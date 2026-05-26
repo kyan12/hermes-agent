@@ -7,7 +7,10 @@ First slice of the multi-agent supervisor upgrade.
 - Runs on `pre_gateway_dispatch` for incoming gateway messages.
 - Preserves a portable origin envelope (`platform`, `chat_id`, `thread_id`, `message_id`, user/chat metadata, visibility, fallback route).
 - Creates durable task envelopes in `~/.hermes/workspace/supervisor/state/supervisor-tasks.json`.
+- Exposes a small task lifecycle API (`find_task`, `request_human_attention`, `complete_task`, `append_worker_callback`, `render_attention_ask`).
+- Keeps only one active human ask per origin; additional asks for the same origin are queued and promoted after the active task completes.
 - Merges duplicate intake from the same origin instead of spawning parallel asks.
+- Records worker callbacks and can turn worker blockers into queued Kevin-attention items without letting workers DM Kevin directly.
 - If a task is marked as the active human-attention item, captures Kevin's reply as natural language and rewrites the turn with explicit supervisor context.
 - Yields to the existing BlueBubbles daily briefing queue when that queue has an active item, so the generic supervisor does not steal briefing blocker replies.
 
@@ -55,7 +58,7 @@ Each task includes:
 
 ## Next slices
 
-1. Promote/triage one active ask per Kevin-attention queue across origins, not just per origin.
-2. Add explicit task tools (`create_task`, `merge_task`, `resolve_task`, `route_result`).
-3. Add worker registry + structured callbacks.
-4. Add route-result delivery verification/fallback behavior.
+1. Add route-result delivery verification/fallback behavior.
+2. Add a worker registry with capability/risk/cadence metadata.
+3. Promote/triage one active ask across Kevin globally, not just per origin.
+4. Add a supervisor dashboard/status rendering surface.

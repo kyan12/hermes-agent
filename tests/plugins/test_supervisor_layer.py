@@ -226,6 +226,153 @@ def test_distinct_unicode_messages_do_not_merge_via_empty_ascii_fingerprint(monk
     assert [task["objective"] for task in data["tasks"]] == ["审批发票", "安排会议"]
 
 
+def test_attention_requests_keep_one_active_ask_per_origin(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice draft", message_id="msg-1"), "Approve invoice draft")
+    second = plugin.upsert_intake_task(data, _event(text="Pick launch date", message_id="msg-2"), "Pick launch date")
+
+    first_status = plugin.request_human_attention(
+        data,
+        first["task_id"],
+        ask="Approve the invoice draft?",
+        recommended_default="approve",
+        why_now="unblocks sending",
+        where="this thread",
+    )
+    second_status = plugin.request_human_attention(
+        data,
+        second["task_id"],
+        ask="Pick the launch date",
+        recommended_default="Friday",
+    )
+
+    assert first_status == "activated"
+    assert second_status == "queued"
+    assert first["state"] == "needs_human"
+    assert first["attention"]["active"] is True
+    assert first["attention"]["recommended_default"] == "approve"
+    assert first["attention"]["why_now"] == "unblocks sending"
+    assert first["attention"]["where"] == "this thread"
+    assert second["state"] == "needs_human"
+    assert second["attention"]["active"] is False
+    assert second["attention"]["queued"] is True
+
+
+def test_completing_active_attention_promotes_next_queued_same_origin(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice draft", message_id="msg-1"), "Approve invoice draft")
+    second = plugin.upsert_intake_task(data, _event(text="Pick launch date", message_id="msg-2"), "Pick launch date")
+    plugin.request_human_attention(data, first["task_id"], ask="Approve the invoice draft?")
+    plugin.request_human_attention(data, second["task_id"], ask="Pick the launch date")
+
+    promoted = plugin.complete_task(data, first["task_id"], result="approved")
+
+    assert first["state"] == "done"
+    assert first["attention"]["active"] is False
+    assert first["result"] == "approved"
+    assert promoted is second
+    assert second["state"] == "needs_human"
+    assert second["attention"]["active"] is True
+    assert second["attention"]["queued"] is False
+
+
+def test_worker_callback_can_queue_human_attention_without_interrupting_active_ask(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    active = plugin.upsert_intake_task(data, _event(text="Approve invoice draft", message_id="msg-1"), "Approve invoice draft")
+    worker_task = plugin.upsert_intake_task(data, _event(text="Review contract", message_id="msg-2"), "Review contract")
+    plugin.request_human_attention(data, active["task_id"], ask="Approve the invoice draft?")
+
+    status = plugin.append_worker_callback(
+        data,
+        worker_task["task_id"],
+        worker="legal_ops",
+        status="blocked",
+        summary="Need Kevin to choose fallback language.",
+        needs_human=True,
+        ask="Use safer fallback language?",
+        recommended_default="use safer fallback",
+    )
+
+    assert status == "queued"
+    assert worker_task["callbacks"][-1]["worker"] == "legal_ops"
+    assert worker_task["callbacks"][-1]["status"] == "blocked"
+    assert worker_task["attention"]["active"] is False
+    assert worker_task["attention"]["queued"] is True
+    assert worker_task["attention"]["recommended_default"] == "use safer fallback"
+
+
+def test_render_attention_ask_is_atomic_and_natural_language(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Approve invoice draft"), "Approve invoice draft")
+    plugin.request_human_attention(
+        data,
+        task["task_id"],
+        ask="Approve the invoice draft?",
+        recommended_default="approve",
+        why_now="unblocks sending",
+        where="this thread",
+    )
+
+    rendered = plugin.render_attention_ask(task)
+
+    assert "Needs Kevin" in rendered
+    assert "Do exactly this: Approve the invoice draft?" in rendered
+    assert "Recommended default: approve" in rendered
+    assert "Where: this thread" in rendered
+    assert "Why now: unblocks sending" in rendered
+    assert "Reply naturally" in rendered
+
+
+def test_re_requesting_attention_clears_stale_optional_guidance(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Approve invoice draft"), "Approve invoice draft")
+    plugin.request_human_attention(
+        data,
+        task["task_id"],
+        ask="Approve the invoice draft?",
+        recommended_default="approve",
+        why_now="unblocks sending",
+        where="this thread",
+    )
+
+    plugin.request_human_attention(data, task["task_id"], ask="Pick a launch date")
+
+    attention = task["attention"]
+    assert attention["ask"] == "Pick a launch date"
+    assert "recommended_default" not in attention
+    assert "why_now" not in attention
+    assert "where" not in attention
+
+
+def test_completion_promotes_only_explicitly_queued_attention(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice draft", message_id="msg-1"), "Approve invoice draft")
+    inactive = plugin.upsert_intake_task(data, _event(text="Inactive draft", message_id="msg-2"), "Inactive draft")
+    queued = plugin.upsert_intake_task(data, _event(text="Pick launch date", message_id="msg-3"), "Pick launch date")
+    plugin.request_human_attention(data, first["task_id"], ask="Approve the invoice draft?")
+    inactive["state"] = "needs_human"
+    inactive["attention"] = {"active": False, "queued": False, "ask": "Should not auto-promote", "reply_style": "natural_language"}
+    plugin.request_human_attention(data, queued["task_id"], ask="Pick launch date")
+
+    promoted = plugin.complete_task(data, first["task_id"], result="approved")
+
+    assert promoted is queued
+    assert inactive["attention"]["active"] is False
+    assert queued["attention"]["active"] is True
+
+
 def test_pre_auth_hook_skips_missing_or_unauthorized_users(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()

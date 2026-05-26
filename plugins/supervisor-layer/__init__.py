@@ -279,6 +279,188 @@ def _find_active_attention_task(data: dict[str, Any], origin: dict[str, Any]) ->
     return None
 
 
+def find_task(data: dict[str, Any], task_id: str) -> dict[str, Any] | None:
+    tasks = data.get("tasks", [])
+    if not isinstance(tasks, list):
+        return None
+    for task in tasks:
+        if isinstance(task, dict) and task.get("task_id") == task_id:
+            return task
+    return None
+
+
+def _attention_for(task: dict[str, Any]) -> dict[str, Any]:
+    attention = task.get("attention")
+    if not isinstance(attention, dict):
+        attention = {}
+        task["attention"] = attention
+    attention.setdefault("reply_style", "natural_language")
+    return attention
+
+
+def _set_attention_payload(
+    task: dict[str, Any],
+    *,
+    ask: str,
+    recommended_default: str | None = None,
+    why_now: str | None = None,
+    where: str | None = None,
+) -> dict[str, Any]:
+    attention = _attention_for(task)
+    attention["ask"] = ask
+    attention["reply_style"] = "natural_language"
+    optional_payload = {
+        "recommended_default": recommended_default,
+        "why_now": why_now,
+        "where": where,
+    }
+    for key, value in optional_payload.items():
+        if value is None:
+            attention.pop(key, None)
+        else:
+            attention[key] = value
+    return attention
+
+
+def _promote_next_attention_for_origin(data: dict[str, Any], origin: dict[str, Any]) -> dict[str, Any] | None:
+    tasks = data.get("tasks", [])
+    if not isinstance(tasks, list):
+        return None
+    if _find_active_attention_task(data, origin) is not None:
+        return None
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if task.get("state") != "needs_human":
+            continue
+        if not _same_origin(task.get("origin") or {}, origin):
+            continue
+        attention = _attention_for(task)
+        if attention.get("ask") and attention.get("queued") is True:
+            attention["active"] = True
+            attention["queued"] = False
+            attention["activated_at"] = _now_iso()
+            task["updated_at"] = attention["activated_at"]
+            return task
+    return None
+
+
+def request_human_attention(
+    data: dict[str, Any],
+    task_id: str,
+    *,
+    ask: str,
+    recommended_default: str | None = None,
+    why_now: str | None = None,
+    where: str | None = None,
+) -> str:
+    """Activate or queue one natural-language human ask for a task's origin."""
+    task = find_task(data, task_id)
+    if task is None:
+        raise KeyError(f"unknown supervisor task: {task_id}")
+    now = _now_iso()
+    origin = task.get("origin") or {}
+    active = _find_active_attention_task(data, origin)
+    attention = _set_attention_payload(
+        task,
+        ask=ask,
+        recommended_default=recommended_default,
+        why_now=why_now,
+        where=where,
+    )
+    task["state"] = "needs_human"
+    task["updated_at"] = now
+    if active is None or active is task:
+        attention["active"] = True
+        attention["queued"] = False
+        attention["activated_at"] = now
+        return "activated"
+    attention["active"] = False
+    attention["queued"] = True
+    attention["queued_at"] = now
+    return "queued"
+
+
+def complete_task(data: dict[str, Any], task_id: str, *, result: str | None = None) -> dict[str, Any] | None:
+    """Mark a task done and promote the next queued ask for the same origin."""
+    task = find_task(data, task_id)
+    if task is None:
+        raise KeyError(f"unknown supervisor task: {task_id}")
+    now = _now_iso()
+    origin = task.get("origin") or {}
+    task["state"] = "done"
+    task["updated_at"] = now
+    task["completed_at"] = now
+    if result is not None:
+        task["result"] = result
+    attention = _attention_for(task)
+    attention["active"] = False
+    attention["queued"] = False
+    return _promote_next_attention_for_origin(data, origin)
+
+
+def append_worker_callback(
+    data: dict[str, Any],
+    task_id: str,
+    *,
+    worker: str,
+    status: str,
+    summary: str,
+    needs_human: bool = False,
+    ask: str | None = None,
+    recommended_default: str | None = None,
+    why_now: str | None = None,
+    where: str | None = None,
+) -> str | None:
+    """Record a worker callback and optionally request Kevin attention."""
+    task = find_task(data, task_id)
+    if task is None:
+        raise KeyError(f"unknown supervisor task: {task_id}")
+    now = _now_iso()
+    callbacks = task.get("callbacks")
+    if not isinstance(callbacks, list):
+        callbacks = []
+        task["callbacks"] = callbacks
+    callbacks.append({
+        "at": now,
+        "worker": worker,
+        "status": status,
+        "summary": summary,
+    })
+    task["updated_at"] = now
+    if needs_human:
+        return request_human_attention(
+            data,
+            task_id,
+            ask=ask or summary,
+            recommended_default=recommended_default,
+            why_now=why_now,
+            where=where,
+        )
+    if status in {"done", "completed"}:
+        task["state"] = "review"
+    elif status in {"blocked", "needs_human"}:
+        task["state"] = "blocked"
+    return None
+
+
+def render_attention_ask(task: dict[str, Any]) -> str:
+    """Render the one atomic Kevin-facing ask for an active/queued task."""
+    attention = _attention_for(task)
+    ask = attention.get("ask") or task.get("objective") or task.get("title") or "Review this supervisor item."
+    where = attention.get("where") or "origin thread"
+    default = attention.get("recommended_default") or "use your judgment"
+    why_now = attention.get("why_now") or "unblocks the next supervisor step"
+    return (
+        "Needs Kevin — 2 min\n\n"
+        f"Do exactly this: {ask}\n"
+        f"Where: {where}\n"
+        f"Recommended default: {default}\n"
+        f"Why now: {why_now}\n"
+        "Reply naturally — e.g. approve, defer, pick another option, or tell me what is wrong."
+    )
+
+
 def _find_merge_candidate(data: dict[str, Any], origin: dict[str, Any], text_fingerprint: str) -> dict[str, Any] | None:
     tasks = data.get("tasks", [])
     if not isinstance(tasks, list):
