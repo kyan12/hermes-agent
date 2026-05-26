@@ -1,0 +1,7 @@
+name: supervisor-layer
+version: 0.1.0
+description: Origin-routed supervisor task intake and natural-language attention loop.
+author: Hermes Agent
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch
