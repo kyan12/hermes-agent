@@ -215,6 +215,32 @@ def test_same_origin_duplicate_intake_merges_instead_of_spawning_parallel_asks(m
     assert task["state"] == "inbox"
 
 
+def test_repeated_same_text_after_completion_gets_unique_task_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    real_datetime = plugin.dt.datetime
+
+    class _FixedDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime(2026, 1, 1, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(plugin.dt, "datetime", _FixedDateTime)
+    uuids = iter([
+        SimpleNamespace(hex="a" * 32),
+        SimpleNamespace(hex="b" * 32),
+    ])
+    monkeypatch.setattr(plugin.uuid, "uuid4", lambda: next(uuids))
+
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice draft", message_id="msg-1"), "Approve invoice draft")
+    plugin.complete_task(data, first["task_id"], result="done")
+    second = plugin.upsert_intake_task(data, _event(text="Approve invoice draft", message_id="msg-2"), "Approve invoice draft")
+
+    assert first["task_id"] != second["task_id"]
+    assert len({task["task_id"] for task in data["tasks"]}) == 2
+
+
 def test_distinct_unicode_messages_do_not_merge_via_empty_ascii_fingerprint(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()

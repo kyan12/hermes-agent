@@ -16,6 +16,7 @@ import re
 import tempfile
 import threading
 import unicodedata
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -205,6 +206,7 @@ def _task_id(origin: dict[str, Any], text: str) -> str:
         str(origin.get("thread_id") or ""),
         text,
         stamp,
+        uuid.uuid4().hex,
     ])
     return f"sup_{stamp}_{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:8]}"
 
