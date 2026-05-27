@@ -463,6 +463,102 @@ def render_attention_ask(task: dict[str, Any]) -> str:
     )
 
 
+def delivery_target_for_origin(origin: dict[str, Any]) -> str | None:
+    """Return the explicit gateway target string for a stored origin envelope.
+
+    Background workers do not have the live gateway session's implicit
+    ``deliver=origin`` context. This helper turns the portable origin envelope
+    into the same explicit target shape accepted by the messaging layer, while
+    preserving Discord thread routing when parent/thread IDs are available.
+    """
+    platform = str(origin.get("platform") or "").strip().lower()
+    chat_id = str(origin.get("chat_id") or "").strip()
+    thread_id = str(origin.get("thread_id") or "").strip()
+    parent_chat_id = str(origin.get("parent_chat_id") or "").strip()
+    chat_type = str(origin.get("chat_type") or "").strip().lower()
+    if not platform or not chat_id:
+        return None
+    if platform == "discord" and chat_type == "thread" and thread_id:
+        if parent_chat_id:
+            return f"{platform}:{parent_chat_id}:{thread_id}"
+        return f"{platform}:{thread_id}"
+    if thread_id and thread_id != chat_id:
+        return f"{platform}:{chat_id}:{thread_id}"
+    return f"{platform}:{chat_id}"
+
+
+def delivery_plan_for_task(task: dict[str, Any]) -> dict[str, Any]:
+    """Build a route-preserving delivery plan for a supervisor result.
+
+    The plan is data-only on purpose. Callers still perform the actual send and
+    then record the outcome with ``record_delivery_attempt``. Keeping this
+    separate makes it safe to use in tests, cron jobs, and future worker
+    callbacks without accidentally emitting public messages.
+    """
+    raw_origin = task.get("origin")
+    origin: dict[str, Any] = dict(raw_origin) if isinstance(raw_origin, dict) else {}
+    primary = delivery_target_for_origin(origin)
+    platform = str(origin.get("platform") or "").strip().lower()
+    fallback = str(origin.get("fallback_route") or "origin").strip() or "origin"
+    if fallback == "origin":
+        fallback_target = primary or (platform if platform else None)
+    else:
+        fallback_target = fallback
+    return {
+        "task_id": task.get("task_id"),
+        "primary_target": primary,
+        "fallback_target": fallback_target,
+        "origin": origin,
+        "visibility": origin.get("visibility") or "team",
+    }
+
+
+def record_delivery_attempt(
+    data: dict[str, Any],
+    task_id: str,
+    *,
+    target: str | None,
+    status: str,
+    message_id: str | None = None,
+    error: str | None = None,
+    fallback_target: str | None = None,
+) -> dict[str, Any]:
+    """Append an auditable delivery attempt to a supervisor task."""
+    task = find_task(data, task_id)
+    if task is None:
+        raise KeyError(f"unknown supervisor task: {task_id}")
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status not in {"success", "failed", "fallback_queued"}:
+        raise ValueError("delivery status must be success, failed, or fallback_queued")
+    if normalized_status == "fallback_queued" and not fallback_target:
+        raise ValueError("fallback_queued delivery attempts require fallback_target")
+    now = _now_iso()
+    deliveries = task.get("deliveries")
+    if not isinstance(deliveries, list):
+        deliveries = []
+        task["deliveries"] = deliveries
+    attempt: dict[str, Any] = {
+        "at": now,
+        "target": target,
+        "status": normalized_status,
+    }
+    if message_id:
+        attempt["message_id"] = message_id
+    if error:
+        attempt["error"] = error[:500]
+    if fallback_target:
+        attempt["fallback_target"] = fallback_target
+    deliveries.append(attempt)
+    task["delivery_status"] = normalized_status
+    task["updated_at"] = now
+    if normalized_status == "success":
+        task["delivered_at"] = now
+        task.pop("pending_fallback_target", None)
+    elif fallback_target:
+        task["pending_fallback_target"] = fallback_target
+    return attempt
+
+
 def _find_merge_candidate(data: dict[str, Any], origin: dict[str, Any], text_fingerprint: str) -> dict[str, Any] | None:
     tasks = data.get("tasks", [])
     if not isinstance(tasks, list):

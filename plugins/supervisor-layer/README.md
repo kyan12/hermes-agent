@@ -11,6 +11,7 @@ First slice of the multi-agent supervisor upgrade.
 - Keeps only one active human ask per origin; additional asks for the same origin are queued and promoted after the active task completes.
 - Merges duplicate intake from the same origin instead of spawning parallel asks.
 - Records worker callbacks and can turn worker blockers into queued Kevin-attention items without letting workers DM Kevin directly.
+- Builds route-preserving delivery plans for worker results and records delivery/fallback attempts for auditability.
 - If a task is marked as the active human-attention item, captures Kevin's reply as natural language and rewrites the turn with explicit supervisor context.
 - Yields to the existing BlueBubbles daily briefing queue when that queue has an active item, so the generic supervisor does not steal briefing blocker replies.
 
@@ -58,7 +59,7 @@ Each task includes:
 
 ## Next slices
 
-1. Add route-result delivery verification/fallback behavior.
+1. Add actual sender integration that consumes delivery plans, sends results, and queues fallback sends on failure.
 2. Add a worker registry with capability/risk/cadence metadata.
 3. Promote/triage one active ask across Kevin globally, not just per origin.
 4. Add a supervisor dashboard/status rendering surface.

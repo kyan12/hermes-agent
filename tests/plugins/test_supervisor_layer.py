@@ -357,6 +357,111 @@ def test_render_attention_ask_is_atomic_and_natural_language(monkeypatch, tmp_pa
     assert "Reply naturally" in rendered
 
 
+def test_delivery_plan_preserves_discord_thread_route(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Report worker result"), "Report worker result")
+
+    plan = plugin.delivery_plan_for_task(task)
+
+    assert plan["task_id"] == task["task_id"]
+    assert plan["primary_target"] == "discord:parent-999:thread-456"
+    assert plan["fallback_target"] == "discord:parent-999:thread-456"
+    assert plan["visibility"] == "team"
+
+
+def test_delivery_target_falls_back_to_thread_id_without_parent(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    origin = plugin.origin_envelope_from_event(_event(thread_id="thread-456"))
+    origin.pop("parent_chat_id")
+
+    assert plugin.delivery_target_for_origin(origin) == "discord:thread-456"
+
+
+def test_delivery_target_builds_non_discord_threaded_route(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    assert plugin.delivery_target_for_origin({
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "thread_id": "topic-2",
+    }) == "telegram:chat-1:topic-2"
+
+
+def test_delivery_plan_returns_origin_copy(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Report worker result"), "Report worker result")
+
+    plan = plugin.delivery_plan_for_task(task)
+    plan["origin"]["chat_id"] = "mutated"
+
+    assert task["origin"]["chat_id"] == "channel-123"
+
+
+def test_record_delivery_attempt_rejects_fallback_without_target(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Send completed worker summary"), "Send completed worker summary")
+
+    try:
+        plugin.record_delivery_attempt(data, task["task_id"], target="discord", status="fallback_queued")
+    except ValueError as exc:
+        assert "fallback_target" in str(exc)
+    else:
+        raise AssertionError("fallback_queued without fallback_target should fail closed")
+
+
+def test_record_delivery_attempt_tracks_success_and_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Send completed worker summary"), "Send completed worker summary")
+
+    failure = plugin.record_delivery_attempt(
+        data,
+        task["task_id"],
+        target="discord:parent-999:thread-456",
+        status="failed",
+        error="Unknown Channel",
+        fallback_target="discord",
+    )
+    success = plugin.record_delivery_attempt(
+        data,
+        task["task_id"],
+        target="discord",
+        status="success",
+        message_id="fallback-msg-1",
+    )
+
+    assert failure["status"] == "failed"
+    assert failure["fallback_target"] == "discord"
+    assert success["message_id"] == "fallback-msg-1"
+    assert task["delivery_status"] == "success"
+    assert "pending_fallback_target" not in task
+    assert task["delivered_at"]
+    assert len(task["deliveries"]) == 2
+
+
+def test_record_delivery_attempt_rejects_unknown_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Send completed worker summary"), "Send completed worker summary")
+
+    try:
+        plugin.record_delivery_attempt(data, task["task_id"], target="discord", status="weird")
+    except ValueError as exc:
+        assert "delivery status" in str(exc)
+    else:
+        raise AssertionError("unknown delivery status should fail closed")
+
+
 def test_re_requesting_attention_clears_stale_optional_guidance(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
