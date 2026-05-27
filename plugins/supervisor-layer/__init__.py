@@ -559,6 +559,171 @@ def record_delivery_attempt(
     return attempt
 
 
+def _normalize_send_result(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"success": False, "error": f"non-object send result: {type(parsed).__name__}"}
+        except Exception:
+            return {"error": result[:500]}
+    return {"success": bool(result)}
+
+
+def _send_with_message_tool(target: str, message: str) -> dict[str, Any]:
+    from tools.send_message_tool import send_message_tool
+
+    return _normalize_send_result(send_message_tool({"action": "send", "target": target, "message": message}))
+
+
+def _send_result_ok(result: dict[str, Any]) -> bool:
+    return bool(result.get("success")) and not result.get("error")
+
+
+def _send_result_message_id(result: dict[str, Any]) -> str | None:
+    value = result.get("message_id") or result.get("id")
+    if value is None and isinstance(result.get("raw_response"), dict):
+        raw = result["raw_response"]
+        value = raw.get("message_id") or raw.get("id")
+    return str(value) if value is not None else None
+
+
+def _send_result_error(result: dict[str, Any]) -> str | None:
+    error = result.get("error") or result.get("message")
+    return str(error) if error is not None else None
+
+
+def _call_sender(sender: Any, target: str, message: str) -> dict[str, Any]:
+    try:
+        return _normalize_send_result(sender(target, message))
+    except Exception as exc:
+        return {"error": str(exc) or exc.__class__.__name__}
+
+
+def _persist_delivery_audit(data: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    try:
+        save_task_store(data)
+        result["audit_persisted"] = True
+    except Exception as exc:
+        result["audit_persisted"] = False
+        result["audit_error"] = str(exc) or exc.__class__.__name__
+    return result
+
+
+def deliver_task_result(
+    data: dict[str, Any],
+    task_id: str,
+    message: str,
+    *,
+    sender: Any | None = None,
+    persist: bool = False,
+) -> dict[str, Any]:
+    """Send a supervisor task result to its preserved origin and audit attempts.
+
+    ``sender`` is injectable for tests and worker runtimes.  When omitted this
+    uses the same ``send_message`` tool path as agents, so target parsing and
+    platform-specific behavior stay centralized.
+    """
+    task = find_task(data, task_id)
+    if task is None:
+        raise KeyError(f"unknown supervisor task: {task_id}")
+    clean_message = str(message or "").strip()
+    if not clean_message:
+        raise ValueError("delivery message must be non-empty")
+
+    plan = delivery_plan_for_task(task)
+    primary = plan.get("primary_target")
+    fallback = plan.get("fallback_target")
+    send = sender or _send_with_message_tool
+    if not primary:
+        record_delivery_attempt(data, task_id, target=None, status="failed", error="No primary delivery target resolved")
+        failure = {"success": False, "error": "No primary delivery target resolved", "plan": plan}
+        if persist:
+            return _persist_delivery_audit(data, failure)
+        return failure
+    primary_target = str(primary)
+
+    result = _call_sender(send, primary_target, clean_message)
+    if _send_result_ok(result):
+        record_delivery_attempt(
+            data,
+            task_id,
+            target=primary_target,
+            status="success",
+            message_id=_send_result_message_id(result),
+        )
+        success = {"success": True, "target": primary_target, "result": result, "plan": plan}
+        if persist:
+            return _persist_delivery_audit(data, success)
+        return success
+
+    primary_error = _send_result_error(result) or "send failed"
+    fallback_target = str(fallback) if fallback else None
+    should_try_fallback = bool(fallback_target and fallback_target != primary_target)
+    record_delivery_attempt(
+        data,
+        task_id,
+        target=primary_target,
+        status="failed",
+        error=primary_error,
+        fallback_target=fallback_target if should_try_fallback else None,
+    )
+    if not should_try_fallback:
+        failure = {"success": False, "target": primary_target, "error": primary_error, "result": result, "plan": plan}
+        if persist:
+            return _persist_delivery_audit(data, failure)
+        return failure
+
+    assert fallback_target is not None
+    fallback_result = _call_sender(send, fallback_target, clean_message)
+    if _send_result_ok(fallback_result):
+        record_delivery_attempt(
+            data,
+            task_id,
+            target=fallback_target,
+            status="success",
+            message_id=_send_result_message_id(fallback_result),
+        )
+        success = {"success": True, "target": fallback_target, "result": fallback_result, "plan": plan, "fallback_from": primary_target}
+        if persist:
+            return _persist_delivery_audit(data, success)
+        return success
+
+    fallback_error = _send_result_error(fallback_result) or "fallback send failed"
+    record_delivery_attempt(data, task_id, target=fallback_target, status="failed", error=fallback_error)
+    failure = {
+        "success": False,
+        "target": primary_target,
+        "error": primary_error,
+        "fallback_target": fallback_target,
+        "fallback_error": fallback_error,
+        "result": result,
+        "fallback_result": fallback_result,
+        "plan": plan,
+    }
+    if persist:
+        return _persist_delivery_audit(data, failure)
+    return failure
+
+
+def deliver_stored_task_result(task_id: str, message: str, *, sender: Any | None = None) -> dict[str, Any]:
+    """Locked durable-store wrapper for delivering a supervisor task result."""
+    with _task_store_lock():
+        data = load_task_store()
+        result = deliver_task_result(data, task_id, message, sender=sender, persist=False)
+        try:
+            save_task_store(data)
+        except Exception as exc:
+            result["audit_persisted"] = False
+            result["audit_error"] = str(exc) or exc.__class__.__name__
+            return result
+        result["audit_persisted"] = True
+        return result
+
+
 def _find_merge_candidate(data: dict[str, Any], origin: dict[str, Any], text_fingerprint: str) -> dict[str, Any] | None:
     tasks = data.get("tasks", [])
     if not isinstance(tasks, list):

@@ -448,6 +448,157 @@ def test_record_delivery_attempt_tracks_success_and_fallback(monkeypatch, tmp_pa
     assert len(task["deliveries"]) == 2
 
 
+def test_deliver_task_result_sends_to_primary_and_records_success(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Send completed worker summary"), "Send completed worker summary")
+    calls = []
+
+    def sender(target, message):
+        calls.append((target, message))
+        return {"success": True, "message_id": "msg-primary"}
+
+    result = plugin.deliver_task_result(data, task["task_id"], "Worker result summary", sender=sender)
+
+    assert result["success"] is True
+    assert result["target"] == "discord:parent-999:thread-456"
+    assert calls == [("discord:parent-999:thread-456", "Worker result summary")]
+    assert task["delivery_status"] == "success"
+    assert task["deliveries"][-1]["message_id"] == "msg-primary"
+
+
+def test_deliver_task_result_falls_back_and_records_both_attempts(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Send completed worker summary"), "Send completed worker summary")
+    task["origin"]["fallback_route"] = "discord"
+    calls = []
+
+    def sender(target, message):
+        calls.append((target, message))
+        if target == "discord:parent-999:thread-456":
+            return {"error": "Unknown Channel"}
+        return {"success": True, "message_id": "msg-fallback"}
+
+    result = plugin.deliver_task_result(data, task["task_id"], "Worker result summary", sender=sender)
+
+    assert result["success"] is True
+    assert result["target"] == "discord"
+    assert calls == [
+        ("discord:parent-999:thread-456", "Worker result summary"),
+        ("discord", "Worker result summary"),
+    ]
+    assert [attempt["status"] for attempt in task["deliveries"]] == ["failed", "success"]
+    assert task["deliveries"][0]["fallback_target"] == "discord"
+    assert task["deliveries"][0]["error"] == "Unknown Channel"
+    assert task["deliveries"][1]["message_id"] == "msg-fallback"
+
+
+def test_deliver_task_result_falls_back_after_primary_sender_exception(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Send completed worker summary"), "Send completed worker summary")
+    task["origin"]["fallback_route"] = "discord"
+    calls = []
+
+    def sender(target, message):
+        calls.append(target)
+        if target == "discord:parent-999:thread-456":
+            raise RuntimeError("primary route exploded")
+        return {"success": True, "message_id": "msg-fallback"}
+
+    result = plugin.deliver_task_result(data, task["task_id"], "Worker result summary", sender=sender)
+
+    assert result["success"] is True
+    assert result["target"] == "discord"
+    assert calls == ["discord:parent-999:thread-456", "discord"]
+    assert task["deliveries"][0]["status"] == "failed"
+    assert "primary route exploded" in task["deliveries"][0]["error"]
+    assert task["deliveries"][1]["status"] == "success"
+
+
+def test_deliver_stored_task_result_locks_loads_sends_and_saves(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Send completed worker summary"), "Send completed worker summary")
+    plugin.save_task_store(data)
+
+    result = plugin.deliver_stored_task_result(
+        task["task_id"],
+        "Worker result summary",
+        sender=lambda target, message: {"success": True, "message_id": "msg-primary"},
+    )
+
+    updated = _read_store(tmp_path)
+    assert result["success"] is True
+    assert updated["tasks"][0]["delivery_status"] == "success"
+    assert updated["tasks"][0]["deliveries"][-1]["message_id"] == "msg-primary"
+
+
+def test_deliver_task_result_does_not_persist_by_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Send completed worker summary"), "Send completed worker summary")
+    plugin.save_task_store(data)
+
+    plugin.deliver_task_result(
+        data,
+        task["task_id"],
+        "Worker result summary",
+        sender=lambda target, message: {"success": True, "message_id": "not-persisted"},
+    )
+
+    stored = _read_store(tmp_path)
+    assert "deliveries" not in stored["tasks"][0]
+
+
+def test_deliver_task_result_persist_failure_after_send_returns_without_raising(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Send completed worker summary"), "Send completed worker summary")
+
+    def fail_save(_data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(plugin, "save_task_store", fail_save)
+
+    result = plugin.deliver_task_result(
+        data,
+        task["task_id"],
+        "Worker result summary",
+        sender=lambda target, message: {"success": True, "message_id": "msg-primary"},
+        persist=True,
+    )
+
+    assert result["success"] is True
+    assert result["audit_persisted"] is False
+    assert "disk full" in result["audit_error"]
+    assert task["delivery_status"] == "success"
+
+
+def test_deliver_task_result_json_false_sender_response_is_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Send completed worker summary"), "Send completed worker summary")
+
+    result = plugin.deliver_task_result(
+        data,
+        task["task_id"],
+        "Worker result summary",
+        sender=lambda target, message: "false",
+    )
+
+    assert result["success"] is False
+    assert task["deliveries"][-1]["status"] == "failed"
+
+
 def test_record_delivery_attempt_rejects_unknown_status(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
