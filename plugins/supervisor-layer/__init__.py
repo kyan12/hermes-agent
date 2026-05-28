@@ -37,6 +37,48 @@ except Exception:  # pragma: no cover - standalone/plugin test fallback
 
 OPEN_STATES = {"inbox", "triaged", "doing", "waiting_agent", "needs_human", "in_discussion", "blocked", "review"}
 ACTIVE_ATTENTION_STATES = {"needs_human", "in_discussion"}
+WORKER_RISK_LEVELS = ("low", "medium", "high", "critical")
+WORKER_CADENCES = ("realtime", "on_demand", "scheduled", "batch")
+WORKER_HANDOFF_CONTRACT = {
+    "input": "supervisor_task_envelope",
+    "output": "worker_callback_envelope",
+    "transport": "agent_system_native",
+}
+WORKER_FORBIDDEN_CONTEXT_KEYS = {
+    "origin",
+    "route",
+    "routing",
+    "chat_id",
+    "thread_id",
+    "message_id",
+    "user_id",
+    "user_name",
+    "chat_name",
+    "channel_id",
+    "conversation_id",
+    "room_id",
+    "server_id",
+    "team_id",
+    "workspace_id",
+    "tenant_id",
+    "guild_id",
+    "parent_chat_id",
+    "fallback_route",
+    "visibility",
+}
+WORKER_CONTEXT_REF_KEYS = ("gbrain", "files", "urls", "repos")
+WORKER_ROUTE_TOKEN_SLUGS = {
+    "origin", "route", "routing", "fallback", "visibility", "chat", "thread",
+    "message", "msg", "channel", "conversation", "room", "server", "team",
+    "workspace", "tenant", "guild", "user",
+}
+WORKER_ROUTE_REF_VALUE_RE = re.compile(
+    r"(?i)(?:^|[^a-z0-9])"
+    r"(?:origin|route|routing|fallback|visibility|chat|thread|message|msg|channel|conversation|room|server|team|workspace|tenant|guild|user)"
+    r"[-_:/=.#?&\s]+[a-z0-9][a-z0-9._:/@#?&=-]*"
+    r"(?:$|[^a-z0-9])"
+)
+WORKER_NUMERIC_REF_RE = re.compile(r"^\d+$")
 COMMAND_RE = re.compile(r"^\s*/\w+")
 PHONE_RE = re.compile(r"\D+")
 BRIEFING_ACTIVE_STATUSES = {"sent", "in_discussion", "answered_pending_followup"}
@@ -196,6 +238,447 @@ def _is_low_signal_standalone(text: str) -> bool:
     """Return true for bare punctuation/emoji that should not become tasks."""
     cleaned = _clean_text(text)
     return bool(cleaned) and not any(char.isalnum() for char in cleaned)
+
+
+def _slug(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    normalized = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
+    return normalized or "unknown"
+
+
+_CONFUSABLE_ASCII = str.maketrans({
+    "а": "a", "с": "c", "е": "e", "һ": "h", "і": "i", "ӏ": "l", "о": "o", "р": "p", "х": "x", "у": "y",
+    "Α": "a", "Β": "b", "Ε": "e", "Η": "h", "Ι": "i", "Κ": "k", "Μ": "m", "Ν": "n", "Ο": "o", "Ρ": "p", "Τ": "t", "Χ": "x", "Υ": "y", "Ζ": "z",
+    "α": "a", "β": "b", "ε": "e", "η": "h", "ι": "i", "κ": "k", "μ": "m", "ν": "n", "ο": "o", "ρ": "p", "τ": "t", "χ": "x", "υ": "y", "ζ": "z",
+})
+
+
+def _route_scan_text(value: Any) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).casefold().translate(_CONFUSABLE_ASCII)
+
+
+def _is_ascii_text(value: Any) -> bool:
+    try:
+        str(value or "").encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _route_compact_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", _route_scan_text(value))
+
+
+def _looks_route_like_text(value: Any) -> bool:
+    text = _route_scan_text(value)
+    compact = _route_compact_text(value)
+    if WORKER_ROUTE_REF_VALUE_RE.search(text):
+        return True
+    return any(token in compact and compact != token for token in WORKER_ROUTE_TOKEN_SLUGS)
+
+
+def _unique_slugs(values: Any) -> list[str]:
+    raw_values = values if isinstance(values, list) else [values]
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        slug = _slug(value)
+        if (
+            slug == "unknown"
+            or slug in seen
+            or not _is_ascii_text(value)
+            or slug in WORKER_ROUTE_TOKEN_SLUGS
+            or WORKER_NUMERIC_REF_RE.fullmatch(slug)
+            or _looks_route_like_text(value)
+            or _looks_route_like_text(slug)
+        ):
+            continue
+        seen.add(slug)
+        result.append(slug)
+    return result
+
+
+def _normalize_risk(value: Any, default: str = "medium") -> str:
+    risk = _slug(value).replace("-", "_")
+    return risk if risk in WORKER_RISK_LEVELS else default
+
+
+def _normalize_cadence(value: Any, default: str = "on_demand") -> str:
+    cadence = _slug(value).replace("-", "_")
+    return cadence if cadence in WORKER_CADENCES else default
+
+
+def _risk_rank(risk: str) -> int:
+    try:
+        return WORKER_RISK_LEVELS.index(_normalize_risk(risk))
+    except ValueError:  # pragma: no cover - guarded by _normalize_risk
+        return WORKER_RISK_LEVELS.index("medium")
+
+
+def _cadence_rank(cadence: str) -> int:
+    try:
+        return WORKER_CADENCES.index(_normalize_cadence(cadence))
+    except ValueError:  # pragma: no cover - guarded by _normalize_cadence
+        return WORKER_CADENCES.index("on_demand")
+
+
+def _default_workers() -> list[dict[str, Any]]:
+    return [
+        {
+            "worker_id": "code-crab",
+            "display_name": "Code Crab",
+            "capabilities": ["code", "testing", "github", "debugging", "repo_inspection"],
+            "risk_level": "medium",
+            "cadence": "on_demand",
+            "description": "Specialist for coding, tests, repository inspection, and implementation handoffs.",
+        },
+        {
+            "worker_id": "research-worker",
+            "display_name": "Research Worker",
+            "capabilities": ["research", "synthesis", "web", "docs", "competitive_analysis"],
+            "risk_level": "low",
+            "cadence": "batch",
+            "description": "Specialist for information gathering and summarized evidence packets.",
+        },
+        {
+            "worker_id": "ops-worker",
+            "display_name": "Ops Worker",
+            "capabilities": ["operations", "monitoring", "cron", "triage", "status_reporting"],
+            "risk_level": "medium",
+            "cadence": "scheduled",
+            "description": "Specialist for scheduled checks, operational triage, and status surfaces.",
+        },
+        {
+            "worker_id": "generalist-worker",
+            "display_name": "Generalist Worker",
+            "capabilities": ["general", "writing", "analysis", "planning"],
+            "risk_level": "low",
+            "cadence": "on_demand",
+            "description": "Fallback worker for low-risk synthesis and planning tasks.",
+        },
+    ]
+
+
+def normalize_worker_registry(registry: Any | None = None) -> dict[str, Any]:
+    """Return a portable, JSON-only worker registry contract.
+
+    The registry deliberately avoids Hermes-only classes, callables, secrets, or
+    transport handles. Other agent systems can copy this document and implement
+    the same handoff envelope with their native dispatch mechanism.
+    """
+    if registry is None:
+        source = {"workers": _default_workers()}
+    elif not isinstance(registry, dict):
+        source = {"workers": []}
+    else:
+        source = registry
+    raw_workers_any = source.get("workers")
+    raw_workers = raw_workers_any if isinstance(raw_workers_any, list) else []
+    workers: list[dict[str, Any]] = []
+    seen_worker_ids: set[str] = set()
+    for raw_worker in raw_workers:
+        if not isinstance(raw_worker, dict):
+            continue
+        raw_id = _clean_text(str(raw_worker.get("worker_id") or raw_worker.get("id") or raw_worker.get("name") or "worker"))
+        worker_id = _slug(raw_id)
+        if worker_id in seen_worker_ids:
+            raise ValueError(f"duplicate worker_id after normalization: {worker_id}")
+        seen_worker_ids.add(worker_id)
+        display_name = _clean_text(str(raw_worker.get("display_name") or raw_worker.get("name") or raw_id or worker_id))
+        capability_source = raw_worker.get("capabilities") if "capabilities" in raw_worker else raw_worker.get("skills")
+        capabilities = _unique_slugs(capability_source if capability_source is not None else ["general"])
+        if not capabilities:
+            if capability_source is not None:
+                continue
+            capabilities = ["general"]
+        worker: dict[str, Any] = {
+            "worker_id": worker_id,
+            "display_name": display_name,
+            "capabilities": capabilities,
+            "risk_level": _normalize_risk(raw_worker.get("risk_level") or raw_worker.get("risk")),
+            "cadence": _normalize_cadence(raw_worker.get("cadence")),
+            "handoff_contract": dict(WORKER_HANDOFF_CONTRACT),
+        }
+        description = _clean_text(str(raw_worker.get("description") or ""))
+        if description:
+            worker["description"] = description
+        workers.append(worker)
+
+    selection_policy_any = source.get("selection_policy")
+    selection_policy = selection_policy_any if isinstance(selection_policy_any, dict) else {}
+    return {
+        "schema_version": 1,
+        "portable": True,
+        "selection_policy": {
+            "optimize_for": str(selection_policy.get("optimize_for") or "kevin_attention"),
+            "default_max_risk": _normalize_risk(selection_policy.get("default_max_risk") or "medium"),
+            "tie_breakers": ["lowest_risk", "highest_capability_match", "fastest_cadence", "stable_worker_id"],
+        },
+        "handoff_contract": dict(WORKER_HANDOFF_CONTRACT),
+        "workers": workers,
+    }
+
+
+def default_worker_registry() -> dict[str, Any]:
+    return normalize_worker_registry({"workers": _default_workers()})
+
+
+def _worker_matches(worker: dict[str, Any], required_capabilities: list[str]) -> bool:
+    if not required_capabilities:
+        return True
+    capabilities = set(worker.get("capabilities") or [])
+    return all(capability in capabilities for capability in required_capabilities)
+
+
+def _worker_match_score(worker: dict[str, Any], required_capabilities: list[str]) -> int:
+    capabilities = set(worker.get("capabilities") or [])
+    return sum(1 for capability in required_capabilities if capability in capabilities)
+
+
+def _origin_ref_for_worker(task: dict[str, Any]) -> str:
+    seed = str(task.get("task_id") or uuid.uuid4().hex)
+    return hashlib.sha256(f"worker-origin|{seed}".encode("utf-8")).hexdigest()[:16]
+
+
+def _task_ref_for_worker(task: dict[str, Any]) -> str:
+    seed = str(task.get("task_id") or uuid.uuid4().hex)
+    return f"wtsk_{hashlib.sha256(f'worker-task|{seed}'.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _worker_context_key_forbidden(key: Any) -> bool:
+    if not _is_ascii_text(key):
+        return True
+    normalized = _slug(_route_scan_text(key)).replace("-", "_")
+    compact = _route_compact_text(key)
+    if normalized in WORKER_FORBIDDEN_CONTEXT_KEYS:
+        return True
+    return any(token in compact for token in WORKER_ROUTE_TOKEN_SLUGS)
+
+
+def _sensitive_origin_values(origin: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for nested in value.values():
+                collect(nested)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for nested in value:
+                collect(nested)
+            return
+        if value is None:
+            return
+        text = unicodedata.normalize("NFKC", str(value).strip()).casefold()
+        if text:
+            values.add(text)
+
+    # Treat the entire origin envelope as supervisor-only. Even if a future
+    # platform uses camelCase or a new route key, its values should never become
+    # worker-visible through allowlisted context refs.
+    collect(origin)
+    return values
+
+
+def _worker_context_string_safe(text: str, sensitive_values: set[str]) -> bool:
+    normalized = _route_scan_text(text)
+    compact = _route_compact_text(text)
+    if WORKER_NUMERIC_REF_RE.fullmatch(normalized):
+        return False
+    if any(sensitive and (sensitive in normalized or _route_compact_text(sensitive) in compact) for sensitive in sensitive_values):
+        return False
+    return not _looks_route_like_text(normalized)
+
+
+def _sanitize_worker_context(value: Any, sensitive_values: set[str]) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            if _worker_context_key_forbidden(key):
+                continue
+            sanitized_value = _sanitize_worker_context(item, sensitive_values)
+            if sanitized_value not in (None, "", [], {}):
+                sanitized[str(key)] = sanitized_value
+        return sanitized
+    if isinstance(value, list):
+        sanitized_items = [_sanitize_worker_context(item, sensitive_values) for item in value]
+        return [item for item in sanitized_items if item not in (None, "", [], {})]
+    if isinstance(value, tuple):
+        return _sanitize_worker_context(list(value), sensitive_values)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or not _is_ascii_text(text) or not _worker_context_string_safe(text, sensitive_values):
+            return None
+        return text
+    return None
+
+
+def _sanitize_worker_context_refs(context_refs: Any, sensitive_values: set[str]) -> dict[str, Any]:
+    if not isinstance(context_refs, dict):
+        return {}
+    sanitized: dict[str, Any] = {}
+    for key in WORKER_CONTEXT_REF_KEYS:
+        if key not in context_refs:
+            continue
+        value = _sanitize_worker_context(context_refs[key], sensitive_values)
+        if value not in (None, "", [], {}):
+            sanitized[key] = value
+    return sanitized
+
+
+def _build_worker_handoff(task: dict[str, Any], worker: dict[str, Any], required_capabilities: list[str]) -> dict[str, Any]:
+    raw_origin = task.get("origin")
+    origin = raw_origin if isinstance(raw_origin, dict) else {}
+    context_refs = _sanitize_worker_context_refs(task.get("context_refs") or {}, _sensitive_origin_values(origin))
+    return {
+        "schema_version": 1,
+        "task_id": _task_ref_for_worker(task),
+        "origin_ref": _origin_ref_for_worker(task),
+        "route_policy": "supervisor_managed",
+        "context_refs": context_refs,
+        "required_capabilities": required_capabilities,
+        "worker_id": worker.get("worker_id"),
+        "callback_contract": dict(WORKER_HANDOFF_CONTRACT),
+    }
+
+
+def plan_worker_dispatch(
+    task: dict[str, Any],
+    *,
+    registry: dict[str, Any] | None = None,
+    required_capabilities: list[str] | None = None,
+    max_risk: str | None = None,
+) -> dict[str, Any]:
+    """Create a data-only worker dispatch plan without starting the worker."""
+    try:
+        normalized_registry = normalize_worker_registry(default_worker_registry() if registry is None else registry)
+    except ValueError as exc:
+        return {
+            "schema_version": 1,
+            "status": "no_match",
+            "worker_id": None,
+            "needs_human": True,
+            "reason": str(exc),
+            "required_capabilities": _unique_slugs(required_capabilities or []),
+            "registry_schema_version": 1,
+        }
+    raw_required = required_capabilities if required_capabilities is not None else []
+    required = _unique_slugs(raw_required)
+    if raw_required and not required:
+        return {
+            "schema_version": 1,
+            "status": "no_match",
+            "worker_id": None,
+            "needs_human": True,
+            "reason": "Required capabilities were not safe to include in a worker handoff.",
+            "required_capabilities": [],
+            "registry_schema_version": normalized_registry["schema_version"],
+        }
+    risk_ceiling = _normalize_risk(max_risk or normalized_registry["selection_policy"]["default_max_risk"])
+    candidates = [worker for worker in normalized_registry["workers"] if _worker_matches(worker, required)]
+    if not candidates:
+        return {
+            "schema_version": 1,
+            "status": "no_match",
+            "worker_id": None,
+            "needs_human": True,
+            "reason": f"No registered worker matches capabilities: {', '.join(required) or 'general'}",
+            "required_capabilities": required,
+            "registry_schema_version": normalized_registry["schema_version"],
+        }
+    candidates.sort(
+        key=lambda worker: (
+            _risk_rank(str(worker.get("risk_level") or "medium")),
+            -_worker_match_score(worker, required),
+            _cadence_rank(str(worker.get("cadence") or "on_demand")),
+            str(worker.get("worker_id") or ""),
+        )
+    )
+    worker = candidates[0]
+    worker_risk = str(worker.get("risk_level") or "medium")
+    over_risk = _risk_rank(worker_risk) > _risk_rank(risk_ceiling)
+    status = "needs_human_approval" if over_risk else "ready"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "worker_id": worker.get("worker_id"),
+        "worker_display_name": worker.get("display_name"),
+        "risk_level": worker_risk,
+        "max_risk": risk_ceiling,
+        "cadence": worker.get("cadence"),
+        "capabilities": worker.get("capabilities") or [],
+        "required_capabilities": required,
+        "needs_human": over_risk,
+        "reason": "Risk exceeds supervisor auto-dispatch ceiling." if over_risk else "Best registered capability match under risk ceiling.",
+        "handoff": _build_worker_handoff(task, worker, required),
+        "registry_schema_version": normalized_registry["schema_version"],
+    }
+
+
+def assign_worker_to_task(
+    data: dict[str, Any],
+    task_id: str,
+    *,
+    registry: dict[str, Any] | None = None,
+    required_capabilities: list[str] | None = None,
+    max_risk: str | None = None,
+) -> dict[str, Any]:
+    """Attach a portable worker dispatch plan to a task, asking Kevin for risky work."""
+    task = find_task(data, task_id)
+    if task is None:
+        raise KeyError(f"unknown supervisor task: {task_id}")
+    plan = plan_worker_dispatch(task, registry=registry, required_capabilities=required_capabilities, max_risk=max_risk)
+    task["worker_assignment"] = plan
+    now = _now_iso()
+    task["updated_at"] = now
+    if plan["status"] == "ready" and plan.get("worker_id"):
+        task["owner"] = plan["worker_id"]
+        if task.get("state") not in {"doing", "review", "done"}:
+            task["state"] = "triaged"
+        task["attention"] = {
+            "active": False,
+            "ask": None,
+            "reply_style": "natural_language",
+            "queued": False,
+        }
+        return plan
+    task["owner"] = "supervisor"
+    if plan["status"] == "no_match":
+        ask = "Pick the right specialist for this task."
+        recommended_default = "reply with the specialist name"
+    else:
+        ask = "Approve the specialist handoff for this task?"
+        recommended_default = "reply approve to hand off"
+    request_human_attention(
+        data,
+        task_id,
+        ask=ask,
+        recommended_default=recommended_default,
+        why_now="this keeps the work moving while preserving the one-active-ask rule",
+        where="this origin thread",
+    )
+    return plan
+
+
+def assign_stored_worker_to_task(
+    task_id: str,
+    *,
+    registry: dict[str, Any] | None = None,
+    required_capabilities: list[str] | None = None,
+    max_risk: str | None = None,
+) -> dict[str, Any]:
+    """Locked durable-store wrapper for assigning a worker to a supervisor task."""
+    with _task_store_lock():
+        data = load_task_store()
+        plan = assign_worker_to_task(
+            data,
+            task_id,
+            registry=registry,
+            required_capabilities=required_capabilities,
+            max_risk=max_risk,
+        )
+        save_task_store(data)
+        return plan
 
 
 def _task_id(origin: dict[str, Any], text: str) -> str:

@@ -613,6 +613,371 @@ def test_record_delivery_attempt_rejects_unknown_status(monkeypatch, tmp_path):
         raise AssertionError("unknown delivery status should fail closed")
 
 
+def test_default_worker_registry_is_portable_json_contract(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    registry = plugin.default_worker_registry()
+
+    json.dumps(registry)
+    assert registry["schema_version"] == 1
+    assert registry["portable"] is True
+    assert registry["selection_policy"]["optimize_for"] == "kevin_attention"
+    assert registry["selection_policy"]["default_max_risk"] == "medium"
+    assert {worker["worker_id"] for worker in registry["workers"]} >= {"code-crab", "research-worker", "ops-worker"}
+    for worker in registry["workers"]:
+        assert set(worker) >= {"worker_id", "display_name", "capabilities", "risk_level", "cadence", "handoff_contract"}
+        assert isinstance(worker["capabilities"], list) and worker["capabilities"]
+        assert worker["risk_level"] in plugin.WORKER_RISK_LEVELS
+        assert worker["cadence"] in plugin.WORKER_CADENCES
+        assert worker["handoff_contract"]["input"] == "supervisor_task_envelope"
+        assert worker["handoff_contract"]["output"] == "worker_callback_envelope"
+        assert not any("secret" in key or "token" in key or "password" in key for key in worker)
+
+
+def test_worker_registry_normalizes_copyable_external_entries(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    registry = plugin.normalize_worker_registry({
+        "workers": [
+            {
+                "worker_id": "  Custom Analyst  ",
+                "capabilities": ["Research", "research", "Market"],
+                "risk_level": "HIGH",
+                "cadence": "Scheduled",
+                "handoff_contract": {
+                    "input": "raw_origin_payload",
+                    "output": "direct_dm",
+                    "transport": "worker_direct_route",
+                },
+            }
+        ]
+    })
+
+    worker = registry["workers"][0]
+    assert worker["worker_id"] == "custom-analyst"
+    assert worker["display_name"] == "Custom Analyst"
+    assert worker["capabilities"] == ["research", "market"]
+    assert worker["risk_level"] == "high"
+    assert worker["cadence"] == "scheduled"
+    assert worker["handoff_contract"]["input"] == "supervisor_task_envelope"
+    assert worker["handoff_contract"]["output"] == "worker_callback_envelope"
+    assert worker["handoff_contract"]["transport"] == "agent_system_native"
+
+
+def test_plan_worker_dispatch_selects_lowest_risk_matching_specialist(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    registry = plugin.normalize_worker_registry({
+        "workers": [
+            {"worker_id": "generalist", "capabilities": ["code", "research"], "risk_level": "medium", "cadence": "on_demand"},
+            {"worker_id": "code-reviewer", "capabilities": ["code", "testing"], "risk_level": "low", "cadence": "on_demand"},
+        ]
+    })
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Review the failing tests"), "Review the failing tests")
+
+    plan = plugin.plan_worker_dispatch(task, registry=registry, required_capabilities=["code"])
+
+    assert plan["status"] == "ready"
+    assert plan["worker_id"] == "code-reviewer"
+    assert plan["needs_human"] is False
+    assert plan["handoff"]["task_id"].startswith("wtsk_")
+    assert plan["handoff"]["task_id"] != task["task_id"]
+    assert plan["handoff"]["required_capabilities"] == ["code"]
+
+
+def test_worker_handoff_keeps_route_metadata_supervisor_only(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Review the failing tests"), "Review the failing tests")
+    task["title"] = "Review thread-456 deploy failure"
+    task["objective"] = "Use message msg-789 from channel-123"
+    task["acceptance_criteria"] = ["Do not mention kevin-1 or guild-1"]
+    task["origin"]["chatId"] = "ExternalCaseABC"
+    task["origin"]["numericRoomId"] = 987654321
+    task["context_refs"] = {
+        "files": [
+            "/tmp/notes.md",
+            "/tmp/channel-123-notes.md",
+            "/tmp/external-channel-999.md",
+            "/tmp/channel-general.md",
+            1508918955744559246,
+            "987654321",
+            "/tmp/Channel=123.md",
+            "/tmp/chat 123.md",
+            "/tmp/thread.456.md",
+            "/tmp/msg#789.md",
+            "/tmp/channel123.md",
+            "/tmp/chat123.md",
+            "/tmp/сhannel-123.md",
+            "/tmp/ѕerver-123.md",
+            "/tmp/сһат-123.md",
+            "/tmp/externalcaseabc.md",
+        ],
+        "urls": ["https://example.test/docs", "https://discord.test/channel/external-channel-999", "https://example.test/workspace-acme"],
+        "repos": ["git@example.test:safe/repo.git", "git@example.test:thread-456/repo.git", "git@example.test:user-kevin/repo.git"],
+        "chat_id": "channel-123",
+        "nested": {
+            "thread_id": "thread-456",
+            "chatId": "external-chat-999",
+            "messageId": "external-message-999",
+            "source_chat_id": "source-channel-999",
+            "channelId": "external-channel-999",
+            "conversationId": "external-conversation-999",
+            "room_id": "external-room-999",
+            "originRef": "origin-ref-999",
+            "сhat_id": "confusable-key-value",
+            "safe_note": "look at msg-789 before replying",
+        },
+        "origin": task["origin"],
+    }
+
+    plan = plugin.plan_worker_dispatch(task, required_capabilities=["code"])
+    handoff_text = json.dumps(plan["handoff"])
+
+    assert "origin" not in plan["handoff"]
+    assert set(plan["handoff"]) == {"schema_version", "task_id", "origin_ref", "route_policy", "context_refs", "required_capabilities", "worker_id", "callback_contract"}
+    assert "origin_ref" in plan["handoff"]
+    assert plan["handoff"]["context_refs"]["files"] == ["/tmp/notes.md"]
+    assert plan["handoff"]["context_refs"]["urls"] == ["https://example.test/docs"]
+    assert plan["handoff"]["context_refs"]["repos"] == ["git@example.test:safe/repo.git"]
+    for leaked_key in (
+        "chat_id", "thread_id", "message_id", "user_id", "guild_id", "fallback_route", "visibility",
+        "chatId", "messageId", "source_chat_id", "channelId", "conversationId", "room_id", "originRef",
+    ):
+        assert leaked_key not in handoff_text
+    for leaked_value in (
+        "channel-123", "thread-456", "msg-789", "kevin-1", "guild-1",
+        "external-chat-999", "external-message-999", "source-channel-999",
+        "external-channel-999", "external-conversation-999", "external-room-999", "origin-ref-999",
+        "channel-general", "workspace-acme", "user-kevin", "1508918955744559246", task["task_id"],
+        "987654321", "Channel=123", "chat 123", "thread.456", "msg#789", "externalcaseabc",
+        "channel123", "chat123", "сhannel-123", "ѕerver-123", "сһат-123", "confusable-key-value",
+    ):
+        assert leaked_value not in handoff_text
+
+
+def test_explicit_empty_worker_registry_fails_closed_instead_of_using_defaults(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Review failing tests"), "Review failing tests")
+
+    plan = plugin.plan_worker_dispatch(task, registry={}, required_capabilities=["code"])
+
+    assert plan["status"] == "no_match"
+    assert plan["worker_id"] is None
+
+
+def test_worker_registry_rejects_duplicate_normalized_worker_ids(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    try:
+        plugin.normalize_worker_registry({
+            "workers": [
+                {"worker_id": "Code Crab", "capabilities": ["code"]},
+                {"worker_id": "code-crab", "capabilities": ["testing"]},
+            ]
+        })
+    except ValueError as exc:
+        assert "duplicate worker_id" in str(exc)
+    else:
+        raise AssertionError("duplicate normalized worker IDs should fail closed")
+
+
+def test_plan_worker_dispatch_duplicate_registry_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Review failing tests"), "Review failing tests")
+
+    plan = plugin.plan_worker_dispatch(
+        task,
+        registry={
+            "workers": [
+                {"worker_id": "Code Crab", "capabilities": ["code"]},
+                {"worker_id": "code-crab", "capabilities": ["testing"]},
+            ]
+        },
+        required_capabilities=["code"],
+    )
+
+    assert plan["status"] == "no_match"
+    assert plan["worker_id"] is None
+    assert "duplicate worker_id" in plan["reason"]
+
+
+def test_assign_worker_to_task_records_portable_dispatch_plan(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+
+    plan = plugin.assign_worker_to_task(data, task["task_id"], required_capabilities=["code", "testing"])
+
+    assert plan["status"] == "ready"
+    assert task["owner"] == plan["worker_id"]
+    assert task["state"] == "triaged"
+    assert task["worker_assignment"] == plan
+    assert task["worker_assignment"]["handoff"]["origin_ref"]
+    assert "origin" not in task["worker_assignment"]["handoff"]
+
+
+def test_ready_worker_assignment_clears_stale_attention_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    plugin.request_human_attention(data, task["task_id"], ask="Old ask")
+
+    plugin.assign_worker_to_task(data, task["task_id"], required_capabilities=["code"])
+
+    assert task["state"] == "triaged"
+    assert task["attention"]["active"] is False
+    assert task["attention"]["queued"] is False
+    assert task["attention"]["ask"] is None
+    assert "Old ask" not in json.dumps(task["attention"])
+
+
+def test_assign_stored_worker_to_task_locks_loads_assigns_and_saves(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    plugin.save_task_store(data)
+
+    plan = plugin.assign_stored_worker_to_task(task["task_id"], required_capabilities=["code"])
+
+    updated = _read_store(tmp_path)
+    assert plan["status"] == "ready"
+    assert updated["tasks"][0]["worker_assignment"]["worker_id"] == plan["worker_id"]
+    assert updated["tasks"][0]["state"] == "triaged"
+
+
+def test_origin_ref_is_task_opaque_not_same_for_same_origin(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="First task", message_id="msg-1"), "First task")
+    second = plugin.upsert_intake_task(data, _event(text="Second task", message_id="msg-2"), "Second task")
+
+    first_ref = plugin.plan_worker_dispatch(first, required_capabilities=["code"])["handoff"]["origin_ref"]
+    second_ref = plugin.plan_worker_dispatch(second, required_capabilities=["code"])["handoff"]["origin_ref"]
+
+    assert first_ref != second_ref
+    assert "channel-123" not in first_ref
+    assert "thread-456" not in first_ref
+
+
+def test_risky_worker_dispatch_plan_requires_human_instead_of_auto_assigning(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    registry = plugin.normalize_worker_registry({
+        "workers": [
+            {"worker_id": "publisher", "capabilities": ["deploy", "publish"], "risk_level": "high", "cadence": "on_demand"}
+        ]
+    })
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Publish the production deploy"), "Publish the production deploy")
+
+    plan = plugin.assign_worker_to_task(
+        data,
+        task["task_id"],
+        registry=registry,
+        required_capabilities=["deploy"],
+        max_risk="medium",
+    )
+
+    assert plan["status"] == "needs_human_approval"
+    assert plan["needs_human"] is True
+    assert task["owner"] == "supervisor"
+    assert task["state"] == "needs_human"
+    assert task["attention"]["active"] is True
+    assert "publisher" not in task["attention"]["ask"]
+    assert task["attention"]["recommended_default"] == "reply approve to hand off"
+    assert "otherwise" not in task["attention"]["recommended_default"].lower()
+    assert "risk" not in task["attention"]["why_now"].lower()
+
+
+def test_no_matching_worker_asks_for_registry_choice_not_approval(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    registry = plugin.normalize_worker_registry({
+        "workers": [
+            {"worker_id": "researcher", "capabilities": ["research"], "risk_level": "low", "cadence": "on_demand"}
+        ]
+    })
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Review failing tests"), "Review failing tests")
+
+    plan = plugin.assign_worker_to_task(data, task["task_id"], registry=registry, required_capabilities=["code"])
+
+    assert plan["status"] == "no_match"
+    assert task["state"] == "needs_human"
+    assert task["attention"]["ask"] == "Pick the right specialist for this task."
+    assert " or " not in task["attention"]["ask"].lower()
+    assert "Approve dispatching" not in task["attention"]["ask"]
+    assert "Code Crab" not in task["attention"]["recommended_default"]
+
+
+def test_worker_handoff_drops_route_like_required_capabilities(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    registry = plugin.normalize_worker_registry({
+        "workers": [
+            {"worker_id": "coder", "capabilities": ["code", "thread-456", "thread456", "сhannel123", "12345"], "risk_level": "low", "cadence": "on_demand"}
+        ]
+    })
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Review failing tests"), "Review failing tests")
+
+    plan = plugin.plan_worker_dispatch(task, registry=registry, required_capabilities=["code", "thread-456", "thread456", "сhannel123", "12345"])
+
+    assert plan["status"] == "ready"
+    assert plan["required_capabilities"] == ["code"]
+    assert plan["handoff"]["required_capabilities"] == ["code"]
+    assert "thread-456" not in json.dumps(plan["handoff"])
+    assert "thread456" not in json.dumps(plan["handoff"])
+    assert "сhannel123" not in json.dumps(plan["handoff"])
+    assert "12345" not in json.dumps(plan["handoff"])
+
+
+def test_unsafe_only_required_capabilities_fail_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Review failing tests"), "Review failing tests")
+
+    plan = plugin.plan_worker_dispatch(task, required_capabilities=["thread-456", "thread456", "сhannel123", "12345"])
+
+    assert plan["status"] == "no_match"
+    assert plan["worker_id"] is None
+    assert plan["required_capabilities"] == []
+
+
+def test_malformed_or_route_like_only_registry_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Review failing tests"), "Review failing tests")
+
+    malformed = plugin.plan_worker_dispatch(task, registry=[], required_capabilities=["code"])
+    route_only_registry = plugin.normalize_worker_registry({
+        "workers": [
+            {"worker_id": "unsafe", "capabilities": ["thread456", "channel123", "сhannel123"], "risk_level": "low", "cadence": "on_demand"}
+        ]
+    })
+    route_only = plugin.plan_worker_dispatch(task, registry=route_only_registry, required_capabilities=[])
+
+    assert malformed["status"] == "no_match"
+    assert route_only_registry["workers"] == []
+    assert route_only["status"] == "no_match"
+
+
 def test_re_requesting_attention_clears_stale_optional_guidance(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
