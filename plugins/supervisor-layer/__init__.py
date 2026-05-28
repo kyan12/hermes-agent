@@ -79,6 +79,9 @@ WORKER_ROUTE_REF_VALUE_RE = re.compile(
     r"(?:$|[^a-z0-9])"
 )
 WORKER_NUMERIC_REF_RE = re.compile(r"^\d+$")
+DASHBOARD_ROUTE_TARGET_RE = re.compile(
+    r"(?i)(?:\b[a-z][a-z0-9_-]*:)?\d{10,}(?::\d{10,})*\b"
+)
 COMMAND_RE = re.compile(r"^\s*/\w+")
 PHONE_RE = re.compile(r"\D+")
 BRIEFING_ACTIVE_STATUSES = {"sent", "in_discussion", "answered_pending_followup"}
@@ -86,6 +89,15 @@ STANDALONE_CONTINUATION_RE = re.compile(
     r"^\s*(continue|keep going|go on|proceed|yes|yeah|yep|no|nope|done|ok|okay|wait|stop)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
+SUPERVISOR_DASHBOARD_REQUEST_RE = re.compile(
+    r"^\s*(?:status|dashboard|queue|inbox|what(?:'s| is) next|what needs kevin|show status|show queue)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+SUPERVISOR_CONTROL_REPLY_RE = re.compile(
+    r"^\s*(?:approve|approved|yes|yep|defer|later|wait|drop(?: it)?|cancel|reject|no|nope|stop|keep going|continue)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+SUPERVISOR_SURFACE_ENV = "HERMES_SUPERVISOR_CHANNELS"
 _IN_PROCESS_STORE_LOCK = threading.RLock()
 
 
@@ -764,6 +776,28 @@ def _find_active_attention_task(data: dict[str, Any], origin: dict[str, Any]) ->
     return None
 
 
+def _find_global_active_attention_tasks(data: dict[str, Any]) -> list[dict[str, Any]]:
+    tasks = data.get("tasks", [])
+    if not isinstance(tasks, list):
+        return []
+    active: list[dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        attention_any = task.get("attention")
+        attention = attention_any if isinstance(attention_any, dict) else {}
+        if task.get("state") in ACTIVE_ATTENTION_STATES and attention.get("active") is True:
+            active.append(task)
+    return active
+
+
+def _find_global_active_attention_task(data: dict[str, Any]) -> dict[str, Any] | None:
+    active = _find_global_active_attention_tasks(data)
+    if len(active) != 1:
+        return None
+    return active[0]
+
+
 def find_task(data: dict[str, Any], task_id: str) -> dict[str, Any] | None:
     tasks = data.get("tasks", [])
     if not isinstance(tasks, list):
@@ -944,6 +978,260 @@ def render_attention_ask(task: dict[str, Any]) -> str:
         f"Why now: {why_now}\n"
         "Reply naturally — e.g. approve, defer, pick another option, or tell me what is wrong."
     )
+
+
+def _dashboard_tasks(data: dict[str, Any]) -> list[dict[str, Any]]:
+    tasks = data.get("tasks", [])
+    if not isinstance(tasks, list):
+        return []
+    return [task for task in tasks if isinstance(task, dict)]
+
+
+def _dashboard_safe_text(value: Any, *, fallback: str = "[redacted route ref]", limit: int | None = None) -> str:
+    text = _clean_text(str(value or ""))
+    if not text:
+        return ""
+    if not _is_ascii_text(text) or WORKER_NUMERIC_REF_RE.fullmatch(text) or DASHBOARD_ROUTE_TARGET_RE.search(text) or _looks_route_like_text(text):
+        return fallback
+    if limit is not None and len(text) > limit:
+        return text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def _task_title_for_dashboard(task: dict[str, Any], *, limit: int = 72) -> str:
+    title = _dashboard_safe_text(task.get("title") or task.get("objective") or "Untitled task", fallback="[redacted title]", limit=limit)
+    return title or "Untitled task"
+
+
+def _task_line_for_dashboard(task: dict[str, Any]) -> str:
+    task_id = str(task.get("task_id") or "unknown")[:18]
+    state = str(task.get("state") or "unknown")
+    return f"- `{task_id}` [{state}] {_task_title_for_dashboard(task)}"
+
+
+def _dashboard_task_summary(task: dict[str, Any]) -> dict[str, Any]:
+    attention_any = task.get("attention")
+    attention = attention_any if isinstance(attention_any, dict) else {}
+    summary = {
+        "task_ref": str(task.get("task_id") or "unknown")[:18],
+        "state": str(task.get("state") or "unknown"),
+        "title": _task_title_for_dashboard(task),
+    }
+    ask = _dashboard_safe_text(attention.get("ask") or "")
+    if ask:
+        summary["ask"] = ask
+    default = _dashboard_safe_text(attention.get("recommended_default") or "")
+    if default:
+        summary["recommended_default"] = default
+    why_now = _dashboard_safe_text(attention.get("why_now") or "")
+    if why_now:
+        summary["why_now"] = why_now
+    where = _dashboard_safe_text(attention.get("where") or "")
+    if where:
+        summary["where"] = where
+    return summary
+
+
+def _dashboard_summary_line(summary: dict[str, Any]) -> str:
+    return f"- `{summary.get('task_ref')}` [{summary.get('state')}] {summary.get('title')}"
+
+
+def _render_attention_summary(summary: dict[str, Any]) -> list[str]:
+    ask = summary.get("ask") or summary.get("title") or "Review this supervisor item."
+    where = summary.get("where") or "origin thread"
+    default = summary.get("recommended_default") or "use your judgment"
+    why_now = summary.get("why_now") or "unblocks the next supervisor step"
+    return [
+        "Needs Kevin — 2 min",
+        "",
+        f"Do exactly this: {ask}",
+        f"Where: {where}",
+        f"Recommended default: {default}",
+        f"Why now: {why_now}",
+        "Reply naturally — e.g. approve, defer, pick another option, or tell me what is wrong.",
+    ]
+
+
+def _completed_today(task: dict[str, Any], today: str) -> bool:
+    if task.get("state") != "done":
+        return False
+    completed_at = str(task.get("completed_at") or task.get("updated_at") or "")
+    return completed_at.startswith(today)
+
+
+def supervisor_dashboard_snapshot(data: dict[str, Any], *, now: dt.datetime | None = None) -> dict[str, Any]:
+    """Return a route-sanitized status snapshot for the supervisor surface."""
+    now_dt = now or dt.datetime.now(dt.timezone.utc).astimezone()
+    today = now_dt.date().isoformat()
+    tasks = _dashboard_tasks(data)
+    active = _find_global_active_attention_task(data)
+    inbox = [task for task in tasks if task.get("state") == "inbox"]
+    waiting = [task for task in tasks if task.get("state") in {"triaged", "doing", "waiting_agent"}]
+    blocked = [task for task in tasks if task.get("state") == "blocked"]
+    review = [task for task in tasks if task.get("state") == "review"]
+    done_today = [task for task in tasks if _completed_today(task, today)]
+    multiple_active = len(_find_global_active_attention_tasks(data)) > 1
+    if multiple_active:
+        recommended_next = "choose which active Kevin ask to resolve"
+    elif active is not None:
+        recommended_next = "resolve the active Kevin ask"
+    elif inbox:
+        recommended_next = "triage the oldest inbox task"
+    elif review:
+        recommended_next = "review completed worker output"
+    elif blocked:
+        recommended_next = "clear the oldest blocked task"
+    elif waiting:
+        recommended_next = "wait for worker callbacks"
+    else:
+        recommended_next = "no action needed"
+    return {
+        "generated_at": now_dt.isoformat(timespec="seconds"),
+        "active_attention_task": _dashboard_task_summary(active) if active is not None else None,
+        "multiple_active_attention": multiple_active,
+        "counts": {
+            "total": len(tasks),
+            "needs_triage": len(inbox),
+            "waiting_on_workers": len(waiting),
+            "blocked": len(blocked),
+            "review": len(review),
+            "done_today": len(done_today),
+        },
+        "samples": {
+            "needs_triage": [_dashboard_task_summary(task) for task in inbox[:5]],
+            "waiting_on_workers": [_dashboard_task_summary(task) for task in waiting[:5]],
+            "blocked": [_dashboard_task_summary(task) for task in blocked[:3]],
+            "review": [_dashboard_task_summary(task) for task in review[:3]],
+        },
+        "recommended_next": recommended_next,
+    }
+
+
+def render_supervisor_dashboard(data: dict[str, Any], *, now: dt.datetime | None = None) -> str:
+    """Render a compact, route-sanitized dashboard for #🧠-supervisor."""
+    snapshot = supervisor_dashboard_snapshot(data, now=now)
+    counts = snapshot["counts"]
+    active = snapshot.get("active_attention_task")
+    lines = [
+        "🧠 Supervisor",
+        "",
+        "Active Kevin ask:",
+    ]
+    if snapshot.get("multiple_active_attention"):
+        lines.append("Multiple active Kevin asks detected; reply `status` and choose the specific task before approving.")
+    elif isinstance(active, dict):
+        lines.extend(_render_attention_summary(active))
+    else:
+        lines.append("- none")
+    lines.extend([
+        "",
+        f"Needs triage: {counts['needs_triage']}",
+        f"Waiting on workers: {counts['waiting_on_workers']}",
+        f"Blocked: {counts['blocked']}",
+        f"Review: {counts['review']}",
+        f"Done today: {counts['done_today']}",
+        "",
+        f"Recommended next: {snapshot['recommended_next']}",
+    ])
+    samples = snapshot["samples"]
+    for label, key in (("Triage queue", "needs_triage"), ("Worker wait", "waiting_on_workers"), ("Review queue", "review"), ("Blocked", "blocked")):
+        sample_tasks = samples.get(key) or []
+        if not sample_tasks:
+            continue
+        lines.extend(["", f"{label}:"])
+        lines.extend(_dashboard_summary_line(task) for task in sample_tasks)
+    lines.extend([
+        "",
+        "Reply naturally here: status, approve, defer, drop it, or keep going.",
+        f"Updated: {snapshot['generated_at']}",
+    ])
+    return "\n".join(lines)
+
+
+def _dashboard_rewrite(data: dict[str, Any]) -> str:
+    return (
+        "[Supervisor layer context]\n"
+        "Current supervisor dashboard requested from the dedicated supervisor surface. "
+        "Answer with the compact dashboard and one recommended next action; do not create a new task for this status request.\n\n"
+        f"{render_supervisor_dashboard(data)}"
+    )
+
+
+def _is_dashboard_request(text: str) -> bool:
+    normalized = _clean_text(text).replace("’", "'").replace("‘", "'").replace("`", "'")
+    return bool(SUPERVISOR_DASHBOARD_REQUEST_RE.match(normalized))
+
+
+def _is_supervisor_control_reply(text: str) -> bool:
+    normalized = _clean_text(text).replace("’", "'").replace("‘", "'").replace("`", "'")
+    return bool(SUPERVISOR_CONTROL_REPLY_RE.match(normalized))
+
+
+def _no_active_attention_rewrite(data: dict[str, Any], reply_text: str) -> str:
+    return (
+        "[Supervisor layer context]\n"
+        "Kevin replied on the dedicated supervisor surface, but there is no active Kevin ask to resolve. "
+        "Do not create a new task from this bare control reply. Answer with the dashboard and tell Kevin there is no active ask.\n\n"
+        f"No active Kevin ask for: {_clean_text(reply_text)}\n\n"
+        f"{render_supervisor_dashboard(data)}"
+    )
+
+
+def _configured_supervisor_surface_ids() -> set[str]:
+    raw = os.environ.get(SUPERVISOR_SURFACE_ENV, "")
+    return {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
+
+
+def _is_supervisor_surface(event: Any) -> bool:
+    source = getattr(event, "source", None)
+    if source is None:
+        return False
+    configured = _configured_supervisor_surface_ids()
+    ids = {
+        str(getattr(source, "chat_id", "") or ""),
+        str(getattr(source, "thread_id", "") or ""),
+        str(getattr(source, "parent_chat_id", "") or ""),
+    }
+    if configured:
+        return any(value in configured for value in ids if value)
+    chat_name = _slug(str(getattr(source, "chat_name", "") or ""))
+    return bool(chat_name and "supervisor" in chat_name)
+
+
+def send_supervisor_dashboard(
+    data: dict[str, Any],
+    *,
+    target: str,
+    sender: Any | None = None,
+    persist: bool = False,
+) -> dict[str, Any]:
+    """Send the current dashboard without exposing route metadata in its body."""
+    clean_target = str(target or "").strip()
+    if not clean_target:
+        raise ValueError("dashboard target must be non-empty")
+    message = render_supervisor_dashboard(data)
+    send = sender or _send_with_message_tool
+    result = _call_sender(send, clean_target, message)
+    dashboard_state = data.setdefault("dashboard", {})
+    if not isinstance(dashboard_state, dict):
+        dashboard_state = {}
+        data["dashboard"] = dashboard_state
+    dashboard_state.update({
+        "target": clean_target,
+        "last_rendered_at": _now_iso(),
+        "last_delivery_status": "success" if _send_result_ok(result) else "failed",
+    })
+    message_id = _send_result_message_id(result)
+    if message_id:
+        dashboard_state["last_message_id"] = message_id
+    error = _send_result_error(result)
+    if error:
+        dashboard_state["last_error"] = error[:500]
+    else:
+        dashboard_state.pop("last_error", None)
+    if persist:
+        save_task_store(data)
+    return {"success": _send_result_ok(result), "target": clean_target, "result": result}
 
 
 def delivery_target_for_origin(origin: dict[str, Any]) -> str | None:
@@ -1502,6 +1790,20 @@ def pre_gateway_dispatch(event: Any = None, gateway: Any = None, session_store: 
     with _task_store_lock():
         data = load_task_store()
         origin = origin_envelope_from_event(event)
+        supervisor_surface = _is_supervisor_surface(event)
+        if supervisor_surface and _is_dashboard_request(text):
+            return {"action": "rewrite", "text": _dashboard_rewrite(data)}
+        if supervisor_surface:
+            global_active_tasks = _find_global_active_attention_tasks(data)
+            if len(global_active_tasks) > 1:
+                return {"action": "rewrite", "text": _dashboard_rewrite(data)}
+            if len(global_active_tasks) == 1:
+                global_active = global_active_tasks[0]
+                capture_natural_reply(global_active, event, text)
+                save_task_store(data)
+                return {"action": "rewrite", "text": _active_task_rewrite(global_active, text)}
+            if _is_supervisor_control_reply(text):
+                return {"action": "rewrite", "text": _no_active_attention_rewrite(data, text)}
         active = _find_active_attention_task(data, origin)
         if active is not None:
             capture_natural_reply(active, event, text)

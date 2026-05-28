@@ -27,13 +27,14 @@ def _event(
     text: str = "Can you get Code Crab to inspect the failing deploy?",
     platform: str = "discord",
     chat_id: str = "channel-123",
+    chat_name: str = "business-general",
     thread_id: str | None = "thread-456",
     message_id: str = "msg-789",
 ):
     source = SimpleNamespace(
         platform=SimpleNamespace(value=platform),
         chat_id=chat_id,
-        chat_name="business-general",
+        chat_name=chat_name,
         chat_type="thread" if thread_id else "channel",
         user_id="kevin-1",
         user_name="Kevin Yan",
@@ -355,6 +356,246 @@ def test_render_attention_ask_is_atomic_and_natural_language(monkeypatch, tmp_pa
     assert "Where: this thread" in rendered
     assert "Why now: unblocks sending" in rendered
     assert "Reply naturally" in rendered
+
+
+def test_render_supervisor_dashboard_summarizes_queue_without_route_ids(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    active = plugin.upsert_intake_task(data, _event(text="Approve invoice draft", message_id="msg-1"), "Approve invoice draft")
+    triage = plugin.upsert_intake_task(data, _event(text="Rename product", message_id="msg-2"), "Rename product")
+    waiting = plugin.upsert_intake_task(data, _event(text="Check deploy", message_id="msg-3"), "Check deploy")
+    waiting["state"] = "waiting_agent"
+    plugin.request_human_attention(
+        data,
+        active["task_id"],
+        ask="Approve the invoice draft?",
+        recommended_default="approve",
+        why_now="unblocks sending",
+        where="original thread",
+    )
+
+    rendered = plugin.render_supervisor_dashboard(data)
+
+    assert "🧠 Supervisor" in rendered
+    assert "Active Kevin ask" in rendered
+    assert "Approve the invoice draft?" in rendered
+    assert "Needs triage: 1" in rendered
+    assert "Waiting on workers: 1" in rendered
+    assert "Recommended next: resolve the active Kevin ask" in rendered
+    assert triage["task_id"][:18] in rendered
+    assert "channel-123" not in rendered
+    assert "thread-456" not in rendered
+    assert "kevin-1" not in rendered
+
+    snapshot = plugin.supervisor_dashboard_snapshot(data)
+    serialized = json.dumps(snapshot, ensure_ascii=False)
+    assert "\"origin\"" not in serialized
+    assert "channel-123" not in serialized
+    assert "thread-456" not in serialized
+    assert "kevin-1" not in serialized
+
+
+def test_dashboard_redacts_route_like_attention_metadata(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Approve invoice draft"), "Approve invoice draft")
+    plugin.request_human_attention(
+        data,
+        task["task_id"],
+        ask="Approve the invoice draft?",
+        recommended_default="message:msg-123",
+        where="channel-123",
+        why_now="thread-456 blocks follow-up",
+    )
+
+    rendered = plugin.render_supervisor_dashboard(data)
+    serialized = json.dumps(plugin.supervisor_dashboard_snapshot(data), ensure_ascii=False)
+
+    assert "channel-123" not in rendered
+    assert "thread-456" not in rendered
+    assert "message:msg-123" not in rendered
+    assert "channel-123" not in serialized
+    assert "thread-456" not in serialized
+    assert "message:msg-123" not in serialized
+
+
+def test_dashboard_redacts_numeric_and_platform_route_targets(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Approve invoice draft"), "Approve invoice draft")
+    plugin.request_human_attention(
+        data,
+        task["task_id"],
+        ask="Approve the invoice draft?",
+        recommended_default="1508918955744559246",
+        where="discord:1508918955744559246:1509636803970207794",
+        why_now="route target 1509636803970207794 is waiting",
+    )
+
+    rendered = plugin.render_supervisor_dashboard(data)
+    serialized = json.dumps(plugin.supervisor_dashboard_snapshot(data), ensure_ascii=False)
+
+    for leaked in ("1508918955744559246", "1509636803970207794", "discord:1508918955744559246:1509636803970207794"):
+        assert leaked not in rendered
+        assert leaked not in serialized
+
+
+def test_configured_supervisor_channel_ids_disable_name_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SUPERVISOR_CHANNELS", "configured-supervisor")
+    plugin = _load_plugin()
+
+    result = plugin.pre_gateway_dispatch(
+        event=_event(
+            text="status",
+            chat_id="wrong-supervisor-channel",
+            chat_name="🧠-supervisor",
+            thread_id=None,
+            message_id="msg-status",
+        ),
+        gateway=_Gateway(True),
+        session_store=None,
+    )
+
+    assert result["action"] == "rewrite"
+    assert "Current supervisor dashboard" not in result["text"]
+    data = _read_store(tmp_path)
+    assert [task["objective"] for task in data["tasks"]] == ["status"]
+
+
+def test_supervisor_channel_smart_apostrophe_status_does_not_create_task(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    result = plugin.pre_gateway_dispatch(
+        event=_event(
+            text="what’s next?",
+            chat_id="supervisor-channel",
+            chat_name="🧠-supervisor",
+            thread_id=None,
+            message_id="msg-status",
+        ),
+        gateway=_Gateway(True),
+        session_store=None,
+    )
+
+    assert result["action"] == "rewrite"
+    assert "Current supervisor dashboard" in result["text"]
+    assert not (tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json").exists()
+
+
+def test_supervisor_channel_bare_control_reply_without_active_ask_does_not_create_task(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    for text in ("approve", "defer", "drop it"):
+        result = plugin.pre_gateway_dispatch(
+            event=_event(
+                text=text,
+                chat_id="supervisor-channel",
+                chat_name="🧠-supervisor",
+                thread_id=None,
+                message_id=f"msg-{text}",
+            ),
+            gateway=_Gateway(True),
+            session_store=None,
+        )
+        assert result["action"] == "rewrite"
+        assert "No active Kevin ask" in result["text"]
+
+    assert not (tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json").exists()
+
+
+def test_supervisor_channel_reply_fails_closed_with_multiple_global_active_asks(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice", chat_id="origin-a"), "Approve invoice")
+    second = plugin.upsert_intake_task(data, _event(text="Pick launch", chat_id="origin-b"), "Pick launch")
+    plugin.request_human_attention(data, first["task_id"], ask="Approve invoice?")
+    plugin.request_human_attention(data, second["task_id"], ask="Pick launch date?")
+    plugin.save_task_store(data)
+
+    result = plugin.pre_gateway_dispatch(
+        event=_event(
+            text="approve",
+            chat_id="supervisor-channel",
+            chat_name="🧠-supervisor",
+            thread_id=None,
+            message_id="msg-approve",
+        ),
+        gateway=_Gateway(True),
+        session_store=None,
+    )
+
+    assert result["action"] == "rewrite"
+    assert "Multiple active Kevin asks" in result["text"]
+    updated = _read_store(tmp_path)
+    assert all(not task.get("human_replies") for task in updated["tasks"])
+
+
+def test_supervisor_channel_status_message_rewrites_to_dashboard_without_new_task(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    plugin.pre_gateway_dispatch(
+        event=_event(text="Rename product", message_id="msg-1"),
+        gateway=_Gateway(True),
+        session_store=None,
+    )
+
+    result = plugin.pre_gateway_dispatch(
+        event=_event(
+            text="status",
+            chat_id="supervisor-channel",
+            chat_name="🧠-supervisor",
+            thread_id=None,
+            message_id="msg-status",
+        ),
+        gateway=_Gateway(True),
+        session_store=None,
+    )
+
+    assert result["action"] == "rewrite"
+    assert "Current supervisor dashboard" in result["text"]
+    assert "🧠 Supervisor" in result["text"]
+    data = _read_store(tmp_path)
+    assert [task["objective"] for task in data["tasks"]] == ["Rename product"]
+
+
+def test_supervisor_channel_reply_captures_global_active_attention(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    plugin.pre_gateway_dispatch(
+        event=_event(text="Approve invoice draft", message_id="msg-1"),
+        gateway=_Gateway(True),
+        session_store=None,
+    )
+    data = _read_store(tmp_path)
+    task = data["tasks"][0]
+    plugin.request_human_attention(data, task["task_id"], ask="Approve the invoice draft?")
+    plugin.save_task_store(data)
+
+    result = plugin.pre_gateway_dispatch(
+        event=_event(
+            text="approve and keep going",
+            chat_id="supervisor-channel",
+            chat_name="🧠-supervisor",
+            thread_id=None,
+            message_id="msg-approve",
+        ),
+        gateway=_Gateway(True),
+        session_store=None,
+    )
+
+    assert result["action"] == "rewrite"
+    assert "Active supervisor task" in result["text"]
+    updated = _read_store(tmp_path)
+    assert len(updated["tasks"]) == 1
+    assert updated["tasks"][0]["state"] == "in_discussion"
+    assert updated["tasks"][0]["human_replies"][-1]["text"] == "approve and keep going"
 
 
 def test_delivery_plan_preserves_discord_thread_route(monkeypatch, tmp_path):

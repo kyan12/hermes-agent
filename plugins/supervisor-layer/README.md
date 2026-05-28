@@ -13,6 +13,9 @@ First slice of the multi-agent supervisor upgrade.
 - Defines a portable JSON worker registry contract with capability/risk/cadence metadata (`default_worker_registry`, `normalize_worker_registry`, `plan_worker_dispatch`, `assign_worker_to_task`, `assign_stored_worker_to_task`). The registry avoids Hermes-only classes, secrets, or callables so the same envelope can be copied into other agent systems and implemented with their native dispatch transport.
 - Records worker callbacks and can turn worker blockers into queued Kevin-attention items without letting workers DM Kevin directly.
 - Builds route-preserving delivery plans for worker results, sends completed results through the shared messaging tool path, and records delivery/fallback attempts for auditability. Durable workers should call `deliver_stored_task_result()` so load/mutate/save happens under the supervisor task-store lock; `deliver_task_result()` is the in-memory/testable core.
+- Renders a compact, route-sanitized supervisor dashboard for the dedicated supervisor surface (`render_supervisor_dashboard`, `supervisor_dashboard_snapshot`, `send_supervisor_dashboard`) with active Kevin ask, triage counts, worker waits, review/blocked counts, and recommended next action.
+- Treats messages like `status`, `dashboard`, `queue`, or `what's next` in the supervisor channel as dashboard requests instead of creating new inbox tasks.
+- Lets replies in the supervisor channel resolve the globally active Kevin ask, even when the original task came from another origin, while preserving the original delivery route.
 - If a task is marked as the active human-attention item, captures Kevin's reply as natural language and rewrites the turn with explicit supervisor context.
 - Yields to the existing BlueBubbles daily briefing queue when that queue has an active item, so the generic supervisor does not steal briefing blocker replies.
 
@@ -58,6 +61,14 @@ Each task includes:
 - `human_replies`
 - `context_refs`
 - `acceptance_criteria`
+
+## Supervisor dashboard surface
+
+`#🧠-supervisor` is the intended visible control surface. A message like `status`, `dashboard`, `queue`, `inbox`, or `what's next` in that channel is rewritten as a dashboard request instead of becoming another task. The rendered dashboard deliberately omits raw origin route IDs and redacts route-like attention metadata; it shows the active Kevin ask, queue counts, short task refs/titles, and one recommended next action.
+
+The channel can also act as the global reply surface for the currently active Kevin ask. If a task from another origin is waiting on Kevin and Kevin replies naturally in `#🧠-supervisor` — for example `approve and keep going`, `defer`, or `drop it` — the reply is captured on the original task while the supervisor retains the original route for final delivery. If there is no active ask, bare control replies such as `approve`, `defer`, or `drop it` fail closed into a dashboard/no-active-ask response instead of becoming new inbox tasks. If multiple active asks exist across origins, the supervisor surface fails closed to the dashboard rather than guessing which task Kevin meant.
+
+For non-default deployments, set `HERMES_SUPERVISOR_CHANNELS` to a comma/space-separated list of channel, thread, or parent IDs that should behave as supervisor surfaces. Without that env var, channel names containing `supervisor` are treated as supervisor surfaces.
 
 ## Portable worker registry
 
