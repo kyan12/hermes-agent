@@ -36,6 +36,7 @@ except Exception:  # pragma: no cover - standalone/plugin test fallback
     _core_hermes_home = None  # type: ignore[assignment]
 
 OPEN_STATES = {"inbox", "triaged", "doing", "waiting_agent", "needs_human", "in_discussion", "blocked", "review"}
+TERMINAL_STATES = {"done", "cancelled", "deferred"}
 ACTIVE_ATTENTION_STATES = {"needs_human", "in_discussion"}
 WORKER_RISK_LEVELS = ("low", "medium", "high", "critical")
 WORKER_CADENCES = ("realtime", "on_demand", "scheduled", "batch")
@@ -841,27 +842,49 @@ def _set_attention_payload(
     return attention
 
 
-def _promote_next_attention_for_origin(data: dict[str, Any], origin: dict[str, Any]) -> dict[str, Any] | None:
+def _attention_queue_sort_key(timestamp: Any, index: int) -> tuple[float, int, str]:
+    raw = str(timestamp or "")
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return (parsed.timestamp(), index, raw)
+    except Exception:
+        return (float("inf"), index, raw)
+
+
+def _promote_next_attention(data: dict[str, Any]) -> dict[str, Any] | None:
     tasks = data.get("tasks", [])
     if not isinstance(tasks, list):
         return None
-    if _find_active_attention_task(data, origin) is not None:
+    if _find_global_active_attention_tasks(data):
         return None
-    for task in tasks:
+    candidates: list[tuple[tuple[float, int, str], dict[str, Any]]] = []
+    for index, task in enumerate(tasks):
         if not isinstance(task, dict):
             continue
         if task.get("state") != "needs_human":
             continue
-        if not _same_origin(task.get("origin") or {}, origin):
-            continue
         attention = _attention_for(task)
         if attention.get("ask") and attention.get("queued") is True:
-            attention["active"] = True
-            attention["queued"] = False
-            attention["activated_at"] = _now_iso()
-            task["updated_at"] = attention["activated_at"]
-            return task
-    return None
+            queued_at = attention.get("queued_at") or task.get("updated_at") or task.get("created_at") or ""
+            candidates.append((_attention_queue_sort_key(queued_at, index), task))
+    if not candidates:
+        return None
+    _, task = sorted(candidates, key=lambda item: item[0])[0]
+    attention = _attention_for(task)
+    now = _now_iso()
+    attention["active"] = True
+    attention["queued"] = False
+    attention["activated_at"] = now
+    task["updated_at"] = now
+    return task
+
+
+def _promote_next_attention_for_origin(data: dict[str, Any], origin: dict[str, Any]) -> dict[str, Any] | None:
+    # Backward-compatible wrapper: the product invariant is now global Kevin
+    # attention, not one active ask per origin.
+    return _promote_next_attention(data)
 
 
 def request_human_attention(
@@ -878,8 +901,8 @@ def request_human_attention(
     if task is None:
         raise KeyError(f"unknown supervisor task: {task_id}")
     now = _now_iso()
-    origin = task.get("origin") or {}
-    active = _find_active_attention_task(data, origin)
+    active_tasks = _find_global_active_attention_tasks(data)
+    active = active_tasks[0] if len(active_tasks) == 1 else None
     attention = _set_attention_payload(
         task,
         ask=ask,
@@ -889,7 +912,7 @@ def request_human_attention(
     )
     task["state"] = "needs_human"
     task["updated_at"] = now
-    if active is None or active is task:
+    if len(active_tasks) == 0 or (len(active_tasks) == 1 and active is task):
         attention["active"] = True
         attention["queued"] = False
         attention["activated_at"] = now
@@ -901,12 +924,11 @@ def request_human_attention(
 
 
 def complete_task(data: dict[str, Any], task_id: str, *, result: str | None = None) -> dict[str, Any] | None:
-    """Mark a task done and promote the next queued ask for the same origin."""
+    """Mark a task done and promote the next queued ask globally."""
     task = find_task(data, task_id)
     if task is None:
         raise KeyError(f"unknown supervisor task: {task_id}")
     now = _now_iso()
-    origin = task.get("origin") or {}
     task["state"] = "done"
     task["updated_at"] = now
     task["completed_at"] = now
@@ -915,7 +937,73 @@ def complete_task(data: dict[str, Any], task_id: str, *, result: str | None = No
     attention = _attention_for(task)
     attention["active"] = False
     attention["queued"] = False
-    return _promote_next_attention_for_origin(data, origin)
+    return _promote_next_attention(data)
+
+
+def _clear_attention(task: dict[str, Any], now: str) -> None:
+    attention = _attention_for(task)
+    attention["active"] = False
+    attention["queued"] = False
+    attention["resolved_at"] = now
+
+
+def classify_attention_control(text: str) -> str | None:
+    """Classify bare supervisor-control replies; mixed prose stays natural."""
+    normalized = _clean_text(text).casefold().replace("’", "'").replace("‘", "'").replace("`", "'")
+    normalized = re.sub(r"[.!?]+$", "", normalized).strip()
+    if not normalized:
+        return None
+    if re.fullmatch(r"(?:drop(?: it)?|cancel|reject|stop)", normalized):
+        return "dropped"
+    if re.fullmatch(r"(?:defer|later|wait)", normalized):
+        return "deferred"
+    if re.fullmatch(
+        r"(?:approve(?:d)?|yes|yep|ok|okay|proceed|continue|keep going|approve and keep going|(?:ok|okay),?\s+(?:proceed|continue|keep going)|no problem,?\s+proceed)",
+        normalized,
+    ):
+        return "approved"
+    return None
+
+
+def apply_attention_control(data: dict[str, Any], text: str) -> dict[str, Any]:
+    """Apply a natural supervisor-channel control reply to the sole active ask.
+
+    This is data-only and fail-closed: no active ask or multiple active asks do
+    not mutate the store. Callers can use the returned status to decide whether
+    to show the dashboard or continue the LLM discussion loop.
+    """
+    decision = classify_attention_control(text)
+    if decision is None:
+        return {"status": "unrecognized", "decision": None}
+    active = _find_global_active_attention_tasks(data)
+    if not active:
+        return {"status": "no_active", "decision": decision}
+    if len(active) > 1:
+        return {"status": "ambiguous", "decision": decision, "active_count": len(active)}
+    task = active[0]
+    now = _now_iso()
+    _clear_attention(task, now)
+    clean_text = _clean_text(text)
+    if decision == "approved":
+        task["state"] = "done"
+        task["completed_at"] = now
+        task["result"] = f"Kevin approved: {clean_text}" if clean_text else "Kevin approved"
+    elif decision == "deferred":
+        task["state"] = "deferred"
+        task["deferred_at"] = now
+        task["defer_note"] = clean_text or "Kevin deferred"
+    elif decision == "dropped":
+        task["state"] = "cancelled"
+        task["cancelled_at"] = now
+        task["cancel_note"] = clean_text or "Kevin dropped"
+    task["updated_at"] = now
+    promoted = _promote_next_attention(data)
+    return {
+        "status": "applied",
+        "decision": decision,
+        "task_id": task.get("task_id"),
+        "promoted_task_id": promoted.get("task_id") if isinstance(promoted, dict) else None,
+    }
 
 
 def append_worker_callback(
@@ -1163,8 +1251,7 @@ def _is_dashboard_request(text: str) -> bool:
 
 
 def _is_supervisor_control_reply(text: str) -> bool:
-    normalized = _clean_text(text).replace("’", "'").replace("‘", "'").replace("`", "'")
-    return bool(SUPERVISOR_CONTROL_REPLY_RE.match(normalized))
+    return classify_attention_control(text) is not None
 
 
 def _no_active_attention_rewrite(data: dict[str, Any], reply_text: str) -> str:
@@ -1173,6 +1260,24 @@ def _no_active_attention_rewrite(data: dict[str, Any], reply_text: str) -> str:
         "Kevin replied on the dedicated supervisor surface, but there is no active Kevin ask to resolve. "
         "Do not create a new task from this bare control reply. Answer with the dashboard and tell Kevin there is no active ask.\n\n"
         f"No active Kevin ask for: {_clean_text(reply_text)}\n\n"
+        f"{render_supervisor_dashboard(data)}"
+    )
+
+
+def _attention_control_rewrite(data: dict[str, Any], result: dict[str, Any]) -> str:
+    decision = result.get("decision") or "updated"
+    status = result.get("status") or "unknown"
+    task_ref = str(result.get("task_id") or "")[:18]
+    promoted_ref = str(result.get("promoted_task_id") or "")[:18]
+    promoted_line = f"\nPromoted next ask: `{promoted_ref}`" if promoted_ref else ""
+    return (
+        "[Supervisor layer context]\n"
+        "Kevin's supervisor-surface control reply was applied deterministically by the control plane. "
+        "Answer with the applied state and the current dashboard; do not re-ask the resolved item.\n\n"
+        f"Control status: {status}\n"
+        f"Decision: {decision}\n"
+        f"Task: `{task_ref}`"
+        f"{promoted_line}\n\n"
         f"{render_supervisor_dashboard(data)}"
     )
 
@@ -1586,16 +1691,31 @@ def upsert_intake_task(data: dict[str, Any], event: Any, text: str) -> dict[str,
     return task
 
 
-def _task_summary(task: dict[str, Any]) -> str:
-    return json.dumps(
-        {
+def _task_summary(task: dict[str, Any], *, include_origin: bool = True) -> str:
+    if include_origin:
+        summary = {
             "task_id": task.get("task_id"),
             "state": task.get("state"),
             "title": task.get("title"),
             "objective": task.get("objective"),
             "attention": task.get("attention"),
             "origin": task.get("origin"),
-        },
+        }
+    else:
+        attention = _dashboard_task_summary(task)
+        summary = {
+            "task_id": task.get("task_id"),
+            "state": str(task.get("state") or "unknown"),
+            "title": _task_title_for_dashboard(task),
+            "objective": _dashboard_safe_text(task.get("objective") or "", fallback="[redacted objective]") or None,
+            "attention": {
+                key: value
+                for key, value in attention.items()
+                if key in {"ask", "recommended_default", "why_now", "where"}
+            },
+        }
+    return json.dumps(
+        summary,
         ensure_ascii=False,
         indent=2,
     )
@@ -1623,7 +1743,7 @@ def _active_task_rewrite(task: dict[str, Any], reply_text: str) -> str:
         "[Supervisor layer context]\n"
         "Kevin is replying to an active supervisor attention item. Treat this as a collaborative natural-language resolution loop, not as a command protocol.\n\n"
         "Active supervisor task:\n"
-        f"{_task_summary(task)}\n\n"
+        f"{_task_summary(task, include_origin=False)}\n\n"
         "Rules: infer whether Kevin approved, deferred, corrected, rejected, supplied missing data, or asked a follow-up. "
         "Keep the current task active unless the issue is genuinely resolved, delegated, deferred, merged, or dropped. "
         "If it is resolved, move to the next highest-leverage ask in normal prose; otherwise ask the narrowest possible follow-up.\n\n"
@@ -1798,6 +1918,10 @@ def pre_gateway_dispatch(event: Any = None, gateway: Any = None, session_store: 
             if len(global_active_tasks) > 1:
                 return {"action": "rewrite", "text": _dashboard_rewrite(data)}
             if len(global_active_tasks) == 1:
+                if classify_attention_control(text) is not None:
+                    control_result = apply_attention_control(data, text)
+                    save_task_store(data)
+                    return {"action": "rewrite", "text": _attention_control_rewrite(data, control_result)}
                 global_active = global_active_tasks[0]
                 capture_natural_reply(global_active, event, text)
                 save_task_store(data)

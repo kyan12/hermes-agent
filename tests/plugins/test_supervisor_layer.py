@@ -287,6 +287,45 @@ def test_attention_requests_keep_one_active_ask_per_origin(monkeypatch, tmp_path
     assert second["attention"]["queued"] is True
 
 
+def test_attention_requests_keep_one_active_ask_globally_across_origins(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice draft", chat_id="origin-a", message_id="msg-1"), "Approve invoice draft")
+    second = plugin.upsert_intake_task(data, _event(text="Pick launch date", chat_id="origin-b", message_id="msg-2"), "Pick launch date")
+
+    first_status = plugin.request_human_attention(data, first["task_id"], ask="Approve invoice?")
+    second_status = plugin.request_human_attention(data, second["task_id"], ask="Pick launch date?")
+
+    assert first_status == "activated"
+    assert second_status == "queued"
+    assert first["attention"]["active"] is True
+    assert second["attention"]["active"] is False
+    assert second["attention"]["queued"] is True
+    assert len(plugin._find_global_active_attention_tasks(data)) == 1
+    assert plugin.supervisor_dashboard_snapshot(data)["multiple_active_attention"] is False
+
+
+def test_attention_request_queues_when_store_already_has_multiple_active_asks(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice", chat_id="origin-a"), "Approve invoice")
+    second = plugin.upsert_intake_task(data, _event(text="Pick launch", chat_id="origin-b"), "Pick launch")
+    third = plugin.upsert_intake_task(data, _event(text="Choose copy", chat_id="origin-c"), "Choose copy")
+    plugin.request_human_attention(data, first["task_id"], ask="Approve invoice?")
+    plugin.request_human_attention(data, second["task_id"], ask="Pick launch?")
+    second["attention"]["active"] = True
+    second["attention"]["queued"] = False
+
+    status = plugin.request_human_attention(data, third["task_id"], ask="Choose copy?")
+
+    assert status == "queued"
+    assert third["attention"]["active"] is False
+    assert third["attention"]["queued"] is True
+    assert len(plugin._find_global_active_attention_tasks(data)) == 2
+
+
 def test_completing_active_attention_promotes_next_queued_same_origin(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
@@ -305,6 +344,134 @@ def test_completing_active_attention_promotes_next_queued_same_origin(monkeypatc
     assert second["state"] == "needs_human"
     assert second["attention"]["active"] is True
     assert second["attention"]["queued"] is False
+
+
+def test_completing_active_attention_promotes_next_queued_globally(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice draft", chat_id="origin-a", message_id="msg-1"), "Approve invoice draft")
+    second = plugin.upsert_intake_task(data, _event(text="Pick launch date", chat_id="origin-b", message_id="msg-2"), "Pick launch date")
+    plugin.request_human_attention(data, first["task_id"], ask="Approve invoice?")
+    plugin.request_human_attention(data, second["task_id"], ask="Pick launch date?")
+
+    promoted = plugin.complete_task(data, first["task_id"], result="approved")
+
+    assert promoted is second
+    assert first["state"] == "done"
+    assert first["attention"]["active"] is False
+    assert second["attention"]["active"] is True
+    assert second["attention"]["queued"] is False
+    assert len(plugin._find_global_active_attention_tasks(data)) == 1
+
+
+def test_promotes_oldest_queued_attention_by_queued_at_not_task_order(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    active = plugin.upsert_intake_task(data, _event(text="Approve invoice", chat_id="origin-a"), "Approve invoice")
+    newer = plugin.upsert_intake_task(data, _event(text="Newer queued", chat_id="origin-b"), "Newer queued")
+    older = plugin.upsert_intake_task(data, _event(text="Older queued", chat_id="origin-c"), "Older queued")
+    plugin.request_human_attention(data, active["task_id"], ask="Approve invoice?")
+    plugin.request_human_attention(data, newer["task_id"], ask="Newer queued?")
+    plugin.request_human_attention(data, older["task_id"], ask="Older queued?")
+    newer["attention"]["queued_at"] = "2026-05-28T12:00:00+00:00"
+    older["attention"]["queued_at"] = "2026-05-28T11:00:00+00:00"
+
+    promoted = plugin.complete_task(data, active["task_id"], result="approved")
+
+    assert promoted is older
+    assert older["attention"]["active"] is True
+    assert newer["attention"]["queued"] is True
+
+
+def test_promotes_oldest_queued_attention_by_absolute_time_across_offsets(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    active = plugin.upsert_intake_task(data, _event(text="Approve invoice", chat_id="origin-a"), "Approve invoice")
+    older = plugin.upsert_intake_task(data, _event(text="Older absolute time", chat_id="origin-b"), "Older absolute time")
+    newer = plugin.upsert_intake_task(data, _event(text="Newer absolute time", chat_id="origin-c"), "Newer absolute time")
+    plugin.request_human_attention(data, active["task_id"], ask="Approve invoice?")
+    plugin.request_human_attention(data, older["task_id"], ask="Older absolute?")
+    plugin.request_human_attention(data, newer["task_id"], ask="Newer absolute?")
+    older["attention"]["queued_at"] = "2026-11-01T01:30:00-04:00"  # 05:30Z
+    newer["attention"]["queued_at"] = "2026-11-01T01:15:00-05:00"  # 06:15Z
+
+    promoted = plugin.complete_task(data, active["task_id"], result="approved")
+
+    assert promoted is older
+    assert older["attention"]["active"] is True
+    assert newer["attention"]["queued"] is True
+
+
+def test_apply_attention_control_approve_completes_and_promotes(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice draft", chat_id="origin-a", message_id="msg-1"), "Approve invoice draft")
+    second = plugin.upsert_intake_task(data, _event(text="Pick launch date", chat_id="origin-b", message_id="msg-2"), "Pick launch date")
+    plugin.request_human_attention(data, first["task_id"], ask="Approve invoice?")
+    plugin.request_human_attention(data, second["task_id"], ask="Pick launch date?")
+
+    result = plugin.apply_attention_control(data, "approve and keep going")
+
+    assert result["status"] == "applied"
+    assert result["decision"] == "approved"
+    assert result["task_id"] == first["task_id"]
+    assert result["promoted_task_id"] == second["task_id"]
+    assert first["state"] == "done"
+    assert first["result"] == "Kevin approved: approve and keep going"
+    assert second["attention"]["active"] is True
+
+
+def test_attention_control_classifier_prefers_proceed_over_no_problem(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    assert plugin.classify_attention_control("no problem, proceed") == "approved"
+
+
+def test_attention_control_classifier_treats_bare_no_as_natural_language(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    assert plugin.classify_attention_control("no") is None
+    assert plugin.classify_attention_control("nope") is None
+
+
+def test_attention_control_classifier_rejects_mixed_or_negated_replies(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    for text in ("don't drop it, proceed", "please don't cancel, approve it", "don't stop", "ok, but change the date first", "wait, proceed"):
+        assert plugin.classify_attention_control(text) is None
+
+
+def test_apply_attention_control_defer_and_drop_fail_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice draft"), "Approve invoice draft")
+    second = plugin.upsert_intake_task(data, _event(text="Pick launch date", chat_id="origin-b"), "Pick launch date")
+    plugin.request_human_attention(data, first["task_id"], ask="Approve invoice?")
+    plugin.request_human_attention(data, second["task_id"], ask="Pick launch date?")
+
+    defer_result = plugin.apply_attention_control(data, "defer")
+
+    assert defer_result["status"] == "applied"
+    assert defer_result["decision"] == "deferred"
+    assert defer_result["task_id"] == first["task_id"]
+    assert first["state"] == "deferred"
+    assert second["attention"]["active"] is True
+
+    drop_result = plugin.apply_attention_control(data, "drop it")
+
+    assert drop_result["status"] == "applied"
+    assert drop_result["decision"] == "dropped"
+    assert drop_result["task_id"] == second["task_id"]
+    assert second["state"] == "cancelled"
+    assert plugin.apply_attention_control(data, "approve")["status"] == "no_active"
 
 
 def test_worker_callback_can_queue_human_attention_without_interrupting_active_ask(monkeypatch, tmp_path):
@@ -491,7 +658,7 @@ def test_supervisor_channel_bare_control_reply_without_active_ask_does_not_creat
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
 
-    for text in ("approve", "defer", "drop it"):
+    for text in ("approve", "approve and keep going", "defer", "drop it"):
         result = plugin.pre_gateway_dispatch(
             event=_event(
                 text=text,
@@ -509,6 +676,28 @@ def test_supervisor_channel_bare_control_reply_without_active_ask_does_not_creat
     assert not (tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json").exists()
 
 
+def test_supervisor_channel_non_bare_control_words_without_active_ask_can_be_new_task(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    result = plugin.pre_gateway_dispatch(
+        event=_event(
+            text="ok, but change the date first",
+            chat_id="supervisor-channel",
+            chat_name="🧠-supervisor",
+            thread_id=None,
+            message_id="msg-ok-but",
+        ),
+        gateway=_Gateway(True),
+        session_store=None,
+    )
+
+    assert result["action"] == "rewrite"
+    assert "No active Kevin ask" not in result["text"]
+    data = _read_store(tmp_path)
+    assert [task["objective"] for task in data["tasks"]] == ["ok, but change the date first"]
+
+
 def test_supervisor_channel_reply_fails_closed_with_multiple_global_active_asks(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
@@ -517,6 +706,8 @@ def test_supervisor_channel_reply_fails_closed_with_multiple_global_active_asks(
     second = plugin.upsert_intake_task(data, _event(text="Pick launch", chat_id="origin-b"), "Pick launch")
     plugin.request_human_attention(data, first["task_id"], ask="Approve invoice?")
     plugin.request_human_attention(data, second["task_id"], ask="Pick launch date?")
+    second["attention"]["active"] = True
+    second["attention"]["queued"] = False
     plugin.save_task_store(data)
 
     result = plugin.pre_gateway_dispatch(
@@ -591,11 +782,53 @@ def test_supervisor_channel_reply_captures_global_active_attention(monkeypatch, 
     )
 
     assert result["action"] == "rewrite"
-    assert "Active supervisor task" in result["text"]
+    assert "control reply was applied deterministically" in result["text"]
     updated = _read_store(tmp_path)
     assert len(updated["tasks"]) == 1
+    assert updated["tasks"][0]["state"] == "done"
+    assert updated["tasks"][0]["result"] == "Kevin approved: approve and keep going"
+    assert updated["tasks"][0]["attention"]["active"] is False
+
+
+def test_supervisor_channel_non_control_reply_to_cross_origin_active_ask_is_route_sanitized(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(
+        data,
+        _event(text="Approve invoice draft", chat_id="channel-123", thread_id="thread-456", message_id="msg-1"),
+        "Approve invoice draft",
+    )
+    plugin.request_human_attention(data, task["task_id"], ask="Approve the invoice draft?")
+    task["attention"]["where"] = "discord:1508918955744559246:1509636803970207794"
+    task["attention"]["recommended_default"] = "message:msg-123"
+    task["attention"]["why_now"] = "reply in channel-123"
+    plugin.save_task_store(data)
+
+    result = plugin.pre_gateway_dispatch(
+        event=_event(
+            text="I need the safer copy first",
+            chat_id="supervisor-channel",
+            chat_name="🧠-supervisor",
+            thread_id=None,
+            message_id="msg-natural",
+        ),
+        gateway=_Gateway(True),
+        session_store=None,
+    )
+
+    assert result["action"] == "rewrite"
+    assert "Active supervisor task" in result["text"]
+    assert "channel-123" not in result["text"]
+    assert "thread-456" not in result["text"]
+    assert "kevin-1" not in result["text"]
+    assert "1508918955744559246" not in result["text"]
+    assert "1509636803970207794" not in result["text"]
+    assert "message:msg-123" not in result["text"]
+    assert "[redacted route ref]" in result["text"]
+    updated = _read_store(tmp_path)
     assert updated["tasks"][0]["state"] == "in_discussion"
-    assert updated["tasks"][0]["human_replies"][-1]["text"] == "approve and keep going"
+    assert updated["tasks"][0]["human_replies"][-1]["text"] == "I need the safer copy first"
 
 
 def test_delivery_plan_preserves_discord_thread_route(monkeypatch, tmp_path):
