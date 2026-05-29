@@ -154,7 +154,7 @@ def test_new_message_creates_origin_routed_task_and_rewrites_to_supervisor_conte
     assert "Can you get Code Crab to inspect the failing deploy?" in rewritten
 
     data = _read_store(tmp_path)
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == plugin.TASK_STORE_SCHEMA_VERSION
     assert len(data["tasks"]) == 1
     task = data["tasks"][0]
     assert task["state"] == "inbox"
@@ -446,6 +446,96 @@ def test_attention_control_classifier_rejects_mixed_or_negated_replies(monkeypat
 
     for text in ("don't drop it, proceed", "please don't cancel, approve it", "don't stop", "ok, but change the date first", "wait, proceed"):
         assert plugin.classify_attention_control(text) is None
+
+
+def test_controller_rejects_unknown_actions_without_creating_store(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    result = plugin.supervisor_control(
+        "discord:1508918955744559246:1509636803970207794",
+        payload={"task_id": "sup_unsafe", "text": "approve"},
+        actor={"chat_id": "channel-123", "thread_id": "thread-456", "user_id": "kevin-1"},
+    )
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["status"] == "unknown_action"
+    assert result["action"] == "unknown"
+    assert "1508918955744559246" not in serialized
+    assert "channel-123" not in serialized
+    assert not (tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json").exists()
+
+
+def test_load_task_store_migrates_legacy_store_to_current_controller_schema(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    store_path = tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json"
+    store_path.parent.mkdir(parents=True)
+    store_path.write_text(json.dumps({"schema_version": 1, "tasks": [{"task_id": "sup_legacy", "state": "inbox"}]}), encoding="utf-8")
+
+    data = plugin.load_task_store()
+
+    assert data["schema_version"] == plugin.TASK_STORE_SCHEMA_VERSION
+    assert data["control_plane"]["schema_version"] == 1
+    assert data["control_plane"]["last_event_seq"] == 0
+    assert data["tasks"][0]["revision"] == 0
+    assert data["tasks"][0]["controller_events"] == []
+
+
+def test_migration_recovers_controller_event_sequence_from_existing_events(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    store_path = tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json"
+    store_path.parent.mkdir(parents=True)
+    store_path.write_text(json.dumps({"schema_version": 1, "controller_events": [{"seq": 7}], "tasks": []}), encoding="utf-8")
+
+    data = plugin.load_task_store()
+
+    assert data["control_plane"]["last_event_seq"] == 7
+
+
+def test_controller_dashboard_and_not_found_paths_do_not_create_store(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    store_path = tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json"
+
+    dashboard = plugin.supervisor_control("dashboard")
+    not_found = plugin.supervisor_control("complete_task", payload={"task_id": "sup_missing"})
+
+    assert dashboard["status"] == "ok"
+    assert not_found["status"] == "not_found"
+    assert not store_path.exists()
+
+
+def test_controller_apply_attention_control_persists_promotes_and_audits_safely(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": plugin.TASK_STORE_SCHEMA_VERSION, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="Approve invoice", chat_id="origin-a"), "Approve invoice")
+    second = plugin.upsert_intake_task(data, _event(text="Pick launch", chat_id="origin-b"), "Pick launch")
+    plugin.request_human_attention(data, first["task_id"], ask="Approve invoice?")
+    plugin.request_human_attention(data, second["task_id"], ask="Pick launch?")
+    plugin.save_task_store(data)
+
+    result = plugin.supervisor_control(
+        "apply_attention_control",
+        payload={"text": "approve and keep going"},
+        actor={"platform": "discord", "chat_id": "channel-123", "thread_id": "thread-456", "user_id": "kevin-1"},
+    )
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["status"] == "applied"
+    assert result["event_seq"] == 1
+    assert "dashboard" in result
+    assert "channel-123" not in serialized
+    assert "thread-456" not in serialized
+    stored = _read_store(tmp_path)
+    assert stored["control_plane"]["last_event_seq"] == 1
+    assert stored["controller_events"][-1]["action"] == "apply_attention_control"
+    assert stored["controller_events"][-1]["actor"] == "[redacted route ref]"
+    assert stored["tasks"][0]["state"] == "done"
+    assert stored["tasks"][0]["revision"] == 1
+    assert stored["tasks"][1]["attention"]["active"] is True
 
 
 def test_apply_attention_control_defer_and_drop_fail_closed(monkeypatch, tmp_path):
@@ -1628,6 +1718,6 @@ def test_save_task_store_uses_atomic_writer(monkeypatch, tmp_path):
     assert calls[0][0] == tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json"
     assert calls[0][2] == 2
     data = _read_store(tmp_path)
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == plugin.TASK_STORE_SCHEMA_VERSION
     assert data["tasks"] == []
     assert "updated_at" in data

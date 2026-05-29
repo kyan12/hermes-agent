@@ -7,8 +7,9 @@ First slice of the multi-agent supervisor upgrade.
 - Runs on `pre_gateway_dispatch` for incoming gateway messages.
 - Preserves a portable origin envelope (`platform`, `chat_id`, `thread_id`, `message_id`, user/chat metadata, visibility, fallback route).
 - Creates durable task envelopes in `~/.hermes/workspace/supervisor/state/supervisor-tasks.json`.
-- Exposes a small task lifecycle API (`find_task`, `request_human_attention`, `complete_task`, `append_worker_callback`, `render_attention_ask`).
-- Keeps only one active human ask per origin; additional asks for the same origin are queued and promoted after the active task completes.
+- Exposes a small task lifecycle API (`find_task`, `request_human_attention`, `complete_task`, `append_worker_callback`, `render_attention_ask`) plus a lock-scoped durable control-plane API (`supervisor_control`).
+- Migrates task-store files to the current schema on load/save, adding `control_plane`, bounded `controller_events`, and per-task `revision`/controller audit trails without dropping unknown fields.
+- Keeps only one active human ask globally; additional asks across any origin are queued and promoted after the active task completes.
 - Merges duplicate intake from the same origin instead of spawning parallel asks.
 - Defines a portable JSON worker registry contract with capability/risk/cadence metadata (`default_worker_registry`, `normalize_worker_registry`, `plan_worker_dispatch`, `assign_worker_to_task`, `assign_stored_worker_to_task`). The registry avoids Hermes-only classes, secrets, or callables so the same envelope can be copied into other agent systems and implemented with their native dispatch transport.
 - Records worker callbacks and can turn worker blockers into queued Kevin-attention items without letting workers DM Kevin directly.
@@ -69,6 +70,12 @@ Each task includes:
 The channel can also act as the global reply surface for the currently active Kevin ask. If a task from another origin is waiting on Kevin and Kevin replies naturally in `#🧠-supervisor` — for example `approve and keep going`, `defer`, or `drop it` — the deterministic control plane applies that reply to the sole active task while the supervisor retains the original route for final delivery. `approve`/`keep going` marks the active item done and promotes the next queued ask; `defer` moves it to `deferred`; `drop it` cancels it. If there is no active ask, bare control replies fail closed into a dashboard/no-active-ask response instead of becoming new inbox tasks. If multiple active asks exist across origins, the supervisor surface fails closed to the dashboard rather than guessing which task Kevin meant.
 
 Human attention is now globally serialized across origins. `request_human_attention()` activates a new ask only when no other Kevin ask is active anywhere in the store; otherwise it queues the ask. Completing, approving, deferring, or dropping the active item promotes the oldest queued ask globally. This is the product-level invariant: optimize Kevin's attention, not per-thread concurrency.
+
+## Durable control plane
+
+`supervisor_control(action, payload=..., actor=...)` is the explicit state mutation boundary for non-gateway callers. It runs under the task-store lock, loads/migrates state, applies only allowlisted actions, saves only recognized mutating operations, and returns route-sanitized dashboard payloads. Unknown or route-shaped actions return `{"status": "unknown_action", "action": "unknown"}` without creating the store. Supported actions are `dashboard`/`status`, `apply_attention_control`, `complete_task`, `request_attention`, and `append_worker_callback`.
+
+Controller writes append bounded redacted audit events to `controller_events`, advance `control_plane.last_event_seq`, and increment the target task `revision`. Actor metadata is redacted with the same route-safety rules used by the dashboard; the audit trail stores task refs and action/status, not raw origin envelopes.
 
 For non-default deployments, set `HERMES_SUPERVISOR_CHANNELS` to a comma/space-separated list of channel, thread, or parent IDs that should behave as supervisor surfaces. Without that env var, channel names containing `supervisor` are treated as supervisor surfaces.
 

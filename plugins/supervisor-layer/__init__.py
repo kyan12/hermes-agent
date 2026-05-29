@@ -35,6 +35,9 @@ try:
 except Exception:  # pragma: no cover - standalone/plugin test fallback
     _core_hermes_home = None  # type: ignore[assignment]
 
+TASK_STORE_SCHEMA_VERSION = 2
+CONTROL_PLANE_SCHEMA_VERSION = 1
+CONTROLLER_EVENT_LIMIT = 200
 OPEN_STATES = {"inbox", "triaged", "doing", "waiting_agent", "needs_human", "in_discussion", "blocked", "review"}
 TERMINAL_STATES = {"done", "cancelled", "deferred"}
 ACTIVE_ATTENTION_STATES = {"needs_human", "in_discussion"}
@@ -125,13 +128,59 @@ def task_store_path() -> Path:
 
 def _fresh_task_store(recovery_note: str | None = None) -> dict[str, Any]:
     data: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": TASK_STORE_SCHEMA_VERSION,
         "description": "Supervisor-layer task envelopes with origin-routed natural-language attention state.",
         "tasks": [],
+        "controller_events": [],
+        "control_plane": {
+            "schema_version": CONTROL_PLANE_SCHEMA_VERSION,
+            "last_event_seq": 0,
+        },
         "created_at": _now_iso(),
     }
     if recovery_note:
         data["state_recovery_note"] = recovery_note
+    return data
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def migrate_task_store(data: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade supervisor state in memory without dropping unknown fields."""
+    if not isinstance(data, dict):
+        return _fresh_task_store("Ignored non-object task store during migration")
+    previous_version = _coerce_int(data.get("schema_version"), 1)
+    data["schema_version"] = TASK_STORE_SCHEMA_VERSION
+    if previous_version < TASK_STORE_SCHEMA_VERSION:
+        data.setdefault("migrated_from_schema_version", previous_version)
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        tasks = []
+        data["tasks"] = tasks
+    events = data.get("controller_events")
+    if not isinstance(events, list):
+        events = []
+    data["controller_events"] = events[-CONTROLLER_EVENT_LIMIT:]
+    max_event_seq = max((_coerce_int(event.get("seq"), 0) for event in events if isinstance(event, dict)), default=0)
+    control_plane = data.get("control_plane")
+    if not isinstance(control_plane, dict):
+        control_plane = {}
+    control_plane["schema_version"] = CONTROL_PLANE_SCHEMA_VERSION
+    control_plane["last_event_seq"] = max(max_event_seq, _coerce_int(control_plane.get("last_event_seq"), 0))
+    data["control_plane"] = control_plane
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task["revision"] = max(0, _coerce_int(task.get("revision"), 0))
+        task_events = task.get("controller_events")
+        if not isinstance(task_events, list):
+            task_events = []
+        task["controller_events"] = task_events[-CONTROLLER_EVENT_LIMIT:]
     return data
 
 
@@ -164,7 +213,7 @@ def load_task_store() -> dict[str, Any]:
         data.setdefault("tasks", [])
         if not isinstance(data.get("tasks"), list):
             raise ValueError("task store tasks must be a list")
-        return data
+        return migrate_task_store(data)
     except Exception as exc:
         # Do not let corrupt state break message delivery. Preserve the broken
         # file for manual recovery and start a fresh in-memory store.
@@ -217,6 +266,7 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
 
 def save_task_store(data: dict[str, Any]) -> None:
     path = task_store_path()
+    data = migrate_task_store(data)
     data["updated_at"] = _now_iso()
     _atomic_write_json(path, data)
 
@@ -1280,6 +1330,172 @@ def _attention_control_rewrite(data: dict[str, Any], result: dict[str, Any]) -> 
         f"{promoted_line}\n\n"
         f"{render_supervisor_dashboard(data)}"
     )
+
+
+CONTROLLER_ACTIONS = {
+    "dashboard",
+    "status",
+    "apply_attention_control",
+    "complete_task",
+    "request_attention",
+    "append_worker_callback",
+}
+
+
+def _controller_action_slug(action: Any) -> str:
+    slug = _slug(action)
+    return slug.replace("-", "_")
+
+
+def _controller_actor_ref(actor: Any) -> str:
+    if actor is None:
+        return "system"
+    if isinstance(actor, str):
+        raw = actor
+    elif isinstance(actor, dict):
+        raw = json.dumps(actor, sort_keys=True, ensure_ascii=False)
+    else:
+        raw = str(actor)
+    return _dashboard_safe_text(raw, fallback="[redacted route ref]", limit=80) or "[redacted route ref]"
+
+
+def _controller_event_for_response(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: event[key]
+        for key in ("seq", "at", "action", "status", "task_ref", "actor")
+        if key in event
+    }
+
+
+def _record_controller_event(
+    data: dict[str, Any],
+    *,
+    action: str,
+    status: str,
+    actor: Any = None,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    migrate_task_store(data)
+    control_plane = data["control_plane"]
+    seq = _coerce_int(control_plane.get("last_event_seq"), 0) + 1
+    control_plane["last_event_seq"] = seq
+    event = {
+        "seq": seq,
+        "at": _now_iso(),
+        "action": action,
+        "status": status,
+        "actor": _controller_actor_ref(actor),
+    }
+    if task_id:
+        event["task_ref"] = str(task_id)[:18]
+    events = data.get("controller_events")
+    if not isinstance(events, list):
+        events = []
+    events.append(event)
+    data["controller_events"] = events[-CONTROLLER_EVENT_LIMIT:]
+    if task_id:
+        task = find_task(data, task_id)
+        if isinstance(task, dict):
+            task["revision"] = max(0, _coerce_int(task.get("revision"), 0)) + 1
+            task_events = task.get("controller_events")
+            if not isinstance(task_events, list):
+                task_events = []
+            task_events.append(_controller_event_for_response(event))
+            task["controller_events"] = task_events[-CONTROLLER_EVENT_LIMIT:]
+    return event
+
+
+def _controller_dashboard_payload(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "dashboard": supervisor_dashboard_snapshot(data),
+        "rendered_dashboard": render_supervisor_dashboard(data),
+    }
+
+
+def supervisor_control(action: Any, *, payload: dict[str, Any] | None = None, actor: Any = None) -> dict[str, Any]:
+    """Explicit, lock-scoped supervisor control-plane API.
+
+    Returns route-sanitized payloads and only persists recognized mutating actions.
+    """
+    action_slug = _controller_action_slug(action)
+    if action_slug not in CONTROLLER_ACTIONS:
+        return {"status": "unknown_action", "action": "unknown"}
+    payload = payload if isinstance(payload, dict) else {}
+    with _task_store_lock():
+        data = load_task_store()
+        if action_slug in {"dashboard", "status"}:
+            return {"status": "ok", "action": action_slug, **_controller_dashboard_payload(data)}
+        if action_slug == "apply_attention_control":
+            result = apply_attention_control(data, str(payload.get("text") or ""))
+            response = {"action": action_slug, **result, **_controller_dashboard_payload(data)}
+            if result.get("status") == "applied":
+                event = _record_controller_event(
+                    data,
+                    action=action_slug,
+                    status=str(result.get("status") or "unknown"),
+                    actor=actor,
+                    task_id=str(result.get("task_id") or ""),
+                )
+                save_task_store(data)
+                response["event_seq"] = event["seq"]
+            return response
+        if action_slug == "complete_task":
+            task_id = str(payload.get("task_id") or "")
+            if not task_id or find_task(data, task_id) is None:
+                return {"status": "not_found", "action": action_slug, **_controller_dashboard_payload(data)}
+            promoted = complete_task(data, task_id, result=str(payload.get("result") or "controller completed"))
+            event = _record_controller_event(data, action=action_slug, status="applied", actor=actor, task_id=task_id)
+            save_task_store(data)
+            return {
+                "status": "applied",
+                "action": action_slug,
+                "task_id": task_id,
+                "promoted_task_id": promoted.get("task_id") if isinstance(promoted, dict) else None,
+                "event_seq": event["seq"],
+                **_controller_dashboard_payload(data),
+            }
+        if action_slug == "request_attention":
+            task_id = str(payload.get("task_id") or "")
+            if not task_id or find_task(data, task_id) is None:
+                return {"status": "not_found", "action": action_slug, **_controller_dashboard_payload(data)}
+            status = request_human_attention(
+                data,
+                task_id,
+                ask=str(payload.get("ask") or "Review this supervisor item."),
+                recommended_default=payload.get("recommended_default"),
+                why_now=payload.get("why_now"),
+                where=payload.get("where"),
+            )
+            event = _record_controller_event(data, action=action_slug, status=status, actor=actor, task_id=task_id)
+            save_task_store(data)
+            return {"status": status, "action": action_slug, "task_id": task_id, "event_seq": event["seq"], **_controller_dashboard_payload(data)}
+        if action_slug == "append_worker_callback":
+            task_id = str(payload.get("task_id") or "")
+            if not task_id or find_task(data, task_id) is None:
+                return {"status": "not_found", "action": action_slug, **_controller_dashboard_payload(data)}
+            attention_status = append_worker_callback(
+                data,
+                task_id,
+                worker=str(payload.get("worker") or "unknown-worker"),
+                status=str(payload.get("worker_status") or payload.get("status") or "reported"),
+                summary=str(payload.get("summary") or "Worker callback received."),
+                needs_human=bool(payload.get("needs_human")),
+                ask=payload.get("ask"),
+                recommended_default=payload.get("recommended_default"),
+                why_now=payload.get("why_now"),
+                where=payload.get("where"),
+            )
+            event = _record_controller_event(data, action=action_slug, status="applied", actor=actor, task_id=task_id)
+            save_task_store(data)
+            return {
+                "status": "applied",
+                "action": action_slug,
+                "task_id": task_id,
+                "attention_status": attention_status,
+                "event_seq": event["seq"],
+                **_controller_dashboard_payload(data),
+            }
+    return {"status": "unknown_action", "action": "unknown"}
 
 
 def _configured_supervisor_surface_ids() -> set[str]:
