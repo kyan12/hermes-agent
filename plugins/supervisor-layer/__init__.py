@@ -1898,6 +1898,72 @@ def worker_callback(payload: dict[str, Any], *, actor: Any = None) -> dict[str, 
     return supervisor_control("append_worker_callback", payload=payload, actor=actor)
 
 
+SUPERVISOR_CONTROL_TOOL_SCHEMA = {
+    "name": "supervisor_control",
+    "description": "Operate the durable supervisor control plane: dashboard/status, Kevin-attention controls, task completion, human-attention requests, and authenticated worker callbacks.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": sorted(CONTROLLER_ACTIONS),
+                "description": "Allowlisted supervisor control-plane action.",
+            },
+            "payload": {
+                "type": "object",
+                "description": "Action-specific payload. Do not include raw origin route IDs unless the action explicitly requires a supervisor-owned task_id.",
+            },
+            "actor": {
+                "type": "object",
+                "description": "Optional caller metadata for redacted audit. Secret-like keys are redacted before persistence.",
+            },
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    },
+}
+
+
+WORKER_CALLBACK_TOOL_SCHEMA = {
+    "name": "worker_callback",
+    "description": "Submit an authenticated worker result or blocker to the supervisor. Requires the opaque task_id, callback_token, and unique callback_id from the worker handoff.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Opaque worker task ref from handoff.callback.task_id."},
+            "callback_token": {"type": "string", "description": "One-time-visible callback token from the handoff."},
+            "callback_id": {"type": "string", "description": "Unique id/nonce for idempotency."},
+            "worker": {"type": "string", "description": "Worker id reporting the callback."},
+            "worker_status": {"type": "string", "description": "done, blocked, review, or another concise status."},
+            "summary": {"type": "string", "description": "Short worker result/blocker summary."},
+            "needs_human": {"type": "boolean", "description": "Set true only when Kevin must answer one atomic ask."},
+            "ask": {"type": "string", "description": "The one atomic Kevin ask when needs_human is true."},
+            "artifacts": {"type": "array", "items": {"type": "string"}, "description": "Optional artifact paths/URLs safe for supervisor review."},
+        },
+        "required": ["task_id", "callback_token", "callback_id", "worker_status", "summary"],
+        "additionalProperties": True,
+    },
+}
+
+
+def _json_tool_result(result: dict[str, Any]) -> str:
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _supervisor_control_tool_handler(args: dict[str, Any], **_: Any) -> str:
+    payload = args.get("payload") if isinstance(args.get("payload"), dict) else {}
+    actor = args.get("actor") if isinstance(args.get("actor"), dict) else {"tool": "supervisor_control"}
+    result = supervisor_control(args.get("action"), payload=payload, actor=actor)
+    return _json_tool_result(result)
+
+
+def _worker_callback_tool_handler(args: dict[str, Any], **_: Any) -> str:
+    payload = dict(args) if isinstance(args, dict) else {}
+    actor = {"tool": "worker_callback", "worker": payload.get("worker")}
+    result = worker_callback(payload, actor=actor)
+    return _json_tool_result(result)
+
+
 def _configured_supervisor_surface_ids() -> set[str]:
     raw = os.environ.get(SUPERVISOR_SURFACE_ENV, "")
     return {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
@@ -2560,3 +2626,19 @@ def pre_gateway_dispatch(event: Any = None, gateway: Any = None, session_store: 
 
 def register(ctx: Any) -> None:
     ctx.register_hook("pre_gateway_dispatch", pre_gateway_dispatch)
+    ctx.register_tool(
+        "supervisor_control",
+        "supervisor",
+        SUPERVISOR_CONTROL_TOOL_SCHEMA,
+        _supervisor_control_tool_handler,
+        description="Operate the durable supervisor control plane.",
+        emoji="🧠",
+    )
+    ctx.register_tool(
+        "worker_callback",
+        "supervisor",
+        WORKER_CALLBACK_TOOL_SCHEMA,
+        _worker_callback_tool_handler,
+        description="Submit an authenticated supervisor worker callback.",
+        emoji="📨",
+    )

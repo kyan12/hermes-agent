@@ -2043,3 +2043,88 @@ def test_save_task_store_uses_atomic_writer(monkeypatch, tmp_path):
     assert data["schema_version"] == plugin.TASK_STORE_SCHEMA_VERSION
     assert data["tasks"] == []
     assert "updated_at" in data
+
+
+class _PluginCtx:
+    def __init__(self):
+        self.hooks = []
+        self.tools = {}
+
+    def register_hook(self, name, callback):
+        self.hooks.append((name, callback))
+
+    def register_tool(self, name, toolset, schema, handler, **kwargs):
+        self.tools[name] = {
+            "toolset": toolset,
+            "schema": schema,
+            "handler": handler,
+            "kwargs": kwargs,
+        }
+
+
+def test_register_exposes_supervisor_control_and_worker_callback_tools(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    ctx = _PluginCtx()
+
+    plugin.register(ctx)
+
+    assert ctx.hooks == [("pre_gateway_dispatch", plugin.pre_gateway_dispatch)]
+    assert set(ctx.tools) >= {"supervisor_control", "worker_callback"}
+    assert ctx.tools["supervisor_control"]["toolset"] == "supervisor"
+    assert "append_worker_callback" in ctx.tools["supervisor_control"]["schema"]["parameters"]["properties"]["action"]["enum"]
+    assert ctx.tools["worker_callback"]["toolset"] == "supervisor"
+    callback_props = ctx.tools["worker_callback"]["schema"]["parameters"]["properties"]
+    assert {"task_id", "callback_token", "callback_id", "worker_status", "summary"}.issubset(callback_props)
+
+
+def test_worker_callback_registered_tool_uses_authenticated_control_plane(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    plan = plugin.assign_worker_to_task(data, task["task_id"], required_capabilities=["code"])
+    callback = plan["handoff"]["callback"]
+    token = callback["token"]
+    plugin.save_task_store(data)
+    ctx = _PluginCtx()
+    plugin.register(ctx)
+
+    raw = ctx.tools["worker_callback"]["handler"]({
+        "task_id": callback["task_id"],
+        "callback_token": token,
+        "callback_id": "tool-cb-1",
+        "worker": plan["worker_id"],
+        "worker_status": "done",
+        "summary": "Worker finished through the registered tool.",
+    })
+
+    result = json.loads(raw)
+    stored = _read_store(tmp_path)
+    assert result["status"] == "applied"
+    assert result["task_id"] == task["task_id"]
+    assert stored["tasks"][0]["callbacks"][-1]["callback_id"] == "tool-cb-1"
+    assert token not in json.dumps(stored)
+
+
+def test_supervisor_control_registered_tool_sanitizes_actor_and_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    ctx = _PluginCtx()
+    plugin.register(ctx)
+
+    raw = ctx.tools["supervisor_control"]["handler"]({
+        "action": "append_worker_callback",
+        "payload": {
+            "task_id": "missing",
+            "callback_token": "raw-token-should-not-return",
+            "callback_id": "cb-1",
+        },
+        "actor": {"callback_token": "raw-token-should-not-return", "channel_id": "channel-123"},
+    })
+
+    result = json.loads(raw)
+    assert result["status"] == "not_found"
+    assert "raw-token-should-not-return" not in raw
+    assert "channel-123" not in raw
+    assert not (tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json").exists()
