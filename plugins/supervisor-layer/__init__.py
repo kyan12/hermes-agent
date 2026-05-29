@@ -53,6 +53,7 @@ WORKER_HANDOFF_CONTRACT = {
 WORKER_CALLBACK_AUTH_SCHEMA_VERSION = 1
 WORKER_CALLBACK_ID_LIMIT = 200
 WORKER_CALLBACK_TOKEN_BYTES = 32
+WORKER_DISPATCH_EVENT_LIMIT = 200
 CONTROLLER_ACTOR_SECRET_KEY_RE = re.compile(r"(?i)(token|secret|password|api[_-]?key|authorization|bearer)")
 WORKER_FORBIDDEN_CONTEXT_KEYS = {
     "origin",
@@ -863,6 +864,242 @@ def assign_stored_worker_to_task(
         )
         save_task_store(data)
         return plan
+
+
+def _redact_worker_dispatch_text(value: Any, secret_values: list[str] | None = None) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    for secret_value in secret_values or []:
+        if secret_value:
+            text = text.replace(str(secret_value), "[redacted secret]")
+    if len(text) > 500:
+        text = text[:500]
+    return text
+
+
+def _worker_dispatch_id(result: dict[str, Any], secret_values: list[str] | None = None) -> str | None:
+    value = result.get("dispatch_id") or result.get("id")
+    if value is None and isinstance(result.get("raw_response"), dict):
+        raw = result["raw_response"]
+        value = raw.get("dispatch_id") or raw.get("id")
+    return _redact_worker_dispatch_text(value, secret_values)
+
+
+def _call_worker_dispatcher(dispatcher: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _normalize_send_result(dispatcher(payload))
+    except Exception as exc:
+        return {"success": False, "error": str(exc) or exc.__class__.__name__}
+
+
+def _record_worker_dispatch_attempt(
+    data: dict[str, Any],
+    task_id: str,
+    *,
+    worker_id: str | None,
+    status: str,
+    dispatch_id: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    task = find_task(data, task_id)
+    if task is None:
+        raise KeyError(f"unknown supervisor task: {task_id}")
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status not in {"dispatched", "failed"}:
+        raise ValueError("worker dispatch status must be dispatched or failed")
+    now = _now_iso()
+    dispatches = task.get("worker_dispatches")
+    if not isinstance(dispatches, list):
+        dispatches = []
+        task["worker_dispatches"] = dispatches
+    attempt: dict[str, Any] = {
+        "at": now,
+        "worker": worker_id,
+        "status": normalized_status,
+    }
+    if dispatch_id:
+        attempt["dispatch_id"] = dispatch_id
+    if error:
+        safe_error = _redact_worker_dispatch_text(error)
+        if safe_error:
+            attempt["error"] = safe_error[:500]
+    dispatches.append(attempt)
+    task["worker_dispatches"] = dispatches[-WORKER_DISPATCH_EVENT_LIMIT:]
+    task["worker_dispatch_status"] = normalized_status
+    task["updated_at"] = now
+    if normalized_status == "dispatched":
+        task["state"] = "waiting_agent"
+        task["worker_dispatched_at"] = now
+    elif task.get("state") not in TERMINAL_STATES:
+        task["state"] = "blocked"
+    return attempt
+
+
+def _worker_handoff_without_callback_token(handoff: Any) -> dict[str, Any] | None:
+    if not isinstance(handoff, dict):
+        return None
+    clean = _json_copy(handoff)
+    callback = clean.get("callback")
+    if isinstance(callback, dict):
+        callback.pop("token", None)
+    return clean
+
+
+def _worker_assignment_matches_task(task: dict[str, Any], assignment: dict[str, Any]) -> bool:
+    stored = _worker_assignment_for(task)
+    if stored.get("status") != "ready" or assignment.get("status") != "ready":
+        return False
+    if str(stored.get("worker_id") or "") != str(assignment.get("worker_id") or ""):
+        return False
+    stored_handoff = _worker_handoff_without_callback_token(stored.get("handoff"))
+    assignment_handoff = _worker_handoff_without_callback_token(assignment.get("handoff"))
+    if not stored_handoff or not assignment_handoff or stored_handoff != assignment_handoff:
+        return False
+    assignment_callback = assignment.get("handoff", {}).get("callback") if isinstance(assignment.get("handoff"), dict) else {}
+    token = str(assignment_callback.get("token") or "") if isinstance(assignment_callback, dict) else ""
+    if token:
+        expected_hash = str(_callback_auth_for(task).get("token_hash") or "")
+        if not expected_hash or not hmac.compare_digest(_worker_callback_token_hash(token), expected_hash):
+            return False
+    return True
+
+
+def _worker_dispatch_payload(assignment: dict[str, Any]) -> dict[str, Any] | None:
+    handoff = assignment.get("handoff")
+    if not isinstance(handoff, dict):
+        return None
+    callback = handoff.get("callback")
+    if not isinstance(callback, dict) or not callback.get("token"):
+        return None
+    worker_id = str(assignment.get("worker_id") or handoff.get("worker_id") or "")
+    if not worker_id:
+        return None
+    return {
+        "schema_version": 1,
+        "worker_id": worker_id,
+        "handoff": _json_copy(handoff),
+    }
+
+
+def dispatch_worker_assignment(
+    data: dict[str, Any],
+    task_id: str,
+    *,
+    dispatcher: Any,
+    assignment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Dispatch an already-ready worker assignment through an injected native transport.
+
+    The dispatcher receives only the worker handoff envelope, including the
+    in-memory callback token. Stored task state keeps only the token hash, so a
+    durable dispatch must combine assignment and dispatch in one process.
+    """
+    task = find_task(data, task_id)
+    if task is None:
+        raise KeyError(f"unknown supervisor task: {task_id}")
+    selected = assignment if isinstance(assignment, dict) else _worker_assignment_for(task)
+    if selected.get("status") != "ready" or not selected.get("worker_id"):
+        return {"status": "not_ready", "task_id": task_id, "assignment_status": selected.get("status")}
+    if not _worker_assignment_matches_task(task, selected):
+        return {"status": "assignment_mismatch", "task_id": task_id}
+    payload = _worker_dispatch_payload(selected)
+    if payload is None:
+        return {"status": "missing_callback_token", "task_id": task_id}
+    result = _call_worker_dispatcher(dispatcher, payload)
+    worker_id = str(payload.get("worker_id") or "")
+    callback = payload.get("handoff", {}).get("callback") if isinstance(payload.get("handoff"), dict) else {}
+    callback_token = str(callback.get("token") or "") if isinstance(callback, dict) else ""
+    secret_values = [callback_token] if callback_token else []
+    dispatch_id = _worker_dispatch_id(result, secret_values)
+    if _send_result_ok(result):
+        _record_worker_dispatch_attempt(data, task_id, worker_id=worker_id, status="dispatched", dispatch_id=dispatch_id)
+        return {
+            "status": "dispatched",
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "dispatch_id": dispatch_id,
+        }
+    error = _redact_worker_dispatch_text(_send_result_error(result) or "worker dispatch failed", secret_values) or "worker dispatch failed"
+    _record_worker_dispatch_attempt(data, task_id, worker_id=worker_id, status="failed", dispatch_id=dispatch_id, error=error)
+    return {
+        "status": "failed",
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "dispatch_id": dispatch_id,
+        "error": error,
+    }
+
+
+def dispatch_worker_task(
+    data: dict[str, Any],
+    task_id: str,
+    *,
+    dispatcher: Any,
+    registry: dict[str, Any] | None = None,
+    required_capabilities: list[str] | None = None,
+    max_risk: str | None = None,
+) -> dict[str, Any]:
+    """Assign and immediately dispatch a worker while the callback token is in memory."""
+    assignment = assign_worker_to_task(
+        data,
+        task_id,
+        registry=registry,
+        required_capabilities=required_capabilities,
+        max_risk=max_risk,
+    )
+    if assignment.get("status") != "ready":
+        return {"status": str(assignment.get("status") or "not_ready"), "task_id": task_id, "assignment": assignment}
+    return dispatch_worker_assignment(data, task_id, dispatcher=dispatcher, assignment=assignment)
+
+
+def dispatch_stored_worker_task(
+    task_id: str,
+    *,
+    dispatcher: Any,
+    registry: dict[str, Any] | None = None,
+    required_capabilities: list[str] | None = None,
+    max_risk: str | None = None,
+) -> dict[str, Any]:
+    """Locked durable-store wrapper that assigns and dispatches in one token-safe pass."""
+    with _task_store_lock():
+        data = load_task_store()
+        assignment = assign_worker_to_task(
+            data,
+            task_id,
+            registry=registry,
+            required_capabilities=required_capabilities,
+            max_risk=max_risk,
+        )
+        if assignment.get("status") != "ready":
+            result = {"status": str(assignment.get("status") or "not_ready"), "task_id": task_id, "assignment": assignment}
+            try:
+                save_task_store(data)
+            except Exception as exc:
+                result["audit_persisted"] = False
+                result["audit_error"] = str(exc) or exc.__class__.__name__
+                return result
+            result["audit_persisted"] = True
+            return result
+        try:
+            save_task_store(data)
+        except Exception as exc:
+            return {
+                "status": "assignment_persist_failed",
+                "task_id": task_id,
+                "worker_id": assignment.get("worker_id"),
+                "audit_persisted": False,
+                "audit_error": str(exc) or exc.__class__.__name__,
+            }
+        result = dispatch_worker_assignment(data, task_id, dispatcher=dispatcher, assignment=assignment)
+        try:
+            save_task_store(data)
+        except Exception as exc:
+            result["audit_persisted"] = False
+            result["audit_error"] = str(exc) or exc.__class__.__name__
+            return result
+        result["audit_persisted"] = True
+        return result
 
 
 def _task_id(origin: dict[str, Any], text: str) -> str:

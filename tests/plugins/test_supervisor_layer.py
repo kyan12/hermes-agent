@@ -1540,6 +1540,210 @@ def test_assign_stored_worker_to_task_locks_loads_assigns_and_saves(monkeypatch,
     assert updated["tasks"][0]["state"] == "triaged"
 
 
+def test_dispatch_worker_task_sends_sanitized_handoff_and_records_waiting(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    task["context_refs"] = {
+        "files": ["/tmp/safe-notes.md", "/tmp/channel-123-notes.md"],
+        "urls": ["https://example.test/safe", "https://discord.test/channel-123"],
+        "repos": ["git@example.test:safe/repo.git", "git@example.test:thread-456/repo.git"],
+    }
+    calls = []
+
+    def dispatcher(payload):
+        calls.append(payload)
+        return {"success": True, "dispatch_id": "dispatch-1"}
+
+    result = plugin.dispatch_worker_task(data, task["task_id"], dispatcher=dispatcher, required_capabilities=["code"])
+
+    assert result["status"] == "dispatched"
+    assert result["dispatch_id"] == "dispatch-1"
+    assert len(calls) == 1
+    payload = calls[0]
+    payload_text = json.dumps(payload)
+    assert set(payload) == {"schema_version", "worker_id", "handoff"}
+    assert payload["worker_id"] == "code-crab"
+    assert payload["handoff"]["callback"]["token"]
+    assert payload["handoff"]["callback"]["action"] == "append_worker_callback"
+    assert payload["handoff"]["context_refs"]["files"] == ["/tmp/safe-notes.md"]
+    assert payload["handoff"]["context_refs"]["urls"] == ["https://example.test/safe"]
+    assert payload["handoff"]["context_refs"]["repos"] == ["git@example.test:safe/repo.git"]
+    assert task["state"] == "waiting_agent"
+    assert task["worker_dispatches"][-1]["status"] == "dispatched"
+    assert task["worker_dispatches"][-1]["dispatch_id"] == "dispatch-1"
+    assert '"origin"' not in payload_text
+    assert task["task_id"] not in payload_text
+    assert "channel-123" not in payload_text
+    assert "thread-456" not in payload_text
+    assert payload["handoff"]["callback"]["token"] not in json.dumps(task)
+
+
+def test_dispatch_worker_assignment_without_callback_token_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    plugin.assign_worker_to_task(data, task["task_id"], required_capabilities=["code"])
+    calls = []
+
+    result = plugin.dispatch_worker_assignment(data, task["task_id"], dispatcher=lambda payload: calls.append(payload))
+
+    assert result["status"] == "missing_callback_token"
+    assert calls == []
+    assert task["state"] == "triaged"
+    assert "worker_dispatches" not in task
+
+
+def test_dispatch_worker_assignment_rejects_cross_task_assignment(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    first = plugin.upsert_intake_task(data, _event(text="First bug", message_id="msg-1"), "First bug")
+    second = plugin.upsert_intake_task(data, _event(text="Second bug", message_id="msg-2"), "Second bug")
+    first_assignment = plugin.assign_worker_to_task(data, first["task_id"], required_capabilities=["code"])
+    plugin.assign_worker_to_task(data, second["task_id"], required_capabilities=["code"])
+    calls = []
+
+    result = plugin.dispatch_worker_assignment(data, second["task_id"], dispatcher=lambda payload: calls.append(payload), assignment=first_assignment)
+
+    assert result["status"] == "assignment_mismatch"
+    assert calls == []
+    assert second["state"] == "triaged"
+    assert "worker_dispatches" not in second
+
+
+def test_dispatch_worker_assignment_rejects_mutated_handoff_fields(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    assignment = plugin.assign_worker_to_task(data, task["task_id"], required_capabilities=["code"])
+    assignment["handoff"]["origin"] = task["origin"]
+    calls = []
+
+    result = plugin.dispatch_worker_assignment(data, task["task_id"], dispatcher=lambda payload: calls.append(payload), assignment=assignment)
+
+    assert result["status"] == "assignment_mismatch"
+    assert calls == []
+    assert task["state"] == "triaged"
+    assert "worker_dispatches" not in task
+
+
+def test_dispatch_worker_task_does_not_apply_inline_worker_result(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+
+    def dispatcher(_payload):
+        return {"success": True, "dispatch_id": "dispatch-2", "worker_status": "done", "summary": "Inline result should be ignored."}
+
+    result = plugin.dispatch_worker_task(data, task["task_id"], dispatcher=dispatcher, required_capabilities=["code"])
+
+    assert result["status"] == "dispatched"
+    assert task["state"] == "waiting_agent"
+    assert "callbacks" not in task
+    assert "Inline result should be ignored." not in json.dumps(task)
+
+
+def test_dispatch_worker_failure_redacts_callback_token_from_audit(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    seen = {}
+
+    def dispatcher(payload):
+        token = payload["handoff"]["callback"]["token"]
+        seen["token"] = token
+        return {"success": False, "dispatch_id": f"dispatch-{token}", "error": f"transport failed token={token}"}
+
+    result = plugin.dispatch_worker_task(data, task["task_id"], dispatcher=dispatcher, required_capabilities=["code"])
+
+    assert result["status"] == "failed"
+    serialized_task = json.dumps(task)
+    assert seen["token"] not in serialized_task
+    assert seen["token"] not in json.dumps(result)
+    assert "[redacted secret]" in serialized_task
+    assert task["worker_dispatches"][-1]["status"] == "failed"
+
+
+def test_worker_dispatch_audit_is_bounded(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+
+    for index in range(plugin.WORKER_DISPATCH_EVENT_LIMIT + 5):
+        plugin._record_worker_dispatch_attempt(
+            data,
+            task["task_id"],
+            worker_id="code-crab",
+            status="failed",
+            dispatch_id=f"dispatch-{index}",
+            error="boom",
+        )
+
+    assert len(task["worker_dispatches"]) == plugin.WORKER_DISPATCH_EVENT_LIMIT
+    assert task["worker_dispatches"][0]["dispatch_id"] == "dispatch-5"
+
+
+def test_dispatch_stored_worker_task_persists_callback_auth_before_external_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    plugin.save_task_store(data)
+    snapshots = []
+    real_save = plugin.save_task_store
+
+    def flaky_save(next_data):
+        snapshots.append(json.loads(json.dumps(next_data)))
+        if len(snapshots) == 2:
+            raise RuntimeError("second save failed")
+        return real_save(next_data)
+
+    monkeypatch.setattr(plugin, "save_task_store", flaky_save)
+    calls = []
+
+    def dispatcher(payload):
+        calls.append(payload)
+        return {"success": True, "dispatch_id": "dispatch-after-auth"}
+
+    result = plugin.dispatch_stored_worker_task(task["task_id"], dispatcher=dispatcher, required_capabilities=["code"])
+
+    assert calls and calls[0]["handoff"]["callback"]["token"]
+    assert result["status"] == "dispatched"
+    assert result["audit_persisted"] is False
+    assert snapshots[0]["tasks"][0]["worker_assignment"]["callback_auth"]["token_hash"]
+    assert calls[0]["handoff"]["callback"]["token"] not in json.dumps(snapshots[0])
+
+
+def test_dispatch_stored_worker_task_locks_assigns_dispatches_and_saves(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    plugin.save_task_store(data)
+    calls = []
+
+    def dispatcher(payload):
+        calls.append(payload)
+        return {"success": True, "id": "dispatch-stored"}
+
+    result = plugin.dispatch_stored_worker_task(task["task_id"], dispatcher=dispatcher, required_capabilities=["code"])
+
+    updated = _read_store(tmp_path)
+    assert result["status"] == "dispatched"
+    assert result["audit_persisted"] is True
+    assert calls[0]["handoff"]["callback"]["token"]
+    assert updated["tasks"][0]["state"] == "waiting_agent"
+    assert updated["tasks"][0]["worker_dispatches"][-1]["dispatch_id"] == "dispatch-stored"
+    assert calls[0]["handoff"]["callback"]["token"] not in json.dumps(updated)
+
+
 def test_origin_ref_is_task_opaque_not_same_for_same_origin(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
