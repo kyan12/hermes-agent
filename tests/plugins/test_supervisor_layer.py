@@ -1386,9 +1386,12 @@ def test_assign_worker_to_task_records_portable_dispatch_plan(monkeypatch, tmp_p
     assert plan["status"] == "ready"
     assert task["owner"] == plan["worker_id"]
     assert task["state"] == "triaged"
-    assert task["worker_assignment"] == plan
+    assert task["worker_assignment"]["worker_id"] == plan["worker_id"]
     assert task["worker_assignment"]["handoff"]["origin_ref"]
     assert "origin" not in task["worker_assignment"]["handoff"]
+    assert plan["handoff"]["callback"]["token"]
+    assert "token" not in task["worker_assignment"]["handoff"]["callback"]
+    assert task["worker_assignment"]["callback_auth"]["token_hash"]
 
 
 def test_ready_worker_assignment_clears_stale_attention_state(monkeypatch, tmp_path):
@@ -1405,6 +1408,121 @@ def test_ready_worker_assignment_clears_stale_attention_state(monkeypatch, tmp_p
     assert task["attention"]["queued"] is False
     assert task["attention"]["ask"] is None
     assert "Old ask" not in json.dumps(task["attention"])
+
+
+def test_worker_callback_control_requires_token_and_uses_opaque_task_ref(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    plan = plugin.assign_worker_to_task(data, task["task_id"], required_capabilities=["code"])
+    callback = plan["handoff"]["callback"]
+    token = callback["token"]
+    opaque_task_id = callback["task_id"]
+    plugin.save_task_store(data)
+
+    result = plugin.supervisor_control(
+        "append_worker_callback",
+        payload={
+            "task_id": opaque_task_id,
+            "callback_token": token,
+            "callback_id": "cb-1",
+            "worker": plan["worker_id"],
+            "worker_status": "done",
+            "summary": "Tests are green.",
+        },
+        actor={"worker": plan["worker_id"], "callback_token": token},
+    )
+
+    assert result["status"] == "applied"
+    assert result["task_id"] == task["task_id"]
+    assert result["callback_id"] == "cb-1"
+    stored = _read_store(tmp_path)
+    stored_task = stored["tasks"][0]
+    serialized_store = json.dumps(stored)
+    assert stored_task["state"] == "review"
+    assert stored_task["callbacks"][-1]["callback_id"] == "cb-1"
+    assert stored_task["callbacks"][-1]["summary"] == "Tests are green."
+    assert stored_task["worker_assignment"]["callback_auth"]["token_hash"]
+    assert token not in serialized_store
+    assert stored["control_plane"]["last_event_seq"] == 1
+
+
+def test_worker_callback_control_rejects_bad_token_without_mutating(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    plan = plugin.assign_worker_to_task(data, task["task_id"], required_capabilities=["code"])
+    opaque_task_id = plan["handoff"]["callback"]["task_id"]
+    plugin.save_task_store(data)
+
+    result = plugin.supervisor_control(
+        "append_worker_callback",
+        payload={
+            "task_id": opaque_task_id,
+            "callback_token": "wrong-token",
+            "callback_id": "cb-evil",
+            "worker": plan["worker_id"],
+            "worker_status": "done",
+            "summary": "Pretend this is complete.",
+        },
+        actor={"worker": "attacker", "channel_id": "channel-123"},
+    )
+
+    assert result["status"] == "unauthorized"
+    assert "dashboard" not in result
+    assert "rendered_dashboard" not in result
+    stored = _read_store(tmp_path)
+    stored_task = stored["tasks"][0]
+    assert stored_task["state"] == "triaged"
+    assert "callbacks" not in stored_task
+    assert stored["control_plane"]["last_event_seq"] == 0
+    assert "wrong-token" not in json.dumps(result)
+
+
+def test_worker_callback_control_dedupes_callback_id_without_second_mutation(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    data = {"schema_version": 1, "tasks": []}
+    task = plugin.upsert_intake_task(data, _event(text="Code Crab should inspect this bug"), "Code Crab should inspect this bug")
+    plan = plugin.assign_worker_to_task(data, task["task_id"], required_capabilities=["code"])
+    callback = plan["handoff"]["callback"]
+    token = callback["token"]
+    plugin.save_task_store(data)
+
+    first = plugin.supervisor_control(
+        "append_worker_callback",
+        payload={
+            "task_id": callback["task_id"],
+            "callback_token": token,
+            "callback_id": "cb-repeat",
+            "worker": plan["worker_id"],
+            "worker_status": "blocked",
+            "summary": "Need a decision.",
+        },
+    )
+    second = plugin.supervisor_control(
+        "append_worker_callback",
+        payload={
+            "task_id": callback["task_id"],
+            "callback_token": token,
+            "callback_id": "cb-repeat",
+            "worker": plan["worker_id"],
+            "worker_status": "done",
+            "summary": "Different duplicate payload should not overwrite.",
+            "needs_human": True,
+            "ask": "Should I proceed?",
+        },
+    )
+
+    assert first["status"] == "applied"
+    assert second["status"] == "duplicate"
+    stored_task = _read_store(tmp_path)["tasks"][0]
+    assert len(stored_task["callbacks"]) == 1
+    assert stored_task["callbacks"][0]["summary"] == "Need a decision."
+    assert stored_task["state"] == "blocked"
+    assert stored_task["attention"]["active"] is False
 
 
 def test_assign_stored_worker_to_task_locks_loads_assigns_and_saves(monkeypatch, tmp_path):

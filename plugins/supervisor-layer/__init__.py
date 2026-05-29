@@ -10,9 +10,11 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import tempfile
 import threading
 import unicodedata
@@ -48,6 +50,10 @@ WORKER_HANDOFF_CONTRACT = {
     "output": "worker_callback_envelope",
     "transport": "agent_system_native",
 }
+WORKER_CALLBACK_AUTH_SCHEMA_VERSION = 1
+WORKER_CALLBACK_ID_LIMIT = 200
+WORKER_CALLBACK_TOKEN_BYTES = 32
+CONTROLLER_ACTOR_SECRET_KEY_RE = re.compile(r"(?i)(token|secret|password|api[_-]?key|authorization|bearer)")
 WORKER_FORBIDDEN_CONTEXT_KEYS = {
     "origin",
     "route",
@@ -508,6 +514,120 @@ def _task_ref_for_worker(task: dict[str, Any]) -> str:
     return f"wtsk_{hashlib.sha256(f'worker-task|{seed}'.encode('utf-8')).hexdigest()[:16]}"
 
 
+def _json_copy(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _new_worker_callback_token() -> str:
+    return secrets.token_urlsafe(WORKER_CALLBACK_TOKEN_BYTES)
+
+
+def _worker_callback_token_hash(token: Any) -> str:
+    return hashlib.sha256(f"worker-callback-token|{str(token or '')}".encode("utf-8")).hexdigest()
+
+
+def _attach_worker_callback_auth(task: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    """Store callback auth hash on the task and return a worker-visible token once."""
+    stored_plan = _json_copy(plan)
+    returned_plan = _json_copy(plan)
+    stored_handoff = stored_plan.get("handoff") if isinstance(stored_plan.get("handoff"), dict) else None
+    returned_handoff = returned_plan.get("handoff") if isinstance(returned_plan.get("handoff"), dict) else None
+    if stored_handoff is None or returned_handoff is None:
+        task["worker_assignment"] = stored_plan
+        return returned_plan
+    callback_task_id = str(stored_handoff.get("task_id") or _task_ref_for_worker(task))
+    token = _new_worker_callback_token()
+    stored_handoff["callback"] = {
+        "schema_version": WORKER_CALLBACK_AUTH_SCHEMA_VERSION,
+        "action": "append_worker_callback",
+        "task_id": callback_task_id,
+        "token_required": True,
+        "callback_id_required": True,
+    }
+    returned_handoff["callback"] = {
+        **stored_handoff["callback"],
+        "token": token,
+    }
+    stored_plan["callback_auth"] = {
+        "schema_version": WORKER_CALLBACK_AUTH_SCHEMA_VERSION,
+        "token_hash": _worker_callback_token_hash(token),
+        "issued_at": _now_iso(),
+        "used_callback_ids": [],
+    }
+    task["worker_assignment"] = stored_plan
+    return returned_plan
+
+
+def _worker_assignment_for(task: dict[str, Any]) -> dict[str, Any]:
+    assignment = task.get("worker_assignment")
+    return assignment if isinstance(assignment, dict) else {}
+
+
+def _worker_callback_ref_for(task: dict[str, Any]) -> str | None:
+    assignment = _worker_assignment_for(task)
+    handoff = assignment.get("handoff")
+    if not isinstance(handoff, dict):
+        return None
+    callback = handoff.get("callback")
+    if isinstance(callback, dict) and callback.get("task_id"):
+        return str(callback.get("task_id"))
+    if handoff.get("task_id"):
+        return str(handoff.get("task_id"))
+    return None
+
+
+def _find_task_for_worker_callback(data: dict[str, Any], task_ref: Any) -> dict[str, Any] | None:
+    ref = str(task_ref or "")
+    if not ref:
+        return None
+    direct = find_task(data, ref)
+    if direct is not None:
+        return direct
+    for task in _dashboard_tasks(data):
+        if _worker_callback_ref_for(task) == ref:
+            return task
+    return None
+
+
+def _callback_auth_for(task: dict[str, Any]) -> dict[str, Any]:
+    auth = _worker_assignment_for(task).get("callback_auth")
+    return auth if isinstance(auth, dict) else {}
+
+
+def _used_callback_ids(auth: dict[str, Any]) -> list[str]:
+    used = auth.get("used_callback_ids")
+    if not isinstance(used, list):
+        used = []
+    normalized = [str(item) for item in used if str(item or "")]
+    auth["used_callback_ids"] = normalized[-WORKER_CALLBACK_ID_LIMIT:]
+    return auth["used_callback_ids"]
+
+
+def _validate_worker_callback_payload(data: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    task = _find_task_for_worker_callback(data, payload.get("task_id") or payload.get("worker_task_id"))
+    if task is None:
+        return {"status": "not_found", "task": None, "callback_id": None}
+    auth = _callback_auth_for(task)
+    expected_hash = str(auth.get("token_hash") or "")
+    token = str(payload.get("callback_token") or payload.get("token") or "")
+    callback_id = _clean_text(str(payload.get("callback_id") or payload.get("nonce") or ""))
+    if not expected_hash or not token or not callback_id:
+        return {"status": "unauthorized", "task": task, "callback_id": callback_id or None}
+    if not hmac.compare_digest(_worker_callback_token_hash(token), expected_hash):
+        return {"status": "unauthorized", "task": task, "callback_id": callback_id}
+    if callback_id in _used_callback_ids(auth):
+        return {"status": "duplicate", "task": task, "callback_id": callback_id}
+    return {"status": "authorized", "task": task, "callback_id": callback_id}
+
+
+def _mark_worker_callback_used(task: dict[str, Any], callback_id: str) -> None:
+    auth = _callback_auth_for(task)
+    used = _used_callback_ids(auth)
+    if callback_id not in used:
+        used.append(callback_id)
+        auth["used_callback_ids"] = used[-WORKER_CALLBACK_ID_LIMIT:]
+
+
 def _worker_context_key_forbidden(key: Any) -> bool:
     if not _is_ascii_text(key):
         return True
@@ -691,10 +811,10 @@ def assign_worker_to_task(
     if task is None:
         raise KeyError(f"unknown supervisor task: {task_id}")
     plan = plan_worker_dispatch(task, registry=registry, required_capabilities=required_capabilities, max_risk=max_risk)
-    task["worker_assignment"] = plan
     now = _now_iso()
     task["updated_at"] = now
     if plan["status"] == "ready" and plan.get("worker_id"):
+        plan = _attach_worker_callback_auth(task, plan)
         task["owner"] = plan["worker_id"]
         if task.get("state") not in {"doing", "review", "done"}:
             task["state"] = "triaged"
@@ -705,6 +825,7 @@ def assign_worker_to_task(
             "queued": False,
         }
         return plan
+    task["worker_assignment"] = plan
     task["owner"] = "supervisor"
     if plan["status"] == "no_match":
         ask = "Pick the right specialist for this task."
@@ -1068,6 +1189,7 @@ def append_worker_callback(
     recommended_default: str | None = None,
     why_now: str | None = None,
     where: str | None = None,
+    callback_id: str | None = None,
 ) -> str | None:
     """Record a worker callback and optionally request Kevin attention."""
     task = find_task(data, task_id)
@@ -1078,12 +1200,15 @@ def append_worker_callback(
     if not isinstance(callbacks, list):
         callbacks = []
         task["callbacks"] = callbacks
-    callbacks.append({
+    callback_record = {
         "at": now,
         "worker": worker,
         "status": status,
         "summary": summary,
-    })
+    }
+    if callback_id:
+        callback_record["callback_id"] = callback_id
+    callbacks.append(callback_record)
     task["updated_at"] = now
     if needs_human:
         return request_human_attention(
@@ -1347,13 +1472,30 @@ def _controller_action_slug(action: Any) -> str:
     return slug.replace("-", "_")
 
 
+def _controller_actor_sanitized(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if CONTROLLER_ACTOR_SECRET_KEY_RE.search(key_text):
+                sanitized[key_text] = "[redacted secret]"
+            else:
+                sanitized[key_text] = _controller_actor_sanitized(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_controller_actor_sanitized(item) for item in value]
+    if isinstance(value, tuple):
+        return [_controller_actor_sanitized(item) for item in value]
+    return value
+
+
 def _controller_actor_ref(actor: Any) -> str:
     if actor is None:
         return "system"
     if isinstance(actor, str):
         raw = actor
     elif isinstance(actor, dict):
-        raw = json.dumps(actor, sort_keys=True, ensure_ascii=False)
+        raw = json.dumps(_controller_actor_sanitized(actor), sort_keys=True, ensure_ascii=False)
     else:
         raw = str(actor)
     return _dashboard_safe_text(raw, fallback="[redacted route ref]", limit=80) or "[redacted route ref]"
@@ -1470,13 +1612,26 @@ def supervisor_control(action: Any, *, payload: dict[str, Any] | None = None, ac
             save_task_store(data)
             return {"status": status, "action": action_slug, "task_id": task_id, "event_seq": event["seq"], **_controller_dashboard_payload(data)}
         if action_slug == "append_worker_callback":
-            task_id = str(payload.get("task_id") or "")
-            if not task_id or find_task(data, task_id) is None:
-                return {"status": "not_found", "action": action_slug, **_controller_dashboard_payload(data)}
+            validation = _validate_worker_callback_payload(data, payload)
+            callback_id = validation.get("callback_id")
+            task = validation.get("task")
+            if validation["status"] == "not_found" or not isinstance(task, dict):
+                return {"status": "not_found", "action": action_slug}
+            task_id = str(task.get("task_id") or "")
+            if validation["status"] == "unauthorized":
+                return {"status": "unauthorized", "action": action_slug}
+            if validation["status"] == "duplicate":
+                return {
+                    "status": "duplicate",
+                    "action": action_slug,
+                    "task_id": task_id,
+                    "callback_id": callback_id,
+                    **_controller_dashboard_payload(data),
+                }
             attention_status = append_worker_callback(
                 data,
                 task_id,
-                worker=str(payload.get("worker") or "unknown-worker"),
+                worker=str(payload.get("worker") or task.get("owner") or "unknown-worker"),
                 status=str(payload.get("worker_status") or payload.get("status") or "reported"),
                 summary=str(payload.get("summary") or "Worker callback received."),
                 needs_human=bool(payload.get("needs_human")),
@@ -1484,18 +1639,26 @@ def supervisor_control(action: Any, *, payload: dict[str, Any] | None = None, ac
                 recommended_default=payload.get("recommended_default"),
                 why_now=payload.get("why_now"),
                 where=payload.get("where"),
+                callback_id=str(callback_id or ""),
             )
+            _mark_worker_callback_used(task, str(callback_id or ""))
             event = _record_controller_event(data, action=action_slug, status="applied", actor=actor, task_id=task_id)
             save_task_store(data)
             return {
                 "status": "applied",
                 "action": action_slug,
                 "task_id": task_id,
+                "callback_id": callback_id,
                 "attention_status": attention_status,
                 "event_seq": event["seq"],
                 **_controller_dashboard_payload(data),
             }
     return {"status": "unknown_action", "action": "unknown"}
+
+
+def worker_callback(payload: dict[str, Any], *, actor: Any = None) -> dict[str, Any]:
+    """Thin authenticated worker-callback wrapper around supervisor_control."""
+    return supervisor_control("append_worker_callback", payload=payload, actor=actor)
 
 
 def _configured_supervisor_surface_ids() -> set[str]:
