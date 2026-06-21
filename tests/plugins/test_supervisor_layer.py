@@ -57,7 +57,20 @@ def _event(
     )
 
 
+def _supervisor_event(**kwargs):
+    """Event on the dedicated Supervisor surface.
+
+    Fresh natural-language intake is intentionally scoped to this surface so
+    normal project/business channels retain ordinary conversation continuity.
+    """
+    kwargs.setdefault("chat_id", "supervisor-channel")
+    kwargs.setdefault("chat_name", "🧠-supervisor")
+    kwargs.setdefault("thread_id", None)
+    return _event(**kwargs)
+
+
 class _Gateway:
+
     def __init__(self, authorized: bool, update_pending: bool = False):
         self.authorized = authorized
         self._update_prompt_pending = {"session-key": True} if update_pending else {}
@@ -122,7 +135,7 @@ def test_bare_punctuation_passes_through_without_new_task(monkeypatch, tmp_path)
 def test_standalone_continuation_reply_to_active_attention_item_is_captured(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
-    first = _event(text="I need to approve the DIDA collection order")
+    first = _supervisor_event(text="I need to approve the DIDA collection order")
     plugin.pre_gateway_dispatch(event=first, gateway=_Gateway(True), session_store=None)
 
     data = _read_store(tmp_path)
@@ -131,18 +144,32 @@ def test_standalone_continuation_reply_to_active_attention_item_is_captured(monk
     task["attention"] = {"active": True, "ask": "Keep going?", "reply_style": "natural_language"}
     plugin.save_task_store(data)
 
-    for reply in ("continue", "?"):
-        result = plugin.pre_gateway_dispatch(event=_event(text=reply), gateway=_Gateway(True), session_store=None)
-        assert result and result["action"] == "rewrite"
+    result = plugin.pre_gateway_dispatch(event=_supervisor_event(text="continue"), gateway=_Gateway(True), session_store=None)
+    assert result and result["action"] == "rewrite"
+    assert "control reply was applied" in result["text"].lower()
 
-    updated = _read_store(tmp_path)
-    assert [reply["text"] for reply in updated["tasks"][0]["human_replies"][-2:]] == ["continue", "?"]
+
+def test_normal_channel_message_preserves_gateway_session_continuity(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    event = _event(
+        text="Does this still need compliance from what we were doing before?",
+        chat_id="business-general",
+        chat_name="ProteusX AI / #💼-business-general",
+        thread_id=None,
+        message_id="msg-normal-followup",
+    )
+
+    result = plugin.pre_gateway_dispatch(event=event, gateway=_Gateway(True), session_store=None)
+
+    assert result is None
+    assert not (tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json").exists()
 
 
 def test_new_message_creates_origin_routed_task_and_rewrites_to_supervisor_context(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
-    event = _event(text="Can you get Code Crab to inspect the failing deploy?")
+    event = _supervisor_event(text="Can you get Code Crab to inspect the failing deploy?")
 
     result = plugin.pre_gateway_dispatch(event=event, gateway=_Gateway(True), session_store=None)
 
@@ -150,6 +177,7 @@ def test_new_message_creates_origin_routed_task_and_rewrites_to_supervisor_conte
     rewritten = result["text"]
     assert "[Supervisor layer context]" in rewritten
     assert "Origin envelope" in rewritten
+    assert "Recent same-origin supervisor context" in rewritten
     assert "Do not require slash commands" in rewritten
     assert "Can you get Code Crab to inspect the failing deploy?" in rewritten
 
@@ -159,16 +187,40 @@ def test_new_message_creates_origin_routed_task_and_rewrites_to_supervisor_conte
     task = data["tasks"][0]
     assert task["state"] == "inbox"
     assert task["origin"]["platform"] == "discord"
-    assert task["origin"]["thread_id"] == "thread-456"
+    assert task["origin"]["thread_id"] is None
     assert task["origin"]["fallback_route"] == "origin"
     assert task["human_interaction"]["mode"] == "natural_language"
     assert task["human_interaction"]["commands_required"] is False
 
 
+def test_isolated_new_task_packet_includes_recent_same_origin_context(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+
+    first = _supervisor_event(
+        text="Need to set up a Twilio 1800 number for Pharmacy Specs with automated answer and texting",
+        message_id="msg-twilio-1",
+    )
+    plugin.pre_gateway_dispatch(event=first, gateway=_Gateway(True), session_store=None)
+    data = _read_store(tmp_path)
+    plugin.complete_task(data, data["tasks"][0]["task_id"], result="answered checklist")
+    plugin.save_task_store(data)
+
+    followup = _supervisor_event(text="most of this is not needed for twilio", message_id="msg-twilio-2")
+    result = plugin.pre_gateway_dispatch(event=followup, gateway=_Gateway(True), session_store=None)
+
+    assert result and result["action"] == "rewrite"
+    rewritten = result["text"]
+    assert "Recent same-origin supervisor context" in rewritten
+    assert "Twilio 1800 number for Pharmacy Specs" in rewritten
+    assert "most of this" in rewritten
+    assert "retrieve recent origin messages" in rewritten
+
+
 def test_natural_reply_to_active_attention_item_is_captured_without_command(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
-    first = _event(text="I need to approve the DIDA collection order")
+    first = _supervisor_event(text="I need to approve the DIDA collection order")
     plugin.pre_gateway_dispatch(event=first, gateway=_Gateway(True), session_store=None)
 
     data = _read_store(tmp_path)
@@ -181,7 +233,7 @@ def test_natural_reply_to_active_attention_item_is_captured_without_command(monk
     }
     plugin.save_task_store(data)
 
-    reply = _event(text="yeah approve the safer default and keep going")
+    reply = _supervisor_event(text="yeah approve the safer default and keep going")
     result = plugin.pre_gateway_dispatch(event=reply, gateway=_Gateway(True), session_store=None)
 
     assert result["action"] == "rewrite"
@@ -203,7 +255,7 @@ def test_natural_reply_to_active_attention_item_is_captured_without_command(monk
 def test_same_origin_duplicate_intake_merges_instead_of_spawning_parallel_asks(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
-    event = _event(text="Please check whether the WebAir bootstrap is blocked")
+    event = _supervisor_event(text="Please check whether the WebAir bootstrap is blocked")
 
     plugin.pre_gateway_dispatch(event=event, gateway=_Gateway(True), session_store=None)
     plugin.pre_gateway_dispatch(event=event, gateway=_Gateway(True), session_store=None)
@@ -246,8 +298,8 @@ def test_distinct_unicode_messages_do_not_merge_via_empty_ascii_fingerprint(monk
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
 
-    plugin.pre_gateway_dispatch(event=_event(text="审批发票"), gateway=_Gateway(True), session_store=None)
-    plugin.pre_gateway_dispatch(event=_event(text="安排会议"), gateway=_Gateway(True), session_store=None)
+    plugin.pre_gateway_dispatch(event=_supervisor_event(text="审批发票"), gateway=_Gateway(True), session_store=None)
+    plugin.pre_gateway_dispatch(event=_supervisor_event(text="安排会议"), gateway=_Gateway(True), session_store=None)
 
     data = _read_store(tmp_path)
     assert [task["objective"] for task in data["tasks"]] == ["审批发票", "安排会议"]
@@ -717,10 +769,8 @@ def test_configured_supervisor_channel_ids_disable_name_fallback(monkeypatch, tm
         session_store=None,
     )
 
-    assert result["action"] == "rewrite"
-    assert "Current supervisor dashboard" not in result["text"]
-    data = _read_store(tmp_path)
-    assert [task["objective"] for task in data["tasks"]] == ["status"]
+    assert result is None
+    assert not (tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json").exists()
 
 
 def test_supervisor_channel_smart_apostrophe_status_does_not_create_task(monkeypatch, tmp_path):
@@ -822,7 +872,7 @@ def test_supervisor_channel_status_message_rewrites_to_dashboard_without_new_tas
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
     plugin.pre_gateway_dispatch(
-        event=_event(text="Rename product", message_id="msg-1"),
+        event=_supervisor_event(text="Rename product", message_id="msg-1"),
         gateway=_Gateway(True),
         session_store=None,
     )
@@ -850,7 +900,7 @@ def test_supervisor_channel_reply_captures_global_active_attention(monkeypatch, 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plugin = _load_plugin()
     plugin.pre_gateway_dispatch(
-        event=_event(text="Approve invoice draft", message_id="msg-1"),
+        event=_supervisor_event(text="Approve invoice draft", message_id="msg-1"),
         gateway=_Gateway(True),
         session_store=None,
     )
@@ -1950,7 +2000,7 @@ def test_pending_clarify_text_reply_takes_precedence_over_supervisor_rewrite(mon
     assert not (tmp_path / "workspace" / "supervisor" / "state" / "supervisor-tasks.json").exists()
 
 
-def test_bluebubbles_briefing_guard_only_yields_for_configured_alert_recipient(monkeypatch, tmp_path):
+def test_bluebubbles_briefing_guard_only_yields_in_legacy_rollback_mode(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_TEXT_ALERT_TO", raising=False)
     plugin = _load_plugin()
@@ -1960,14 +2010,73 @@ def test_bluebubbles_briefing_guard_only_yields_for_configured_alert_recipient(m
     queue_path.write_text(json.dumps({"items": [{"status": "sent"}]}))
 
     event = _event(text="this BlueBubbles task is not a briefing reply", platform="bluebubbles", thread_id=None)
-    event.source.user_id = "+15551234567"
-    event.source.chat_id = "+15551234567"
+    event.source.user_id = "+155****4567"
+    event.source.chat_id = "+155****4567"
 
+    result = plugin.pre_gateway_dispatch(event=event, gateway=_Gateway(True), session_store=None)
+    assert result is None
+
+    monkeypatch.setenv("HERMES_TEXT_ALERT_TO", "+155****4567")
+    # Unified Supervisor briefing mode is default-on, so the legacy briefing
+    # guard no longer steals BlueBubbles replies merely because an old queue file
+    # has an active item.
+    assert plugin._briefing_queue_should_handle(event) is False
     result = plugin.pre_gateway_dispatch(event=event, gateway=_Gateway(True), session_store=None)
     assert result and result["action"] == "rewrite"
 
-    monkeypatch.setenv("HERMES_TEXT_ALERT_TO", "+15551234567")
+    monkeypatch.setenv("HERMES_BRIEFING_SUPERVISOR_UNIFIED", "0")
     assert plugin._briefing_queue_should_handle(event) is True
+    assert plugin.pre_gateway_dispatch(event=event, gateway=_Gateway(True), session_store=None) is None
+
+
+def test_configured_bluebubbles_text_channel_is_global_supervisor_surface_outside_briefing(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_TEXT_ALERT_TO", "+15551234716")
+    plugin = _load_plugin()
+
+    discord_event = _supervisor_event(text="Approve the safer production default?", platform="discord")
+    plugin.pre_gateway_dispatch(event=discord_event, gateway=_Gateway(True), session_store=None)
+    data = _read_store(tmp_path)
+    task = data["tasks"][0]
+    plugin.request_human_attention(
+        data,
+        task["task_id"],
+        ask="Approve the safer production default?",
+        recommended_default="approve",
+        why_now="unblocks the worker",
+        where="text or origin thread",
+    )
+    plugin.save_task_store(data)
+
+    text_event = _event(text="yes use the default", platform="bluebubbles", thread_id=None)
+    text_event.source.chat_id = "+15551234716"
+    text_event.source.user_id = "+15551234716"
+    text_event.source.chat_name = "Home"
+
+    result = plugin.pre_gateway_dispatch(event=text_event, gateway=_Gateway(True), session_store=None)
+
+    assert result and result["action"] == "rewrite"
+    assert "Active supervisor task" in result["text"]
+    assert "yes use the default" in result["text"]
+    updated = _read_store(tmp_path)
+    assert updated["tasks"][0]["human_replies"][-1]["text"] == "yes use the default"
+
+
+def test_bluebubbles_home_channel_can_be_text_supervisor_surface(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_TEXT_ALERT_TO", raising=False)
+    monkeypatch.setenv("BLUEBUBBLES_HOME_CHANNEL", "+15551234716")
+    plugin = _load_plugin()
+
+    event = _event(text="status", platform="bluebubbles", thread_id=None)
+    event.source.chat_id = "+15551234716"
+    event.source.user_id = "+15551234716"
+    event.source.chat_name = "Home"
+
+    result = plugin.pre_gateway_dispatch(event=event, gateway=_Gateway(True), session_store=None)
+
+    assert result and result["action"] == "rewrite"
+    assert "Current supervisor dashboard requested" in result["text"]
 
 
 def test_bluebubbles_briefing_guard_ignores_nonnumeric_alert_recipient(monkeypatch, tmp_path):

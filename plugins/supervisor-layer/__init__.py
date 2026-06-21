@@ -1969,10 +1969,37 @@ def _configured_supervisor_surface_ids() -> set[str]:
     return {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
 
 
+def _configured_text_supervisor_digits() -> set[str]:
+    """Return configured Kevin text recipients that should act as supervisor surfaces.
+
+    BlueBubbles/iMessage often arrives as a phone/email-shaped DM rather than a
+    channel named "supervisor". Treat Kevin's configured alert/home text channel
+    as the same global supervisor control surface when the briefing queue is not
+    actively owning the back-and-forth.
+    """
+    values = {
+        os.environ.get("HERMES_TEXT_ALERT_TO", ""),
+        os.environ.get("BLUEBUBBLES_HOME_CHANNEL", ""),
+    }
+    return {digits for value in values for digits in [_digits(value)] if digits}
+
+
+def _is_configured_text_supervisor_surface(event: Any) -> bool:
+    if _platform_value(event) != "bluebubbles":
+        return False
+    configured_digits = _configured_text_supervisor_digits()
+    if not configured_digits:
+        return False
+    source_digits = _digits(_source_blob(event))
+    return any(digits and digits in source_digits for digits in configured_digits)
+
+
 def _is_supervisor_surface(event: Any) -> bool:
     source = getattr(event, "source", None)
     if source is None:
         return False
+    if _is_configured_text_supervisor_surface(event):
+        return True
     configured = _configured_supervisor_surface_ids()
     ids = {
         str(getattr(source, "chat_id", "") or ""),
@@ -2403,16 +2430,92 @@ def _task_summary(task: dict[str, Any], *, include_origin: bool = True) -> str:
     )
 
 
-def _new_task_rewrite(task: dict[str, Any], user_text: str) -> str:
+def _same_origin_context_key(origin: dict[str, Any] | None) -> tuple[str, str, str, str]:
+    origin = origin or {}
+    return (
+        str(origin.get("platform") or ""),
+        str(origin.get("chat_id") or ""),
+        str(origin.get("thread_id") or ""),
+        str(origin.get("user_id") or ""),
+    )
+
+
+def _recent_same_origin_context(
+    data: dict[str, Any] | None,
+    current_task: dict[str, Any],
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Return compact prior task context for isolated supervisor packets.
+
+    Each supervisor item intentionally starts a fresh gateway session, so the
+    model cannot rely on the Discord transcript. This small same-origin window
+    preserves enough continuity for natural follow-ups like "most of this is not
+    needed" without re-attaching the whole chat history.
+    """
+    tasks = (data or {}).get("tasks")
+    if not isinstance(tasks, list):
+        return []
+    current_id = current_task.get("task_id")
+    key = _same_origin_context_key(current_task.get("origin"))
+    recent: list[dict[str, Any]] = []
+    for task in reversed(tasks):
+        if not isinstance(task, dict):
+            continue
+        if task.get("task_id") == current_id:
+            continue
+        if _same_origin_context_key(task.get("origin")) != key:
+            continue
+        recent.append({
+            "task_id": task.get("task_id"),
+            "state": task.get("state"),
+            "title": _dashboard_safe_text(task.get("title") or "", fallback="[redacted title]"),
+            "objective": _dashboard_safe_text(task.get("objective") or "", fallback="[redacted objective]"),
+            "updated_at": task.get("updated_at"),
+            "completed_at": task.get("completed_at"),
+            "result": _dashboard_safe_text(task.get("result") or "", fallback="[redacted result]") or None,
+        })
+        if len(recent) >= limit:
+            break
+    return list(reversed(recent))
+
+
+def _isolated_rewrite(text: str) -> dict[str, Any]:
+    """Rewrite into an item-scoped agent run instead of the chat transcript.
+
+    Supervisor state is durable in ``supervisor-tasks.json``. Each rewritten
+    task packet carries the origin envelope and compact task envelope, so the
+    agent should not inherit previous queue items from the Discord thread's
+    transcript. This keeps the Supervisor layer from becoming one giant
+    compaction-prone session.
+    """
+    return {
+        "action": "rewrite",
+        "text": text,
+        "force_new_session": True,
+        "session_boundary_reason": "supervisor_item",
+    }
+
+
+def _new_task_rewrite(task: dict[str, Any], user_text: str, data: dict[str, Any] | None = None) -> str:
+    recent_context = _recent_same_origin_context(data, task)
     return (
         "[Supervisor layer context]\n"
         "You are operating as the thin supervisor for a multi-agent platform. "
-        "Optimize Kevin's attention, not agent count. Keep at most one active human ask per origin, "
+        "Optimize Kevin's attention, not agent count. Keep at most one active human ask globally, "
         "dedupe/merge related work, delegate specialist work when useful, and preserve routing.\n\n"
         "Origin envelope:\n"
         f"{json.dumps(task.get('origin') or {}, ensure_ascii=False, indent=2)}\n\n"
         "Supervisor task envelope:\n"
         f"{_task_summary(task)}\n\n"
+        "Recent same-origin supervisor context for continuity only, not as a separate todo list:\n"
+        f"{json.dumps(recent_context, ensure_ascii=False, indent=2)}\n\n"
+        "Context isolation rule: this supervisor packet is self-contained. "
+        "Use the durable task envelope, origin routing, and tool lookups for grounding; "
+        "do not rely on prior chat/thread transcript except when explicitly retrieved. "
+        "If Kevin's message is a follow-up/correction that depends on recent wording, "
+        "for example 'this', 'that', 'above', 'most of this', or 'not needed', use the recent same-origin context first "
+        "and retrieve recent origin messages with available tools before answering if that compact context is insufficient.\n\n"
         "Interaction rule: Do not require slash commands or rigid control words from Kevin. "
         "Interpret natural language replies like approvals, deferrals, corrections, and 'keep going' in context. "
         "If Kevin needs to do something, ask for exactly one atomic action with the recommended default, where to do it, why it matters, and how to reply naturally.\n\n"
@@ -2426,6 +2529,8 @@ def _active_task_rewrite(task: dict[str, Any], reply_text: str) -> str:
         "Kevin is replying to an active supervisor attention item. Treat this as a collaborative natural-language resolution loop, not as a command protocol.\n\n"
         "Active supervisor task:\n"
         f"{_task_summary(task, include_origin=False)}\n\n"
+        "Context isolation rule: this reply packet is self-contained. Use stored task state and the current natural-language reply; "
+        "do not assume prior queue-item transcript is loaded.\n\n"
         "Rules: infer whether Kevin approved, deferred, corrected, rejected, supplied missing data, or asked a follow-up. "
         "Keep the current task active unless the issue is genuinely resolved, delegated, deferred, merged, or dropped. "
         "If it is resolved, move to the next highest-leverage ask in normal prose; otherwise ask the narrowest possible follow-up.\n\n"
@@ -2475,14 +2580,22 @@ def _latest_briefing_queue_file() -> Path | None:
     return files[-1] if files else None
 
 
-def _briefing_queue_should_handle(event: Any) -> bool:
-    """Yield to the existing BlueBubbles briefing queue loop when active.
+def _supervisor_unified_briefing_enabled() -> bool:
+    """Return True when daily briefing attention is routed through Supervisor."""
+    return os.environ.get("HERMES_BRIEFING_SUPERVISOR_UNIFIED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
-    The briefing plugin is more specific and owns Kevin's daily text blockers.
-    This guard keeps the generic supervisor from stealing those natural replies
-    if plugin ordering changes.  Without an explicit alert recipient, fail open
-    for supervisor handling instead of suppressing unrelated BlueBubbles traffic.
+
+def _briefing_queue_should_handle(event: Any) -> bool:
+    """Yield to the legacy BlueBubbles briefing queue loop only in rollback mode.
+
+    Kevin approved merging daily briefing into Supervisor, so the default path is
+    now: briefing cron produces Supervisor tasks, and BlueBubbles replies attach
+    to the active global Supervisor attention item.  Set
+    HERMES_BRIEFING_SUPERVISOR_UNIFIED=0 for emergency rollback to the legacy
+    briefing-specific reply handler.
     """
+    if _supervisor_unified_briefing_enabled():
+        return False
     if _platform_value(event) != "bluebubbles":
         return False
     alert_to = os.environ.get("HERMES_TEXT_ALERT_TO", "")
@@ -2594,34 +2707,43 @@ def pre_gateway_dispatch(event: Any = None, gateway: Any = None, session_store: 
         origin = origin_envelope_from_event(event)
         supervisor_surface = _is_supervisor_surface(event)
         if supervisor_surface and _is_dashboard_request(text):
-            return {"action": "rewrite", "text": _dashboard_rewrite(data)}
+            return _isolated_rewrite(_dashboard_rewrite(data))
         if supervisor_surface:
             global_active_tasks = _find_global_active_attention_tasks(data)
             if len(global_active_tasks) > 1:
-                return {"action": "rewrite", "text": _dashboard_rewrite(data)}
+                return _isolated_rewrite(_dashboard_rewrite(data))
             if len(global_active_tasks) == 1:
                 if classify_attention_control(text) is not None:
                     control_result = apply_attention_control(data, text)
                     save_task_store(data)
-                    return {"action": "rewrite", "text": _attention_control_rewrite(data, control_result)}
+                    return _isolated_rewrite(_attention_control_rewrite(data, control_result))
                 global_active = global_active_tasks[0]
                 capture_natural_reply(global_active, event, text)
                 save_task_store(data)
-                return {"action": "rewrite", "text": _active_task_rewrite(global_active, text)}
+                return _isolated_rewrite(_active_task_rewrite(global_active, text))
             if _is_supervisor_control_reply(text):
-                return {"action": "rewrite", "text": _no_active_attention_rewrite(data, text)}
+                return _isolated_rewrite(_no_active_attention_rewrite(data, text))
         active = _find_active_attention_task(data, origin)
         if active is not None:
             capture_natural_reply(active, event, text)
             save_task_store(data)
-            return {"action": "rewrite", "text": _active_task_rewrite(active, text)}
+            return _isolated_rewrite(_active_task_rewrite(active, text))
 
         if _is_standalone_continuation(text) or _is_low_signal_standalone(text):
             return None
 
+        # Only the configured/dedicated Supervisor surface should turn fresh
+        # natural-language messages into isolated Supervisor items. Normal
+        # business/project channels must keep their ordinary gateway session
+        # continuity; otherwise follow-ups like "what I was doing before" lose
+        # the channel transcript and become fragmented. Replies to an existing
+        # active attention item are still captured above by origin.
+        if not supervisor_surface:
+            return None
+
         task = upsert_intake_task(data, event, text)
         save_task_store(data)
-        return {"action": "rewrite", "text": _new_task_rewrite(task, text)}
+        return _isolated_rewrite(_new_task_rewrite(task, text, data))
 
 
 def register(ctx: Any) -> None:

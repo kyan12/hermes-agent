@@ -2311,11 +2311,23 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Channel-specific toolset overrides for gateway sessions. Shape:
+    # channel_toolsets.<platform>.<chat_id> = ["web", "terminal", ...]
+    # When a message arrives from a thread, Hermes checks the thread chat_id
+    # first and then the parent channel id. This lets busy general channels run
+    # a lean default prompt while keeping heavier toolsets available elsewhere.
+    "channel_toolsets": {},
+
     # Skills — external skill directories for sharing skills across tools/agents.
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # How much installed-skill metadata to inject into every system prompt:
+        # "full" = category + skill descriptions (legacy), "compact" = category
+        # descriptions + skill names only, "off" = no skills index; discover with
+        # skills_list when needed.
+        "prompt_index": "full",
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled

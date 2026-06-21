@@ -1639,6 +1639,8 @@ def _get_platform_tools(
     platform: str,
     *,
     include_default_mcp_servers: bool = True,
+    chat_id: Optional[str] = None,
+    parent_chat_id: Optional[str] = None,
 ) -> Set[str]:
     """Resolve which individual toolset names are enabled for a platform."""
     from toolsets import resolve_toolset, TOOLSETS
@@ -1650,6 +1652,28 @@ def _get_platform_tools(
     # ``hermes-discord``) is an opt-in to the platform's native default-off
     # toolsets — see _exempt_explicit_platform_native (#35527).
     explicitly_configured = isinstance(toolset_names, list)
+
+    channel_toolsets = config.get("channel_toolsets") or {}
+    platform_channel_toolsets = channel_toolsets.get(platform) or {}
+    if isinstance(platform_channel_toolsets, dict):
+        for candidate_id in (chat_id, parent_chat_id):
+            if candidate_id is None:
+                continue
+            candidate_key = str(candidate_id)
+            override = platform_channel_toolsets.get(candidate_key)
+            if isinstance(override, str):
+                try:
+                    parsed_override = _json.loads(override)
+                    if isinstance(parsed_override, list):
+                        override = parsed_override
+                except Exception:
+                    # ``hermes config set`` can only write scalar strings in
+                    # some shells.  Accept a comma-separated fallback so users
+                    # are not forced to hand-edit config.yaml.
+                    override = [part.strip() for part in override.split(",") if part.strip()]
+            if isinstance(override, list):
+                toolset_names = override
+                break
 
     if toolset_names is None or not isinstance(toolset_names, list):
         plat_info = PLATFORMS.get(platform)

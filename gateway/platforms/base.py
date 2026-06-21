@@ -1776,6 +1776,13 @@ class MessageEvent:
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Plugin-requested session boundary. Pre-dispatch hooks use this when a
+    # rewritten message is a self-contained work packet (for example one
+    # Supervisor queue item) and should not inherit the chat/thread's prior
+    # transcript or cached AIAgent.
+    force_new_session: bool = False
+    session_boundary_reason: Optional[str] = None
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     

@@ -8906,6 +8906,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
+        #       Optional: force_new_session=true, session_boundary_reason="..."
+        #       starts a fresh transcript for this rewritten turn under the
+        #       same platform route. This is used for durable queue systems
+        #       that pass self-contained task packets and should not inherit
+        #       the prior chat/thread context.
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
@@ -8937,7 +8942,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
+                        _force_new = bool(
+                            _result.get("force_new_session")
+                            or _result.get("isolate_session")
+                        )
+                        _boundary_reason = _result.get("session_boundary_reason")
+                        event = dataclasses.replace(
+                            event,
+                            text=_new_text,
+                            force_new_session=_force_new,
+                            session_boundary_reason=(
+                                str(_boundary_reason)
+                                if _boundary_reason is not None
+                                else None
+                            ),
+                        )
                         source = event.source
                     break
                 if _action == "allow":
@@ -10770,6 +10789,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _get_or_create_session_for_event(self, event: MessageEvent, source: SessionSource):
+        """Return the session entry for *event*, honoring plugin boundaries.
+
+        Normal gateway chats reuse the route's current session. Some
+        pre-dispatch plugins, notably the Supervisor queue, rewrite inbound
+        messages into self-contained durable work packets. Those packets
+        should run in a fresh transcript so a long Discord thread does not
+        accumulate unrelated queue items and trigger compaction failures.
+        """
+        if not bool(getattr(event, "force_new_session", False)):
+            return await self.async_session_store.get_or_create_session(source)
+
+        session_key = self._session_key_for_source(source)
+        reason = getattr(event, "session_boundary_reason", None) or "plugin_boundary"
+        logger.info(
+            "Plugin requested fresh gateway session: key=%s reason=%s",
+            session_key,
+            reason,
+        )
+
+        # A fresh transcript must also evict the cached AIAgent, otherwise the
+        # next turn can reuse the old agent object with the old session_id and
+        # conversation state even though SessionStore now points at a new ID.
+        self._evict_cached_agent(session_key)
+        self._session_model_overrides.pop(session_key, None)
+        self._set_session_reasoning_override(session_key, None)
+        if hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes.pop(session_key, None)
+
+        session_entry = await self.async_session_store.reset_session(session_key)
+        if session_entry is None:
+            session_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
+        return session_entry
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -10799,7 +10852,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_entry = await self._get_or_create_session_for_event(event, source)
         session_key = session_entry.session_key
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
@@ -13376,7 +13429,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform_key = _platform_config_key(source.platform)
 
             from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            try:
+                enabled_toolsets = sorted(_get_platform_tools(
+                    user_config,
+                    platform_key,
+                    chat_id=source.chat_id,
+                    parent_chat_id=getattr(source, "parent_chat_id", None),
+                ))
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                # Some tests/plugins monkeypatch the resolver with the old
+                # two-argument shape.  Fall back without channel context rather
+                # than breaking those callers.
+                enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -17042,7 +17108,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        try:
+            enabled_toolsets = sorted(_get_platform_tools(
+                user_config,
+                platform_key,
+                chat_id=source.chat_id,
+                parent_chat_id=getattr(source, "parent_chat_id", None),
+            ))
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+            # Some tests/plugins monkeypatch the resolver with the old
+            # two-argument shape.  Fall back without channel context rather
+            # than breaking those callers.
+            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 

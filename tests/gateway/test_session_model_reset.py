@@ -1,5 +1,7 @@
 """Tests that /new (and its /reset alias) clears session-scoped overrides."""
+from collections import OrderedDict
 from datetime import datetime
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -139,3 +141,74 @@ async def test_new_command_only_clears_own_session():
     assert other_key in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
     assert other_key in runner._pending_model_notes
+
+
+def test_plugin_forced_session_boundary_resets_route_and_clears_transients():
+    """Supervisor queue packets should get a fresh transcript under the same route."""
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    new_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-2",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        is_fresh_reset=True,
+    )
+    session_store = MagicMock()
+    session_store.reset_session.return_value = new_entry
+    runner.session_store = session_store
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = OrderedDict({session_key: (object(), "sig")})
+    runner._session_model_overrides[session_key] = {"model": "old-model"}
+    runner._session_reasoning_overrides[session_key] = {"effort": "high"}
+    runner._pending_model_notes[session_key] = "old note"
+
+    event = MessageEvent(
+        text="[Supervisor layer context]\nitem packet",
+        source=source,
+        message_id="m2",
+        force_new_session=True,
+        session_boundary_reason="supervisor_item",
+    )
+
+    result = runner._get_or_create_session_for_event(event, source)
+
+    assert result is new_entry
+    session_store.reset_session.assert_called_once_with(session_key)
+    session_store.get_or_create_session.assert_not_called()
+    assert session_key not in runner._agent_cache
+    assert session_key not in runner._session_model_overrides
+    assert session_key not in runner._session_reasoning_overrides
+    assert session_key not in runner._pending_model_notes
+
+
+def test_plugin_forced_session_boundary_creates_session_when_route_is_new():
+    """A first supervisor packet for a route should still create a fresh session."""
+    runner = _make_runner()
+    source = _make_source()
+    created_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-created",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    session_store = MagicMock()
+    session_store.reset_session.return_value = None
+    session_store.get_or_create_session.return_value = created_entry
+    runner.session_store = session_store
+    event = MessageEvent(
+        text="[Supervisor layer context]\nfirst item packet",
+        source=source,
+        force_new_session=True,
+        session_boundary_reason="supervisor_item",
+    )
+
+    result = runner._get_or_create_session_for_event(event, source)
+
+    assert result is created_entry
+    session_store.get_or_create_session.assert_called_once_with(source, force_new=True)

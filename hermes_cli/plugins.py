@@ -168,6 +168,9 @@ VALID_HOOKS: Set[str] = {
     # dispatch. Plugins may return a dict to influence flow:
     #   {"action": "skip",    "reason": "..."}  -> drop message (no reply)
     #   {"action": "rewrite", "text": "..."}    -> replace event.text, continue
+    #       Optional: force_new_session=true, session_boundary_reason="..."
+    #       tells the gateway to process the rewritten message in a fresh
+    #       transcript under the same platform route.
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",

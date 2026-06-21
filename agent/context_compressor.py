@@ -1926,10 +1926,13 @@ Be specific with file paths, commands, line numbers, and results.]
 - Environment details that matter]
 
 {HISTORICAL_IN_PROGRESS_HEADING}
-[Work currently underway — what was being done when compaction fired]
+[Work currently underway — what was being done when compaction fired. Include the exact next safe tool/action if obvious, and any open todo IDs/statuses. If a tool call just completed, name the tool and result that should drive the next step.]
+
+## Verification State
+[What has been verified vs assumed. Include commands/checks already run, current test/config/health status, and what still needs verification before telling the user the work is done.]
 
 ## Blocked
-[Any blockers, errors, or issues not yet resolved. Include exact error messages.]
+[Any blockers, errors, or issues not yet resolved. Include exact error messages. Distinguish real blockers from merely pending verification.]
 
 ## Key Decisions
 [Important technical decisions and WHY they were made]
@@ -1949,7 +1952,7 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
-Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed. Optimize for safe continuation after compaction: preserve active todo state, current branch/cwd, modified files, exact next action, verification status, and any user-facing decision still needed.
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
