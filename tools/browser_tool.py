@@ -2857,6 +2857,12 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "url": final_url,
             "title": title
         }
+        if session_info.get("live_url"):
+            response["live_url"] = session_info["live_url"]
+            response["human_in_the_loop"] = (
+                "Open live_url to view or control the same cloud browser session. "
+                "After the human finishes, continue with another browser_* call in this task."
+            )
         # Remember only a successful, non-blocked navigation as the task owner.
         # Failed opens and blocked redirects must not retarget follow-up clicks
         # or snapshots to a newly-created but irrelevant session.

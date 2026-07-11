@@ -1,4 +1,5 @@
 """Tests that /new (and its /reset alias) clears session-scoped overrides."""
+import asyncio
 from collections import OrderedDict
 from datetime import datetime
 import threading
@@ -174,7 +175,7 @@ def test_plugin_forced_session_boundary_resets_route_and_clears_transients():
         session_boundary_reason="supervisor_item",
     )
 
-    result = runner._get_or_create_session_for_event(event, source)
+    result = asyncio.run(runner._get_or_create_session_for_event(event, source))
 
     assert result is new_entry
     session_store.reset_session.assert_called_once_with(session_key)
@@ -208,7 +209,7 @@ def test_plugin_forced_session_boundary_creates_session_when_route_is_new():
         session_boundary_reason="supervisor_item",
     )
 
-    result = runner._get_or_create_session_for_event(event, source)
+    result = asyncio.run(runner._get_or_create_session_for_event(event, source))
 
     assert result is created_entry
     session_store.get_or_create_session.assert_called_once_with(source, force_new=True)

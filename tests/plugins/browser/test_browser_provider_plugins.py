@@ -189,6 +189,51 @@ class TestIsAvailable:
         monkeypatch.setenv("BROWSER_USE_API_KEY", "key")
         assert p.is_available() is True
 
+    def test_browser_use_create_session_surfaces_live_preview(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _ensure_plugins_loaded()
+        from agent.browser_registry import get_provider
+
+        class FakeResponse:
+            ok = True
+            headers = {}
+            status_code = 201
+            text = ""
+
+            def json(self) -> dict:
+                return {
+                    "id": "browser-session-1",
+                    "cdpUrl": "wss://connect.browser-use.com/session-1",
+                    "liveUrl": "https://live.browser-use.com/session-1",
+                }
+
+        def fake_post(url: str, **kwargs):
+            assert url == "https://api.browser-use.com/api/v3/browsers"
+            assert kwargs["json"] == {"profileId": "profile-1"}
+            return FakeResponse()
+
+        monkeypatch.setenv("BROWSER_USE_API_KEY", "key")
+        monkeypatch.setenv("BROWSER_USE_PROFILE_ID", "profile-1")
+        monkeypatch.setattr(
+            "plugins.browser.browser_use.provider.requests.post",
+            fake_post,
+        )
+
+        p = get_provider("browser-use")
+        assert p is not None
+        session = p.create_session("test-task")
+
+        assert session["bb_session_id"] == "browser-session-1"
+        assert session["cdp_url"] == "wss://connect.browser-use.com/session-1"
+        assert session["live_url"] == "https://live.browser-use.com/session-1"
+        assert session["features"] == {
+            "browser_use": True,
+            "stealth": True,
+            "proxies": True,
+            "live_preview": True,
+        }
+
     def test_firecrawl_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _ensure_plugins_loaded()
         from agent.browser_registry import get_provider

@@ -23,6 +23,7 @@ Config keys this provider responds to::
 Auth env vars (one of)::
 
     BROWSER_USE_API_KEY=...           # https://browser-use.com
+    BROWSER_USE_PROFILE_ID=...        # optional persistent cookie profile
     # OR a managed Nous gateway entry (configured via 'hermes setup')
 """
 
@@ -138,11 +139,14 @@ class BrowserUseBrowserProvider(BrowserProvider):
         # Direct API key wins unless the user has explicitly opted into the
         # managed Nous gateway via ``tool_gateway.browser: gateway``.
         api_key = os.environ.get("BROWSER_USE_API_KEY")
+        profile_id = os.environ.get("BROWSER_USE_PROFILE_ID") or None
+
         if api_key and not prefers_gateway("browser"):
             return {
                 "api_key": api_key,
                 "base_url": _BASE_URL,
                 "managed_mode": False,
+                "profile_id": profile_id,
             }
 
         # Keep availability scans off the synchronous OAuth refresh path.
@@ -157,6 +161,7 @@ class BrowserUseBrowserProvider(BrowserProvider):
             "api_key": managed.nous_user_token,
             "base_url": managed.gateway_origin.rstrip("/"),
             "managed_mode": True,
+            "profile_id": profile_id,
         }
 
     def _get_config(self) -> Dict[str, Any]:
@@ -196,14 +201,16 @@ class BrowserUseBrowserProvider(BrowserProvider):
         # Keep gateway-backed sessions short so billing authorization does not
         # default to a long Browser-Use timeout when Hermes only needs a task-
         # scoped ephemeral browser.
-        payload = (
-            {
-                "timeout": _DEFAULT_MANAGED_TIMEOUT_MINUTES,
-                "proxyCountryCode": _DEFAULT_MANAGED_PROXY_COUNTRY_CODE,
-            }
-            if managed_mode
-            else {}
-        )
+        payload = {}
+        if managed_mode:
+            payload.update(
+                {
+                    "timeout": _DEFAULT_MANAGED_TIMEOUT_MINUTES,
+                    "proxyCountryCode": _DEFAULT_MANAGED_PROXY_COUNTRY_CODE,
+                }
+            )
+        if config.get("profile_id"):
+            payload["profileId"] = config["profile_id"]
 
         try:
             response = requests.post(
@@ -241,12 +248,19 @@ class BrowserUseBrowserProvider(BrowserProvider):
         logger.info("Created Browser Use session %s", session_name)
 
         cdp_url = session_data.get("cdpUrl") or session_data.get("connectUrl") or ""
+        live_url = session_data.get("liveUrl") or session_data.get("live_url") or ""
 
         return {
             "session_name": session_name,
             "bb_session_id": session_data["id"],
             "cdp_url": cdp_url,
-            "features": {"browser_use": True},
+            "live_url": live_url,
+            "features": {
+                "browser_use": True,
+                "stealth": True,
+                "proxies": True,
+                "live_preview": bool(live_url),
+            },
             "external_call_id": external_call_id,
         }
 
