@@ -2680,6 +2680,12 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                # ``recompute_ready`` treats blocked cards as recoverable unless
+                # their latest block/unblock event is ``blocked``. Preserve that
+                # event invariant for cards created directly in blocked state,
+                # just as ``block_task`` does for transitioned cards.
+                if task_status == "blocked":
+                    _append_event(conn, task_id, "blocked")
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

@@ -53,6 +53,27 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def test_initial_status_blocked_is_sticky(kanban_home: Path) -> None:
+    """A card created directly in ``blocked`` must carry the same sticky
+    event invariant as a card transitioned there with ``block_task``."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="awaiting human ops",
+            initial_status="blocked",
+        )
+
+        events = kb.list_events(conn, tid)
+        assert events[0].kind == "created"
+        assert events[-1].kind == "blocked"
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+
+
 def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path) -> None:
     """A standalone task that a worker explicitly blocks for review
     must stay blocked across an arbitrary number of dispatcher ticks.
