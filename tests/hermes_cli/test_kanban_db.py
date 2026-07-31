@@ -1929,6 +1929,129 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_active_pr_bypassed_by_later_same_second_unblock(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A scheduled task explicitly unblocked after its PR comment is a
+    deliberate continuation, even when both writes share one-second timestamps."""
+    now = 9_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="continue-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/NousResearch/hermes-agent/pull/42",
+        )
+        assert kb.schedule_task(conn, t, reason="await review")
+        assert kb.unblock_task(conn, t)
+
+        assert kb.check_respawn_guard(conn, t) is None
+        spawned = []
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+
+        assert spawned == [t]
+        assert [task_id for task_id, _assignee, _workspace in result.spawned] == [t]
+
+
+def test_respawn_guard_legacy_pr_audit_event_orders_same_second_unblock(
+    kanban_home, monkeypatch,
+):
+    """Pre-upgrade commented events without comment_id still provide a
+    conservative same-second ordering tie-break for existing boards."""
+    now = 9_050_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    body = "Opened https://github.com/NousResearch/hermes-agent/pull/420"
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy-pr", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (t, "worker", body, now),
+        )
+        kb._append_event(
+            conn, t, "commented", {"author": "worker", "len": len(body)},
+        )
+        assert kb.schedule_task(conn, t, reason="await review")
+        assert kb.unblock_task(conn, t)
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_older_same_second_requeue_does_not_bypass_newer_pr(
+    kanban_home, monkeypatch,
+):
+    """A requeue before a newer PR comment must retain duplicate-PR protection,
+    including when timestamp precision cannot distinguish their order."""
+    now = 9_100_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="newer-pr", assignee="alice")
+        assert kb.schedule_task(conn, t, reason="temporary pause")
+        assert kb.unblock_task(conn, t)
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/NousResearch/hermes-agent/pull/43",
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_active_review_continuation_after_pr(kanban_home):
+    """An unblock after actionable PR review deliberately resumes the existing
+    branch instead of spawning a duplicate-PR guard loop."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review-followup", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR: https://github.com/NousResearch/hermes-agent/pull/44",
+        )
+        assert kb.schedule_task(conn, t, reason="await independent review")
+        kb.add_comment(conn, t, "reviewer", "Review found one actionable issue")
+        assert kb.unblock_task(conn, t)
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_manual_promotion_after_pr_allows_dispatch(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """The public manual-promotion path is an explicit requeue and resumes a
+    blocked PR task even when all audit rows share one-second timestamps."""
+    now = 9_150_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="manual-promote-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR: https://github.com/NousResearch/hermes-agent/pull/47",
+        )
+        assert kb.block_task(conn, t, reason="await operator review")
+        promoted, error = kb.promote_task(
+            conn,
+            t,
+            actor="operator",
+            reason="review requested changes",
+        )
+        assert promoted is True
+        assert error is None
+
+        spawned = []
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+
+        assert spawned == [t]
+        assert [task_id for task_id, _assignee, _workspace in result.spawned] == [t]
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
@@ -2096,6 +2219,65 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
     # Event.payload is already parsed as a dict by list_events.
     assert isinstance(guarded_evt.payload, dict)
     assert guarded_evt.payload.get("reason") == "recent_success"
+
+
+def test_dispatch_respawn_guard_event_emission_is_bounded(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """An unchanged guard emits once, stays quiet on dispatcher ticks, then
+    emits a bounded diagnostic reminder after the cadence elapses."""
+    now = 9_200_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="bounded-events", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/NousResearch/hermes-agent/pull/45",
+        )
+
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        guarded = [e for e in kb.list_events(conn, t) if e.kind == "respawn_guarded"]
+        assert len(guarded) == 1
+
+        monkeypatch.setattr(
+            kb.time,
+            "time",
+            lambda: now + kb._RESPAWN_GUARD_EVENT_CADENCE,
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        guarded = [e for e in kb.list_events(conn, t) if e.kind == "respawn_guarded"]
+        assert len(guarded) == 2
+
+
+def test_dispatch_respawn_guard_emits_on_reason_transition(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A changed guard reason is diagnostic state and emits immediately even
+    before the reminder cadence."""
+    now = 9_300_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reason-transition", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/NousResearch/hermes-agent/pull/46",
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = 'authentication denied' WHERE id = ?",
+            (t,),
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+
+        reasons = [
+            e.payload.get("reason")
+            for e in kb.list_events(conn, t)
+            if e.kind == "respawn_guarded" and isinstance(e.payload, dict)
+        ]
+        assert reasons == ["active_pr", "blocker_auth"]
 
 
 # ---------------------------------------------------------------------------
