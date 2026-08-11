@@ -176,6 +176,27 @@ def test_repeated_occurrence_coalesces_into_active_reconciliation(
         assert first_event != second_event
 
 
+def test_dispatcher_retryable_crash_does_not_spawn_parallel_recovery(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                (source_id,),
+            )
+            kb._append_event(
+                conn,
+                source_id,
+                "crashed",
+                {"error": "worker exited", "retry_status": "ready"},
+            )
+        assert _reconciliation_tasks(conn) == []
+
+
 def test_reconciliation_task_failures_do_not_recurse(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -548,6 +569,104 @@ def test_terminal_reconciliation_failure_resumes_source_automatically(
         )
 
 
+def test_successful_looking_recovery_generations_are_bounded(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    block_kinds = ("transient", "capability", "needs_input")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        for index, block_kind in enumerate(block_kinds, start=1):
+            assert kb.block_task(
+                conn,
+                source_id,
+                reason=f"repeating blocker {index}",
+                kind=block_kind,
+            )
+            recovery = next(
+                task for task in _reconciliation_tasks(conn) if task.status == "ready"
+            )
+            claimed = kb.claim_task(conn, recovery.id, claimer=f"reconciler-{index}")
+            assert claimed is not None
+            source_event_id = next(
+                event.id
+                for event in reversed(kb.list_events(conn, source_id))
+                if event.kind in kb.RECONCILIATION_EVENT_KINDS
+            )
+            assert kb.complete_task(
+                conn,
+                recovery.id,
+                summary="claimed the blocker was cleared",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+            source = kb.get_task(conn, source_id)
+            assert source is not None
+            if index < len(block_kinds):
+                assert source.status == "ready"
+                assert kb.claim_task(conn, source_id, claimer=f"source-{index}") is not None
+            else:
+                assert source.status == "triage"
+
+        gates = [
+            event.payload or {}
+            for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+            and (event.payload or {}).get("outcome") == "genuine_human_gate"
+        ]
+        assert len(gates) == 1
+        assert gates[0]["fallback"] == "automation_exhausted"
+
+
+def test_block_loop_triage_cannot_be_auto_resumed(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="same blocker", kind="capability")
+        assert kb.unblock_task(conn, source_id)
+        assert kb.claim_task(conn, source_id, claimer="source-again") is not None
+        assert kb.block_task(conn, source_id, reason="same blocker", kind="capability")
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == "triage"
+
+        recovery = next(task for task in _reconciliation_tasks(conn) if task.status == "ready")
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = next(
+            event.id
+            for event in reversed(kb.list_events(conn, source_id))
+            if event.kind == "block_loop_detected"
+        )
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="incorrectly claimed the loop was clear",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == "triage"
+        gates = [
+            event.payload or {}
+            for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+            and (event.payload or {}).get("outcome") == "genuine_human_gate"
+        ]
+        assert len(gates) == 1
+
+
 def test_repeated_reconciliation_failures_escalate_once_instead_of_looping(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -767,6 +886,14 @@ def test_backoff_outcome_resumes_when_deadline_elapses(
         source = kb.get_task(conn, source_id)
         assert source is not None
         assert source.status == "ready"
+
+        # A later, unrelated operator/cron park must not be released by the
+        # stale backoff outcome that already elapsed above.
+        assert kb.schedule_task(conn, source_id, reason="wait for external window")
+        assert kb.recompute_ready(conn) == 0
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == "scheduled"
 
 
 def test_reconciliation_envelope_redacts_secret_shaped_values(
