@@ -86,6 +86,14 @@ def test_iteration_budget_block_enqueues_one_reconciliation_without_human_gate(
         assert f":{task_id}:{source_event.id}" in recovery.idempotency_key
         assert f"source_event_id: {source_event.id}" in (recovery.body or "")
         assert '"path":' in (recovery.body or "")
+        for required_field in (
+            "continuation_task_id",
+            "dependency_task_id",
+            "resume_at",
+            "human_action",
+            "error",
+        ):
+            assert required_field in (recovery.body or "")
         assert kb.attention_class(conn, task_id, reconciler_enabled=True) == "automation_recovery"
 
 
@@ -271,3 +279,359 @@ def test_reconciliation_claims_respect_configured_active_cap(
         queued = kb.get_task(conn, recoveries[2].id)
         assert queued is not None
         assert queued.status == "ready"
+
+
+def test_connection_path_wins_over_mismatched_board_environment(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+    with kb.connect_closing(board="alpha") as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        assert recovery.idempotency_key is not None
+        assert recovery.idempotency_key.startswith(f"kanban-reconcile:alpha:{source_id}:")
+
+
+def test_archived_exact_reconciliation_key_is_never_replayed(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        event = next(e for e in reversed(kb.list_events(conn, source_id)) if e.kind == "blocked")
+        assert kb.archive_task(conn, recovery.id)
+        replayed = kb.enqueue_blocker_reconciliation(conn, event.id)
+        assert replayed == recovery.id
+        assert len([
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key == recovery.idempotency_key
+        ]) == 1
+
+
+def test_trigger_and_recovery_enqueue_are_one_transaction(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        monkeypatch.setattr(
+            kb,
+            "enqueue_blocker_reconciliation",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("synthetic enqueue failure")),
+        )
+        with pytest.raises(RuntimeError, match="synthetic enqueue failure"):
+            kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == "running"
+        assert not any(e.kind == "blocked" for e in kb.list_events(conn, source_id))
+
+
+def test_reconciliation_completion_requires_valid_verdict(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        with pytest.raises(ValueError, match="reconciliation"):
+            kb.complete_task(conn, recovery.id, summary="missing verdict", metadata={})
+        current = kb.get_task(conn, recovery.id)
+        assert current is not None
+        assert current.status == "running"
+
+
+def test_stale_reconciliation_cannot_emit_human_gate_after_source_done(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        assert kb.complete_task(conn, source_id, summary="completed externally")
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.complete_task(
+            conn,
+            recovery.id,
+            summary="stale verdict",
+            metadata={
+                "reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "genuine_human_gate",
+                    "human_action": "Choose one option",
+                }
+            },
+        )
+        assert not any(
+            e.kind == "reconciliation_outcome" and (e.payload or {}).get("outcome") == "genuine_human_gate"
+            for e in kb.list_events(conn, source_id)
+        )
+
+
+def test_stale_reconciliation_cannot_regress_manually_resumed_source(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="temporary", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        assert kb.unblock_task(conn, source_id)
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="stale backoff",
+            metadata={
+                "reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "backoff_scheduled",
+                    "resume_at": int(kb.time.time()) + 60,
+                }
+            },
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == "ready"
+        outcomes = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        payload = outcomes[-1].payload or {}
+        assert payload.get("outcome") == "reconciliation_failed"
+        assert payload.get("discarded_outcome") == "backoff_scheduled"
+        assert payload.get("stale") is True
+
+
+def test_terminal_reconciliation_failure_resumes_source_automatically(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            recovery.id,
+            reason="reconciler infrastructure failed",
+            kind="transient",
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == "ready"
+        assert any(
+            e.kind == "reconciliation_outcome" and (e.payload or {}).get("outcome") == "reconciliation_failed"
+            for e in kb.list_events(conn, source_id)
+        )
+
+
+def test_outcome_specific_metadata_is_validated(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        for outcome, missing in (
+            ("continuation_created", "continuation_task_id"),
+            ("dependency_wait", "dependency_task_id"),
+            ("backoff_scheduled", "resume_at"),
+            ("genuine_human_gate", "human_action"),
+            ("reconciliation_failed", "error"),
+        ):
+            with pytest.raises(ValueError, match=missing):
+                kb.complete_task(
+                    conn,
+                    recovery.id,
+                    summary="invalid verdict",
+                    metadata={
+                        "reconciliation": {
+                            "source_task_id": source_id,
+                            "source_event_id": source_event_id,
+                            "outcome": outcome,
+                        }
+                    },
+                )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "id_field"),
+    (
+        ("continuation_created", "continuation_task_id"),
+        ("dependency_wait", "dependency_task_id"),
+    ),
+)
+def test_task_outcomes_require_linked_parent_lineage(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    id_field: str,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        unrelated_id = kb.create_task(conn, title="unrelated", assignee="code-crab")
+        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        with pytest.raises(ValueError, match="linked parent"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="invalid lineage",
+                metadata={
+                    "reconciliation": {
+                        "source_task_id": source_id,
+                        "source_event_id": source_event_id,
+                        "outcome": outcome,
+                        id_field: unrelated_id,
+                    }
+                },
+            )
+
+
+def test_backoff_outcome_resumes_when_deadline_elapses(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="quota reset", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        resume_at = int(kb.time.time()) + 60
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="wait for quota reset",
+            metadata={
+                "reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "backoff_scheduled",
+                    "resume_at": resume_at,
+                }
+            },
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == "scheduled"
+        assert kb.recompute_ready(conn) == 0
+        monkeypatch.setattr(kb.time, "time", lambda: resume_at + 1)
+        assert kb.recompute_ready(conn) == 1
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == "ready"
+
+
+def test_reconciliation_envelope_redacts_secret_shaped_values(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    private_key = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "very-secret-key-material\n"
+        "-----END RSA PRIVATE KEY-----"
+    )
+    with kb.connect_closing() as conn:
+        source_id = _running(
+            conn,
+            title="https://alice:password@example.test/private",
+            body=(
+                "OPENAI_API_KEY=openai-secret\n"
+                "AWS_SECRET_ACCESS_KEY=aws-secret\n"
+                "GITHUB_TOKEN=github-secret\n"
+                f"token=very-secret\n{private_key}"
+            ),
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                source_id,
+                "protocol_violation",
+                {
+                    "authorization": "Bearer abcdefghijklmnopqrstuvwxyz",
+                    "detail": private_key,
+                },
+            )
+        body = _reconciliation_tasks(conn)[0].body or ""
+        assert "password" not in body
+        assert "very-secret" not in body
+        assert "Bearer abcdef" not in body
+        assert "openai-secret" not in body
+        assert "aws-secret" not in body
+        assert "github-secret" not in body
+        assert "[REDACTED]" in body
+
+
+def test_reconciliation_redacts_private_key_before_truncation() -> None:
+    private_key = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        + ("secret-material" * 50)
+        + "\n-----END PRIVATE KEY-----"
+    )
+    redacted = kb._redact_reconciliation_text(("x" * 3900) + private_key, limit=4000)
+    assert "secret-material" not in redacted
+    assert "BEGIN PRIVATE KEY" not in redacted
+    assert "[REDACTED PRIVATE KEY]" in redacted
+
+
+def test_coalesced_generation_rejects_stale_verdict(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="first failure", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        original_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        with kb.write_txn(conn):
+            newest_event_id = kb._append_event(
+                conn, source_id, "timed_out", {"error": "new generation"},
+            )
+        assert newest_event_id != original_event_id
+        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is not None
+        with pytest.raises(ValueError, match="stale"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="obsolete result",
+                metadata={
+                    "reconciliation": {
+                        "source_task_id": source_id,
+                        "source_event_id": original_event_id,
+                        "outcome": "cleared/resumed",
+                    }
+                },
+            )
+        current = kb.get_task(conn, recovery.id)
+        assert current is not None
+        assert current.status == "running"
