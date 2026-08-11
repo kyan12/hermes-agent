@@ -2878,9 +2878,23 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     pending_token = _pending_reconciliation_event_ids.set([])
-    committed = False
     try:
         yield conn
+        # Reconciliation is part of the SAME durable transaction as the
+        # triggering event. A process crash can therefore leave neither row or
+        # both rows, but never a blocker whose notification is suppressed with
+        # no recovery task. Newly appended non-trigger events may grow this
+        # list, so drain it to a fixed point before COMMIT.
+        pending_ids = _pending_reconciliation_event_ids.get() or []
+        seen: set[int] = set()
+        cursor = 0
+        while cursor < len(pending_ids):
+            event_id = pending_ids[cursor]
+            cursor += 1
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            enqueue_blocker_reconciliation(conn, event_id)
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -2893,7 +2907,6 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     else:
         try:
             _execute_boundary_with_retry(conn, "COMMIT")
-            committed = True
         except Exception:
             # COMMIT exhausted retries with the txn still open; roll back so the
             # connection isn't poisoned for the next BEGIN IMMEDIATE.
@@ -2906,22 +2919,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
     finally:
-        pending_ids = _pending_reconciliation_event_ids.get() or []
         _pending_reconciliation_event_ids.reset(pending_token)
-
-    # Event-driven handoff: source transitions are durable before any recovery
-    # task is created. Failures here are deliberately non-fatal to the source
-    # write; the event remains audit evidence and can be replayed idempotently.
-    if committed:
-        for event_id in dict.fromkeys(pending_ids):
-            try:
-                enqueue_blocker_reconciliation(conn, event_id)
-            except Exception as exc:  # pragma: no cover - defensive observer path
-                _log.warning(
-                    "kanban blocker reconciler: failed to enqueue event %s: %s",
-                    event_id,
-                    exc,
-                )
 
 
 # ---------------------------------------------------------------------------
@@ -3408,9 +3406,9 @@ def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
     """Resolve the board owning ``conn`` without trusting process-global state."""
     row = conn.execute("PRAGMA database_list").fetchone()
     db_path = Path(row["file"] if isinstance(row, sqlite3.Row) else row[2]).resolve()
-    explicit_board = _normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD"))
-    if explicit_board:
-        return explicit_board
+    # Standard board paths are authoritative. Process-global environment can
+    # describe a different board when one process opens several connections;
+    # never let that relabel an existing database.
     if db_path.name == "kanban.db" and db_path.parent.parent.name == "boards":
         try:
             return _normalize_board_slug(db_path.parent.name) or "default"
@@ -3418,6 +3416,11 @@ def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
             pass
     if db_path == kanban_db_path("default").resolve():
         return "default"
+    # A custom HERMES_KANBAN_DB path has no slug encoded on disk. Only this
+    # non-standard case may use the explicit board environment as its identity.
+    explicit_board = _normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD"))
+    if explicit_board:
+        return explicit_board
     return get_current_board()
 
 
@@ -3439,14 +3442,39 @@ def classify_blocker_occurrence(
 
 
 def _redact_reconciliation_text(value: Optional[str], *, limit: int = 4000) -> str:
-    text = (value or "")[:limit]
+    """Redact common credential forms from any retained prompt string."""
+    text = value or ""
+    # PEM/private-key material can span lines and may not contain a key=value
+    # marker. Remove the whole block before applying line-oriented patterns.
     text = re.sub(
-        r"(?i)\b(api[_-]?key|token|password|passwd|secret)\b\s*[:=]\s*\S+",
+        r"-----BEGIN [^-\n]*PRIVATE KEY-----.*?-----END [^-\n]*PRIVATE KEY-----",
+        "[REDACTED PRIVATE KEY]",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Credential-bearing URLs are especially easy to leak through titles,
+    # workspace remotes, or comments.
+    text = re.sub(
+        r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s:]+:[^/@\s]+@",
+        r"\1[REDACTED]@",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b((?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|token|password|passwd|secret|authorization))\b"
+        r"\s*[:=]\s*(?:['\"]?)[^\s,'\"}]+",
         r"\1=[REDACTED]",
         text,
     )
     text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", text)
-    return text
+    # High-signal provider/token formats and JWTs without relying on nearby
+    # labels. Keep patterns deliberately conservative to avoid mangling prose.
+    text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b", "[REDACTED]", text)
+    text = re.sub(
+        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+        "[REDACTED JWT]",
+        text,
+    )
+    return text[:limit]
 
 
 def _redact_reconciliation_value(value: Any, *, depth: int = 0) -> Any:
@@ -3505,20 +3533,22 @@ def _reconciliation_envelope(
             "source_run_id": event.run_id,
             "source_event_kind": event.kind,
         },
-        "relationship": _relationship_envelope(source.body, source.created_by),
+        "relationship": _redact_reconciliation_value(
+            _relationship_envelope(source.body, source.created_by)
+        ),
         "source": {
-            "title": source.title,
+            "title": _redact_reconciliation_text(source.title, limit=500),
             "body": _redact_reconciliation_text(source.body, limit=12000),
-            "assignee": source.assignee,
+            "assignee": _redact_reconciliation_text(source.assignee, limit=200),
             "status": source.status,
             "block_kind": source.block_kind,
-            "tenant": source.tenant,
-            "project_id": source.project_id,
+            "tenant": _redact_reconciliation_text(source.tenant, limit=300),
+            "project_id": _redact_reconciliation_text(source.project_id, limit=300),
         },
         "workspace": {
             "kind": source.workspace_kind,
-            "path": source.workspace_path,
-            "branch": source.branch_name,
+            "path": _redact_reconciliation_text(source.workspace_path, limit=2000),
+            "branch": _redact_reconciliation_text(source.branch_name, limit=500),
             "preserve_dirty_work": True,
         },
         "event": {
@@ -3529,7 +3559,7 @@ def _reconciliation_envelope(
         "comments": [
             {
                 "id": comment.id,
-                "author": comment.author,
+                "author": _redact_reconciliation_text(comment.author, limit=200),
                 "body": _redact_reconciliation_text(comment.body),
                 "created_at": comment.created_at,
             }
@@ -3559,18 +3589,92 @@ def _reconciliation_prompt(envelope: Mapping[str, Any]) -> str:
         "work. Diagnose and continue work, create a continuation card when "
         "needed, wait on a real dependency, schedule bounded backoff, or affirm "
         "one genuine human-only gate. Do not notify Kevin merely because the "
-        "source used needs_input/capability wording.\n\n"
-        "Complete this reconciliation task with metadata exactly shaped as:\n"
-        '{"reconciliation":{"outcome":"cleared/resumed|continuation_created|'
-        'dependency_wait|backoff_scheduled|genuine_human_gate|reconciliation_failed",'
+        "source used needs_input/capability wording. A continuation or dependency "
+        "must be linked as a direct parent of the source before you report it.\n\n"
+        "Complete this reconciliation task with metadata matching exactly one outcome schema:\n"
+        '{"reconciliation":{"outcome":"cleared/resumed",'
         f'"source_task_id":"{lineage["source_task_id"]}",'
-        f'"source_event_id":{lineage["source_event_id"]},'
-        '"human_action":"required only for genuine_human_gate",'
-        '"continuation_task_id":"required only when created"}}.\n\n'
+        f'"source_event_id":{lineage["source_event_id"]}}}\n'
+        '{"reconciliation":{"outcome":"continuation_created",'
+        f'"source_task_id":"{lineage["source_task_id"]}",'
+        '"source_event_id":<latest>,"continuation_task_id":"t_..."}}\n'
+        '{"reconciliation":{"outcome":"dependency_wait",'
+        f'"source_task_id":"{lineage["source_task_id"]}",'
+        '"source_event_id":<latest>,"dependency_task_id":"t_..."}}\n'
+        '{"reconciliation":{"outcome":"backoff_scheduled",'
+        f'"source_task_id":"{lineage["source_task_id"]}",'
+        '"source_event_id":<latest>,"resume_at":<positive unix timestamp>}}\n'
+        '{"reconciliation":{"outcome":"genuine_human_gate",'
+        f'"source_task_id":"{lineage["source_task_id"]}",'
+        '"source_event_id":<latest>,"human_action":"one atomic action"}}\n'
+        '{"reconciliation":{"outcome":"reconciliation_failed",'
+        f'"source_task_id":"{lineage["source_task_id"]}",'
+        '"source_event_id":<latest>,"error":"sanitized failure"}}.\n'
+        "Repeated occurrences may be coalesced while you work. Re-read the live "
+        "source and use the newest coalesced source_event_id; stale verdicts are rejected.\n\n"
         "source_task_id: " + str(lineage["source_task_id"]) + "\n"
         "source_event_id: " + str(lineage["source_event_id"]) + "\n"
         "```json\n" + json.dumps(envelope, ensure_ascii=False, indent=2) + "\n```"
     )
+
+
+def _reconciliation_source_from_key(task: Task) -> tuple[Optional[str], Optional[int]]:
+    key = task.idempotency_key or ""
+    if not key.startswith(RECONCILIATION_IDEMPOTENCY_PREFIX):
+        return None, None
+    parts = key[len(RECONCILIATION_IDEMPOTENCY_PREFIX):].rsplit(":", 2)
+    if len(parts) != 3:
+        return None, None
+    try:
+        return parts[1], int(parts[2])
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _handle_terminal_reconciliation_failure(
+    conn: sqlite3.Connection,
+    recovery: Task,
+    event: Event,
+) -> Optional[str]:
+    """Resume a source when its recovery worker itself terminates.
+
+    Transient crash/timeout/spawn events retain the normal dispatcher retry
+    path. A final block/give-up cannot recursively create another reconciliation
+    task, so fail open to the source task and record an explicit automation
+    outcome. If the source blocks again, that new source event gets its own
+    bounded reconciliation task.
+    """
+    if event.kind not in {"blocked", "block_loop_detected", "gave_up"}:
+        return None
+    source_id, source_event_id = _reconciliation_source_from_key(recovery)
+    source = get_task(conn, source_id) if source_id else None
+    if source is None or source.status not in {"blocked", "triage", "scheduled"}:
+        return recovery.id
+    next_status = "ready" if _parents_satisfied(conn, source.id) else "todo"
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, block_kind = NULL WHERE id = ? "
+            "AND status IN ('blocked', 'triage', 'scheduled')",
+            (next_status, source.id),
+        )
+        _append_event(
+            conn,
+            source.id,
+            "reconciliation_outcome",
+            {
+                "outcome": "reconciliation_failed",
+                "source_event_id": source_event_id,
+                "reconciliation_task_id": recovery.id,
+                "recovery_failure_event_id": event.id,
+                "error": _redact_reconciliation_text(
+                    str((event.payload or {}).get("reason") or (event.payload or {}).get("error") or event.kind)
+                ),
+                "fallback": "source_resumed",
+            },
+            run_id=event.run_id,
+        )
+    return recovery.id
 
 
 def enqueue_blocker_reconciliation(
@@ -3595,15 +3699,15 @@ def enqueue_blocker_reconciliation(
     if event.kind not in RECONCILIATION_EVENT_KINDS:
         return None
     source = get_task(conn, event.task_id)
-    if source is None or (source.idempotency_key or "").startswith(
-        RECONCILIATION_IDEMPOTENCY_PREFIX
-    ):
+    if source is None:
         return None
+    if (source.idempotency_key or "").startswith(RECONCILIATION_IDEMPOTENCY_PREFIX):
+        return _handle_terminal_reconciliation_failure(conn, source, event)
 
     board = _board_slug_for_connection(conn)
     exact_key = f"{RECONCILIATION_IDEMPOTENCY_PREFIX}{board}:{source.id}:{event.id}"
     exact = conn.execute(
-        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived'",
+        "SELECT id FROM tasks WHERE idempotency_key = ?",
         (exact_key,),
     ).fetchone()
     if exact:
@@ -3612,12 +3716,13 @@ def enqueue_blocker_reconciliation(
     active_prefix = f"{RECONCILIATION_IDEMPOTENCY_PREFIX}{board}:{source.id}:"
     active = conn.execute(
         "SELECT id FROM tasks WHERE idempotency_key LIKE ? "
-        "AND status NOT IN ('done', 'archived') ORDER BY created_at LIMIT 1",
+        "AND status IN ('todo', 'ready', 'running', 'review', 'scheduled') "
+        "ORDER BY created_at LIMIT 1",
         (active_prefix + "%",),
     ).fetchone()
     if active:
         now = int(time.time())
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=True):
             conn.execute(
                 "INSERT INTO task_comments (task_id, author, body, created_at) "
                 "VALUES (?, 'blocker-reconciler', ?, ?)",
@@ -3631,7 +3736,11 @@ def enqueue_blocker_reconciliation(
                 conn,
                 source.id,
                 "reconciliation_coalesced",
-                {"source_event_id": event.id, "reconciliation_task_id": active["id"]},
+                {
+                    "source_event_id": event.id,
+                    "source_status": source.status,
+                    "reconciliation_task_id": active["id"],
+                },
                 run_id=event.run_id,
             )
         return active["id"]
@@ -3654,13 +3763,14 @@ def enqueue_blocker_reconciliation(
         board=board,
         session_id=source.session_id,
     )
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         _append_event(
             conn,
             source.id,
             "reconciliation_enqueued",
             {
                 "source_event_id": event.id,
+                "source_status": source.status,
                 "reconciliation_task_id": recovery_id,
                 "classification": classify_blocker_occurrence(
                     event.kind, event.payload, block_kind=source.block_kind,
@@ -3671,71 +3781,250 @@ def enqueue_blocker_reconciliation(
     return recovery_id
 
 
-def _apply_reconciliation_completion(
+def _latest_reconciliation_source_event_id(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    recovery_task_id: str,
+    original_event_id: int,
+) -> tuple[int, Optional[str]]:
+    """Return the newest coalesced occurrence and its assigned source state."""
+    latest = original_event_id
+    source_status: Optional[str] = None
+    for event in list_events(conn, source_task_id):
+        if event.kind not in {"reconciliation_enqueued", "reconciliation_coalesced"}:
+            continue
+        payload = event.payload or {}
+        if payload.get("reconciliation_task_id") != recovery_task_id:
+            continue
+        raw_event_id = payload.get("source_event_id")
+        if raw_event_id is None:
+            continue
+        try:
+            latest = int(raw_event_id)
+        except (TypeError, ValueError):
+            continue
+        raw_status = payload.get("source_status")
+        source_status = raw_status if isinstance(raw_status, str) else None
+    return latest, source_status
+
+
+def _required_reconciliation_text(
+    reconciliation: Mapping[str, Any],
+    field: str,
+) -> str:
+    value = reconciliation.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"reconciliation.{field} is required")
+    return value.strip()
+
+
+def _validate_reconciliation_verdict(
     conn: sqlite3.Connection,
     recovery_task_id: str,
     metadata: Optional[Mapping[str, Any]],
-) -> None:
+) -> Optional[dict[str, Any]]:
+    """Validate and normalize a recovery worker's machine-readable verdict.
+
+    Non-reconciliation tasks return ``None``. Recovery tasks fail closed: they
+    cannot transition to done without a complete verdict for the newest source
+    occurrence assigned to them.
+    """
     recovery = get_task(conn, recovery_task_id)
     if recovery is None or not (recovery.idempotency_key or "").startswith(
         RECONCILIATION_IDEMPOTENCY_PREFIX
     ):
-        return
+        return None
+
     reconciliation = metadata.get("reconciliation") if isinstance(metadata, Mapping) else None
     if not isinstance(reconciliation, Mapping):
-        return
-    outcome = str(reconciliation.get("outcome") or "").strip()
-    source_id = str(reconciliation.get("source_task_id") or "").strip()
+        raise ValueError("reconciliation metadata is required")
+
+    outcome = _required_reconciliation_text(reconciliation, "outcome")
+    if outcome not in RECONCILIATION_OUTCOMES:
+        raise ValueError(
+            "reconciliation.outcome must be one of " + ", ".join(sorted(RECONCILIATION_OUTCOMES))
+        )
+    source_id = _required_reconciliation_text(reconciliation, "source_task_id")
+    source_from_key, original_event_id = _reconciliation_source_from_key(recovery)
+    if source_from_key != source_id or original_event_id is None:
+        raise ValueError("reconciliation.source_task_id does not match recovery lineage")
+
     raw_source_event_id = reconciliation.get("source_event_id")
     if raw_source_event_id is None:
-        return
+        raise ValueError("reconciliation.source_event_id must be an integer")
     try:
         source_event_id = int(raw_source_event_id)
     except (TypeError, ValueError):
-        return
-    if outcome not in RECONCILIATION_OUTCOMES or not source_id:
-        return
-    expected_suffix = f":{source_id}:{source_event_id}"
-    if not (recovery.idempotency_key or "").endswith(expected_suffix):
-        return
+        raise ValueError("reconciliation.source_event_id must be an integer") from None
+    latest_event_id, expected_source_status = _latest_reconciliation_source_event_id(
+        conn, source_id, recovery_task_id, original_event_id,
+    )
+    if source_event_id != latest_event_id:
+        raise ValueError(
+            "reconciliation.source_event_id is stale; "
+            f"expected newest coalesced event {latest_event_id}"
+        )
     source_event = conn.execute(
-        "SELECT 1 FROM task_events WHERE id = ? AND task_id = ?",
+        "SELECT kind FROM task_events WHERE id = ? AND task_id = ?",
         (source_event_id, source_id),
     ).fetchone()
-    if source_event is None:
+    if source_event is None or source_event["kind"] not in RECONCILIATION_EVENT_KINDS:
+        raise ValueError("reconciliation.source_event_id is not a reconciliation occurrence")
+
+    verdict: dict[str, Any] = {
+        "outcome": outcome,
+        "source_task_id": source_id,
+        "source_event_id": source_event_id,
+        "expected_source_status": expected_source_status,
+    }
+    if outcome == "continuation_created":
+        continuation_id = _required_reconciliation_text(reconciliation, "continuation_task_id")
+        if get_task(conn, continuation_id) is None:
+            raise ValueError("reconciliation.continuation_task_id does not exist")
+        linked = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (continuation_id, source_id),
+        ).fetchone()
+        if linked is None:
+            raise ValueError(
+                "reconciliation.continuation_task_id must be a linked parent of the source task"
+            )
+        verdict["continuation_task_id"] = continuation_id
+    elif outcome == "dependency_wait":
+        dependency_id = _required_reconciliation_text(reconciliation, "dependency_task_id")
+        if get_task(conn, dependency_id) is None:
+            raise ValueError("reconciliation.dependency_task_id does not exist")
+        linked = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (dependency_id, source_id),
+        ).fetchone()
+        if linked is None:
+            raise ValueError(
+                "reconciliation.dependency_task_id must be a linked parent of the source task"
+            )
+        verdict["dependency_task_id"] = dependency_id
+    elif outcome == "backoff_scheduled":
+        raw_resume_at = reconciliation.get("resume_at")
+        if raw_resume_at is None or isinstance(raw_resume_at, bool):
+            raise ValueError("reconciliation.resume_at must be a positive unix timestamp")
+        try:
+            resume_at = int(raw_resume_at)
+        except (TypeError, ValueError):
+            raise ValueError("reconciliation.resume_at must be a positive unix timestamp") from None
+        if resume_at <= 0:
+            raise ValueError("reconciliation.resume_at must be a positive unix timestamp")
+        verdict["resume_at"] = resume_at
+    elif outcome == "genuine_human_gate":
+        verdict["human_action"] = _redact_reconciliation_text(
+            _required_reconciliation_text(reconciliation, "human_action"),
+            limit=1000,
+        )
+    elif outcome == "reconciliation_failed":
+        verdict["error"] = _redact_reconciliation_text(
+            _required_reconciliation_text(reconciliation, "error"),
+            limit=2000,
+        )
+    return verdict
+
+
+def _apply_reconciliation_completion(
+    conn: sqlite3.Connection,
+    recovery_task_id: str,
+    verdict: Optional[Mapping[str, Any]],
+) -> None:
+    """Apply one already-validated verdict inside the completion transaction."""
+    if verdict is None:
+        return
+    source_id = str(verdict["source_task_id"])
+    source_event_id = int(verdict["source_event_id"])
+    outcome = str(verdict["outcome"])
+    recovery = get_task(conn, recovery_task_id)
+    if recovery is None:
+        raise ValueError("reconciliation task no longer exists")
+    source = get_task(conn, source_id)
+    if source is None:
+        raise ValueError("reconciliation source task no longer exists")
+
+    # A valid verdict may have been produced just before another actor completed
+    # or materially advanced the source. Never resurrect that state or emit a
+    # stale human gate; retain the discarded verdict as explicit automation
+    # evidence instead.
+    latest_event_id, expected_source_status = _latest_reconciliation_source_event_id(
+        conn,
+        source_id,
+        recovery_task_id,
+        _reconciliation_source_from_key(recovery)[1] or source_event_id,
+    )
+    stale_reason: Optional[str] = None
+    if latest_event_id != source_event_id:
+        stale_reason = f"newer source occurrence {latest_event_id} superseded {source_event_id}"
+    elif expected_source_status and source.status != expected_source_status:
+        stale_reason = (
+            f"source materially advanced from {expected_source_status} to {source.status}"
+        )
+    elif not expected_source_status and source.status in {
+        "done", "archived", "review", "running", "ready", "todo",
+    }:
+        stale_reason = f"source materially advanced to {source.status}"
+    elif outcome == "genuine_human_gate" and source.status not in {"blocked", "triage"}:
+        stale_reason = f"source is no longer awaiting human input ({source.status})"
+    elif outcome in {"continuation_created", "dependency_wait"}:
+        parent_field = (
+            "continuation_task_id"
+            if outcome == "continuation_created"
+            else "dependency_task_id"
+        )
+        parent_id = str(verdict[parent_field])
+        linked = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, source_id),
+        ).fetchone()
+        if linked is None:
+            stale_reason = f"linked parent {parent_id} was removed before completion"
+
+    payload = {
+        "outcome": outcome,
+        "source_event_id": source_event_id,
+        "reconciliation_task_id": recovery_task_id,
+        "human_action": verdict.get("human_action"),
+        "continuation_task_id": verdict.get("continuation_task_id"),
+    }
+    for field in ("dependency_task_id", "resume_at", "error"):
+        if field in verdict:
+            payload[field] = verdict[field]
+    if stale_reason:
+        payload.update(
+            {
+                "outcome": "reconciliation_failed",
+                "human_action": None,
+                "error": stale_reason,
+                "discarded_outcome": outcome,
+                "stale": True,
+            }
+        )
+        _append_event(conn, source_id, "reconciliation_outcome", payload)
         return
 
-    human_action = str(reconciliation.get("human_action") or "").strip() or None
-    continuation_id = str(reconciliation.get("continuation_task_id") or "").strip() or None
-    if outcome == "genuine_human_gate" and not human_action:
-        outcome = "reconciliation_failed"
-    if continuation_id and get_task(conn, continuation_id) is None:
-        continuation_id = None
-        if outcome == "continuation_created":
-            outcome = "reconciliation_failed"
-
-    with write_txn(conn):
-        if outcome in {"cleared/resumed", "dependency_wait", "backoff_scheduled"}:
-            if outcome == "dependency_wait":
-                next_status = "todo"
-            elif outcome == "backoff_scheduled":
-                next_status = "scheduled"
-            else:
-                next_status = "ready" if _parents_satisfied(conn, source_id) else "todo"
-            conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
-                "worker_pid = NULL, block_kind = NULL WHERE id = ? "
-                "AND status IN ('blocked', 'triage', 'scheduled', 'todo', 'ready')",
-                (next_status, source_id),
-            )
-        payload = {
-            "outcome": outcome,
-            "source_event_id": source_event_id,
-            "reconciliation_task_id": recovery_task_id,
-            "human_action": human_action,
-            "continuation_task_id": continuation_id,
-        }
-        _append_event(conn, source_id, "reconciliation_outcome", payload)
+    if outcome in {
+        "cleared/resumed",
+        "continuation_created",
+        "dependency_wait",
+        "backoff_scheduled",
+        "reconciliation_failed",
+    }:
+        if outcome == "dependency_wait":
+            next_status = "todo"
+        elif outcome == "backoff_scheduled":
+            next_status = "scheduled"
+        else:
+            next_status = _landing_status_after_parents(conn, source_id)
+        conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, current_run_id = NULL, block_kind = NULL WHERE id = ? "
+            "AND status IN ('blocked', 'triage', 'scheduled', 'todo', 'ready')",
+            (next_status, source_id),
+        )
+    _append_event(conn, source_id, "reconciliation_outcome", payload)
 
 
 def attention_class(
@@ -4731,6 +5020,56 @@ def recompute_ready(
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
+        # Reconciliation backoffs carry their deadline in the durable outcome
+        # event. Unlike generic ``scheduled`` tasks, they can therefore resume
+        # automatically on the first dispatcher recomputation after the
+        # deadline without a separate polling state store.
+        now = int(time.time())
+        scheduled_rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'scheduled'"
+        ).fetchall()
+        for row in scheduled_rows:
+            task_id = row["id"]
+            outcome_row = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'reconciliation_outcome' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            try:
+                outcome_payload = (
+                    json.loads(outcome_row["payload"])
+                    if outcome_row and outcome_row["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                outcome_payload = {}
+            if not isinstance(outcome_payload, dict):
+                continue
+            if outcome_payload.get("outcome") != "backoff_scheduled":
+                continue
+            raw_resume_at = outcome_payload.get("resume_at")
+            if raw_resume_at is None or isinstance(raw_resume_at, bool):
+                continue
+            try:
+                resume_at = int(raw_resume_at)
+            except (TypeError, ValueError):
+                continue
+            if resume_at > now:
+                continue
+            landing_status = _landing_status_after_parents(conn, task_id)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ? AND status = 'scheduled'",
+                (landing_status, task_id),
+            )
+            if cur.rowcount == 1:
+                _append_event(
+                    conn,
+                    task_id,
+                    "backoff_elapsed",
+                    {"resume_at": resume_at, "status": landing_status},
+                )
+                promoted += 1
+
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -5576,11 +5915,10 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
-    # Preserve the worker's machine-readable recovery contract before artifact
-    # staging mutates completion metadata in-place.
-    reconciliation_metadata = (
-        json.loads(json.dumps(metadata)) if isinstance(metadata, dict) else None
-    )
+    # Recovery workers fail closed: validate their machine-readable verdict
+    # before artifact staging or any task/run transition. The verdict is
+    # re-fenced against source state inside the final write transaction.
+    reconciliation_verdict = _validate_reconciliation_verdict(conn, task_id, metadata)
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5664,6 +6002,7 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        _apply_reconciliation_completion(conn, task_id, reconciliation_verdict)
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -5737,11 +6076,7 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
-    # A reconciliation worker's completion is the machine-readable verdict on
-    # the source occurrence. Apply it only after the recovery task is durably
-    # done; malformed/mismatched metadata is ignored rather than mutating a
-    # different source task.
-    _apply_reconciliation_completion(conn, task_id, reconciliation_metadata)
+
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
