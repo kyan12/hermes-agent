@@ -3816,7 +3816,7 @@ def _reconciliation_prompt(envelope: Mapping[str, Any]) -> str:
         '"source_event_id":<latest>,"dependency_task_id":"t_..."}}\n'
         '{"reconciliation":{"outcome":"backoff_scheduled",'
         f'"source_task_id":"{lineage["source_task_id"]}",'
-        '"source_event_id":<latest>,"resume_at":<positive unix timestamp>}}\n'
+        '"source_event_id":<latest>,"resume_at":<future unix timestamp>}}\n'
         '{"reconciliation":{"outcome":"genuine_human_gate",'
         f'"source_task_id":"{lineage["source_task_id"]}",'
         '"source_event_id":<latest>,"human_action":"one atomic action"}}\n'
@@ -4195,10 +4195,10 @@ def _validate_reconciliation_verdict(
     elif outcome == "backoff_scheduled":
         raw_resume_at = reconciliation.get("resume_at")
         if type(raw_resume_at) is not int:
-            raise ValueError("reconciliation.resume_at must be a positive unix timestamp")
+            raise ValueError("reconciliation.resume_at must be a future unix timestamp")
         resume_at = raw_resume_at
-        if resume_at <= 0:
-            raise ValueError("reconciliation.resume_at must be a positive unix timestamp")
+        if resume_at <= int(time.time()):
+            raise ValueError("reconciliation.resume_at must be a future unix timestamp")
         verdict["resume_at"] = resume_at
     elif outcome == "genuine_human_gate":
         verdict["human_action"] = _redact_reconciliation_text(
