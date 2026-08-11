@@ -667,6 +667,59 @@ def test_block_loop_triage_cannot_be_auto_resumed(
         assert len(gates) == 1
 
 
+def test_failed_reconciliation_cannot_resume_block_loop_triage(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="same blocker", kind="capability")
+        assert kb.unblock_task(conn, source_id)
+        assert kb.claim_task(conn, source_id, claimer="source-again") is not None
+        assert kb.block_task(conn, source_id, reason="same blocker", kind="capability")
+        recovery = next(task for task in _reconciliation_tasks(conn) if task.status == "ready")
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = next(
+            event.id
+            for event in reversed(kb.list_events(conn, source_id))
+            if event.kind == "block_loop_detected"
+        )
+
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="reconciler could not diagnose the loop",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "reconciliation_failed",
+                "error": "diagnosis failed",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == "triage"
+        outcomes = [
+            event.payload or {}
+            for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert outcomes[-1]["outcome"] == "genuine_human_gate"
+
+
+def test_manual_triage_without_active_recovery_is_human_input(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(conn, title="manual triage", assignee="code-crab")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (source_id,))
+        assert kb.attention_class(conn, source_id, reconciler_enabled=True) == "human_input"
+
+
 def test_repeated_reconciliation_failures_escalate_once_instead_of_looping(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

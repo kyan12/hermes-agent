@@ -4181,7 +4181,11 @@ def _apply_reconciliation_completion(
         and _reconciliation_generation_count(conn, source_id)
         >= RECONCILIATION_SOURCE_FAILURE_LIMIT - 1
     )
-    if outcome in resumptive_outcomes and (source.status == "triage" or generation_exhausted):
+    automation_outcomes = resumptive_outcomes | {"reconciliation_failed"}
+    if (
+        outcome in automation_outcomes
+        and (source.status == "triage" or generation_exhausted)
+    ):
         payload.update(
             {
                 "outcome": "genuine_human_gate",
@@ -4272,7 +4276,12 @@ def attention_class(
             payload = {}
         if payload.get("outcome") == "genuine_human_gate":
             return "human_input"
-    return "automation_recovery"
+    active_recovery = conn.execute(
+        "SELECT 1 FROM tasks WHERE idempotency_key LIKE ? "
+        "AND status IN ('todo', 'ready', 'running', 'review', 'scheduled') LIMIT 1",
+        (f"{RECONCILIATION_IDEMPOTENCY_PREFIX}%:{task_id}:%",),
+    ).fetchone()
+    return "automation_recovery" if active_recovery else "human_input"
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
