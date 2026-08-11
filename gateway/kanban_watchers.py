@@ -25,6 +25,39 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+_RECOVERY_TRIGGER_KINDS = frozenset({
+    "blocked", "block_loop_detected", "gave_up", "crashed", "timed_out",
+    "spawn_failed", "protocol_violation", "rate_limited",
+})
+
+
+def should_notify_kanban_event(
+    kind: str,
+    payload: Optional[dict],
+    *,
+    reconciler_enabled: bool,
+) -> bool:
+    """Gate user notification so automation recovery stays silent.
+
+    With the reconciler disabled, legacy terminal-event notifications remain
+    unchanged. With it enabled, raw blocker/failure events are internal recovery
+    signals and only an affirmed ``genuine_human_gate`` outcome may ping/wake the
+    user. Ordinary completion/review/status notifications are unaffected.
+    """
+    if not reconciler_enabled:
+        if kind != "reconciliation_outcome":
+            return True
+        # A recovery already running when the kill switch is flipped may still
+        # finish. Preserve its affirmed human gate so disabling automation can
+        # never strand the source after its raw blocker notification was hidden.
+        return bool(payload and payload.get("outcome") == "genuine_human_gate")
+    if kind in _RECOVERY_TRIGGER_KINDS:
+        return False
+    if kind == "reconciliation_outcome":
+        return bool(payload and payload.get("outcome") == "genuine_human_gate")
+    return True
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -217,7 +250,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "reconciliation_outcome")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -468,6 +501,7 @@ class GatewayKanbanWatchersMixin:
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
+                reconciler_enabled = _kb.blocker_reconciler_enabled()
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -526,6 +560,12 @@ class GatewayKanbanWatchersMixin:
                     wake_handoff = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        if not should_notify_kanban_event(
+                            kind,
+                            ev.payload,
+                            reconciler_enabled=reconciler_enabled,
+                        ):
+                            continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -614,6 +654,14 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
+                            )
+                        elif kind == "reconciliation_outcome":
+                            action = ""
+                            if ev.payload and ev.payload.get("human_action"):
+                                action = f": {str(ev.payload['human_action'])[:240]}"
+                            msg = (
+                                f"🛑 {board_tag}{tag}Kanban {sub['task_id']} needs your input"
+                                f" — automation recovery verified a genuine human gate{action}"
                             )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
@@ -759,9 +807,18 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "reconciliation_outcome")
                         _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                            {
+                                ev.kind
+                                for ev in d["events"]
+                                if ev.kind in _WAKE_KINDS
+                                and should_notify_kanban_event(
+                                    ev.kind,
+                                    ev.payload,
+                                    reconciler_enabled=reconciler_enabled,
+                                )
+                            }
                             if wake_agent
                             else set()
                         )
@@ -796,6 +853,7 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "reconciliation_outcome" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
