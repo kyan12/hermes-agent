@@ -157,11 +157,14 @@ RECONCILIATION_OUTCOMES = frozenset({
     "genuine_human_gate",
     "reconciliation_failed",
 })
+# Stop a source from cycling forever when the recovery mechanism itself cannot
+# complete. The terminal attempt escalates one precise operator action instead
+# of spawning a fourth recovery generation.
+RECONCILIATION_SOURCE_FAILURE_LIMIT = 3
 
 # _append_event runs inside write transactions. Queue trigger ids in a
-# transaction-local ContextVar, then drain only after the outer COMMIT so task
-# creation never nests under the source transition and rollback drops the
-# pending work automatically.
+# transaction-local ContextVar, then drain before the outer COMMIT so the
+# trigger and recovery task are atomic; rollback drops both automatically.
 _pending_reconciliation_event_ids: ContextVar[Optional[list[int]]] = ContextVar(
     "kanban_pending_reconciliation_event_ids", default=None,
 )
@@ -3841,6 +3844,29 @@ def _reconciliation_source_from_key(task: Task) -> tuple[Optional[str], Optional
         return None, None
 
 
+def _reconciliation_resumed_failure_count(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+) -> int:
+    """Count consecutive recovery failures that actually resumed this source."""
+    count = 0
+    for source_event in list_events(conn, source_task_id):
+        if source_event.kind != "reconciliation_outcome":
+            continue
+        payload = source_event.payload or {}
+        if payload.get("outcome") in {
+            "cleared/resumed", "continuation_created", "dependency_wait", "backoff_scheduled",
+        }:
+            count = 0
+            continue
+        if (
+            payload.get("outcome") == "reconciliation_failed"
+            and payload.get("fallback") == "source_resumed"
+        ):
+            count += 1
+    return count
+
+
 def _handle_terminal_reconciliation_failure(
     conn: sqlite3.Connection,
     recovery: Task,
@@ -3860,7 +3886,13 @@ def _handle_terminal_reconciliation_failure(
     source = get_task(conn, source_id) if source_id else None
     if source is None or source.status not in {"blocked", "triage", "scheduled"}:
         return recovery.id
-    next_status = "ready" if _parents_satisfied(conn, source.id) else "todo"
+    failure_count = _reconciliation_resumed_failure_count(conn, source.id) + 1
+    exhausted = failure_count >= RECONCILIATION_SOURCE_FAILURE_LIMIT
+    next_status = (
+        "triage"
+        if exhausted
+        else ("ready" if _parents_satisfied(conn, source.id) else "todo")
+    )
     with write_txn(conn, allow_nested=True):
         conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
@@ -3873,14 +3905,23 @@ def _handle_terminal_reconciliation_failure(
             source.id,
             "reconciliation_outcome",
             {
-                "outcome": "reconciliation_failed",
+                "outcome": (
+                    "genuine_human_gate" if exhausted else "reconciliation_failed"
+                ),
                 "source_event_id": source_event_id,
                 "reconciliation_task_id": recovery.id,
                 "recovery_failure_event_id": event.id,
+                "failure_count": failure_count,
                 "error": _redact_reconciliation_text(
                     str((event.payload or {}).get("reason") or (event.payload or {}).get("error") or event.kind)
                 ),
-                "fallback": "source_resumed",
+                "fallback": (
+                    "automation_exhausted" if exhausted else "source_resumed"
+                ),
+                "human_action": (
+                    "Inspect the blocker reconciler failures for this source task and resume it."
+                    if exhausted else None
+                ),
             },
             run_id=event.run_id,
         )
@@ -4054,18 +4095,34 @@ def _validate_reconciliation_verdict(
         raise ValueError(
             "reconciliation.outcome must be one of " + ", ".join(sorted(RECONCILIATION_OUTCOMES))
         )
+    outcome_field = {
+        "cleared/resumed": None,
+        "continuation_created": "continuation_task_id",
+        "dependency_wait": "dependency_task_id",
+        "backoff_scheduled": "resume_at",
+        "genuine_human_gate": "human_action",
+        "reconciliation_failed": "error",
+    }[outcome]
+    allowed_fields = {"outcome", "source_task_id", "source_event_id"}
+    if outcome_field:
+        allowed_fields.add(outcome_field)
+    unexpected_fields = sorted(
+        str(field) for field in reconciliation.keys() if field not in allowed_fields
+    )
+    if unexpected_fields:
+        raise ValueError(
+            "reconciliation contains unexpected fields for "
+            f"{outcome}: {', '.join(unexpected_fields)}"
+        )
     source_id = _required_reconciliation_text(reconciliation, "source_task_id")
     source_from_key, original_event_id = _reconciliation_source_from_key(recovery)
     if source_from_key != source_id or original_event_id is None:
         raise ValueError("reconciliation.source_task_id does not match recovery lineage")
 
     raw_source_event_id = reconciliation.get("source_event_id")
-    if raw_source_event_id is None:
+    if type(raw_source_event_id) is not int:
         raise ValueError("reconciliation.source_event_id must be an integer")
-    try:
-        source_event_id = int(raw_source_event_id)
-    except (TypeError, ValueError):
-        raise ValueError("reconciliation.source_event_id must be an integer") from None
+    source_event_id = raw_source_event_id
     latest_event_id, expected_source_status = _latest_reconciliation_source_event_id(
         conn, source_id, recovery_task_id, original_event_id,
     )
@@ -4115,12 +4172,9 @@ def _validate_reconciliation_verdict(
         verdict["dependency_task_id"] = dependency_id
     elif outcome == "backoff_scheduled":
         raw_resume_at = reconciliation.get("resume_at")
-        if raw_resume_at is None or isinstance(raw_resume_at, bool):
+        if type(raw_resume_at) is not int:
             raise ValueError("reconciliation.resume_at must be a positive unix timestamp")
-        try:
-            resume_at = int(raw_resume_at)
-        except (TypeError, ValueError):
-            raise ValueError("reconciliation.resume_at must be a positive unix timestamp") from None
+        resume_at = raw_resume_at
         if resume_at <= 0:
             raise ValueError("reconciliation.resume_at must be a positive unix timestamp")
         verdict["resume_at"] = resume_at
@@ -4214,6 +4268,29 @@ def _apply_reconciliation_completion(
         )
         _append_event(conn, source_id, "reconciliation_outcome", payload)
         return
+
+    if outcome == "reconciliation_failed":
+        failure_count = _reconciliation_resumed_failure_count(conn, source_id) + 1
+        payload["failure_count"] = failure_count
+        if failure_count >= RECONCILIATION_SOURCE_FAILURE_LIMIT:
+            payload.update(
+                {
+                    "outcome": "genuine_human_gate",
+                    "fallback": "automation_exhausted",
+                    "human_action": (
+                        "Inspect the blocker reconciler failures for this source task and resume it."
+                    ),
+                }
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'triage', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+                "WHERE id = ? AND status IN ('blocked', 'triage', 'scheduled', 'todo', 'ready')",
+                (source_id,),
+            )
+            _append_event(conn, source_id, "reconciliation_outcome", payload)
+            return
+        payload["fallback"] = "source_resumed"
 
     if outcome in {
         "cleared/resumed",
