@@ -460,13 +460,16 @@ def get_board(
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
-
+        reconciler_enabled = kanban_db.blocker_reconciler_enabled()
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
             d = _task_dict(t, latest_summary=preview)
+            d["attention_class"] = kanban_db.attention_class(
+                conn, t.id, reconciler_enabled=reconciler_enabled,
+            )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -2193,7 +2196,20 @@ def get_stats(board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        return kanban_db.board_stats(conn)
+        stats = kanban_db.board_stats(conn)
+        attention_counts = {"human_input": 0, "automation_recovery": 0}
+        reconciler_enabled = kanban_db.blocker_reconciler_enabled()
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE status IN ('blocked', 'triage') "
+            "AND status != 'archived'"
+        ).fetchall():
+            classification = kanban_db.attention_class(
+                conn, row["id"], reconciler_enabled=reconciler_enabled,
+            )
+            if classification in attention_counts:
+                attention_counts[classification] += 1
+        stats["attention_counts"] = attention_counts
+        return stats
     finally:
         conn.close()
 

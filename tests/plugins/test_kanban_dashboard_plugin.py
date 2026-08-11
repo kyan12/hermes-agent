@@ -942,3 +942,49 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_board_and_stats_separate_automation_recovery_from_human_input(
+    client, monkeypatch,
+):
+    from hermes_cli import config as config_module
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "blocker_reconciler": {
+                    "enabled": True,
+                    "profile": "default",
+                    "max_active": 2,
+                }
+            }
+        },
+    )
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "recover me", "assignee": "code-crab"},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        claimed = kb.claim_task(conn, task["id"], claimer="dashboard-test")
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            task["id"],
+            reason="iteration budget exhausted",
+            kind="transient",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    board = client.get("/api/plugins/kanban/board").json()
+    blocked = next(c for c in board["columns"] if c["name"] == "blocked")
+    source = next(item for item in blocked["tasks"] if item["id"] == task["id"])
+    assert source["attention_class"] == "automation_recovery"
+
+    stats = client.get("/api/plugins/kanban/stats").json()
+    assert stats["attention_counts"] == {
+        "human_input": 0,
+        "automation_recovery": 1,
+    }
