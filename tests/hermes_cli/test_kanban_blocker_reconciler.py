@@ -639,6 +639,30 @@ def test_task_outcomes_require_linked_parent_lineage(
             )
 
 
+def test_backoff_outcome_rejects_non_future_deadline(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="quota reset", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        with pytest.raises(ValueError, match="future unix timestamp"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="invalid expired backoff",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "backoff_scheduled",
+                    "resume_at": int(kb.time.time()) - 1,
+                }},
+            )
+
+
 def test_backoff_outcome_resumes_when_deadline_elapses(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
