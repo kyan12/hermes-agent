@@ -467,8 +467,12 @@ def get_board(
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
             d = _task_dict(t, latest_summary=preview)
-            d["attention_class"] = kanban_db.attention_class(
-                conn, t.id, reconciler_enabled=reconciler_enabled,
+            d["attention_class"] = (
+                kanban_db.attention_class(
+                    conn, t.id, reconciler_enabled=reconciler_enabled,
+                )
+                if t.status in {"blocked", "triage"}
+                else None
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)

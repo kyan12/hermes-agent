@@ -3867,6 +3867,29 @@ def _reconciliation_resumed_failure_count(
     return count
 
 
+def _reconciliation_generation_count(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+) -> int:
+    """Count prior recovery generations that returned a source to automation."""
+    count = 0
+    for source_event in list_events(conn, source_task_id):
+        if source_event.kind != "reconciliation_outcome":
+            continue
+        payload = source_event.payload or {}
+        if payload.get("outcome") in {
+            "cleared/resumed",
+            "continuation_created",
+            "dependency_wait",
+            "backoff_scheduled",
+        } or (
+            payload.get("outcome") == "reconciliation_failed"
+            and payload.get("fallback") == "source_resumed"
+        ):
+            count += 1
+    return count
+
+
 def _handle_terminal_reconciliation_failure(
     conn: sqlite3.Connection,
     recovery: Task,
@@ -3887,7 +3910,12 @@ def _handle_terminal_reconciliation_failure(
     if source is None or source.status not in {"blocked", "triage", "scheduled"}:
         return recovery.id
     failure_count = _reconciliation_resumed_failure_count(conn, source.id) + 1
-    exhausted = failure_count >= RECONCILIATION_SOURCE_FAILURE_LIMIT
+    exhausted = (
+        source.status == "triage"
+        or _reconciliation_generation_count(conn, source.id)
+        >= RECONCILIATION_SOURCE_FAILURE_LIMIT - 1
+        or failure_count >= RECONCILIATION_SOURCE_FAILURE_LIMIT
+    )
     next_status = (
         "triage"
         if exhausted
@@ -3954,6 +3982,18 @@ def enqueue_blocker_reconciliation(
         return None
     if (source.idempotency_key or "").startswith(RECONCILIATION_IDEMPOTENCY_PREFIX):
         return _handle_terminal_reconciliation_failure(conn, source, event)
+    if event.kind in {
+        "crashed",
+        "timed_out",
+        "spawn_failed",
+        "rate_limited",
+        "protocol_violation",
+    } and source.status in {"ready", "todo", "review"}:
+        # These events are emitted after the dispatcher has already restored
+        # the source to a retryable phase. Starting a separate recovery worker
+        # would race the imminent source retry in the same workspace. The final
+        # circuit-breaker event (gave_up/block) remains reconcilable.
+        return None
 
     board = _board_slug_for_connection(conn)
     exact_key = f"{RECONCILIATION_IDEMPOTENCY_PREFIX}{board}:{source.id}:{event.id}"
@@ -4340,6 +4380,37 @@ def _apply_reconciliation_completion(
         _append_event(conn, source_id, "reconciliation_outcome", payload)
         return
 
+    resumptive_outcomes = {
+        "cleared/resumed",
+        "continuation_created",
+        "dependency_wait",
+        "backoff_scheduled",
+    }
+    generation_exhausted = (
+        outcome in resumptive_outcomes
+        and _reconciliation_generation_count(conn, source_id)
+        >= RECONCILIATION_SOURCE_FAILURE_LIMIT - 1
+    )
+    if outcome in resumptive_outcomes and (source.status == "triage" or generation_exhausted):
+        payload.update(
+            {
+                "outcome": "genuine_human_gate",
+                "discarded_outcome": outcome,
+                "fallback": "automation_exhausted",
+                "human_action": (
+                    "Inspect the repeated blocker/recovery loop for this source task and resume it."
+                ),
+            }
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'triage', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ? AND status IN ('blocked', 'triage', 'scheduled', 'todo', 'ready')",
+            (source_id,),
+        )
+        _append_event(conn, source_id, "reconciliation_outcome", payload)
+        return
+
     if outcome == "reconciliation_failed":
         failure_count = _reconciliation_resumed_failure_count(conn, source_id) + 1
         payload["failure_count"] = failure_count
@@ -4378,7 +4449,8 @@ def _apply_reconciliation_completion(
             next_status = _landing_status_after_parents(conn, source_id)
         conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
-            "worker_pid = NULL, current_run_id = NULL, block_kind = NULL WHERE id = ? "
+            "worker_pid = NULL, current_run_id = NULL, block_kind = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL WHERE id = ? "
             "AND status IN ('blocked', 'triage', 'scheduled', 'todo', 'ready')",
             (next_status, source_id),
         )
@@ -5406,10 +5478,13 @@ def recompute_ready(
         for row in scheduled_rows:
             task_id = row["id"]
             outcome_row = conn.execute(
-                "SELECT payload FROM task_events WHERE task_id = ? "
-                "AND kind = 'reconciliation_outcome' ORDER BY id DESC LIMIT 1",
+                "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                "AND kind IN ('reconciliation_outcome', 'backoff_elapsed', 'scheduled') "
+                "ORDER BY id DESC LIMIT 1",
                 (task_id,),
             ).fetchone()
+            if outcome_row is None or outcome_row["kind"] != "reconciliation_outcome":
+                continue
             try:
                 outcome_payload = (
                     json.loads(outcome_row["payload"])
