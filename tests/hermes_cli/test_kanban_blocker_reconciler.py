@@ -411,22 +411,56 @@ def test_stale_reconciliation_cannot_emit_human_gate_after_source_done(
         claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
         assert claimed is not None
         source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
-        kb.complete_task(
-            conn,
-            recovery.id,
-            summary="stale verdict",
-            metadata={
-                "reconciliation": {
-                    "source_task_id": source_id,
-                    "source_event_id": source_event_id,
-                    "outcome": "genuine_human_gate",
-                    "human_action": "Choose one option",
-                }
-            },
-        )
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="stale verdict",
+                metadata={
+                    "reconciliation": {
+                        "source_task_id": source_id,
+                        "source_event_id": source_event_id,
+                        "outcome": "genuine_human_gate",
+                        "human_action": "Choose one option",
+                    }
+                },
+            )
         assert not any(
             e.kind == "reconciliation_outcome" and (e.payload or {}).get("outcome") == "genuine_human_gate"
             for e in kb.list_events(conn, source_id)
+        )
+
+
+def test_stale_reconciliation_rejects_same_status_round_trip(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="temporary", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (source_id,))
+            kb._append_event(conn, source_id, "status", {"status": "ready"})
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (source_id,))
+            kb._append_event(conn, source_id, "status", {"status": "blocked"})
+        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is not None
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="obsolete human gate",
+                metadata={"reconciliation": {
+                    "outcome": "genuine_human_gate",
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "human_action": "This stale verdict must not notify",
+                }},
+            )
+        assert not any(
+            event.kind == "reconciliation_outcome"
+            for event in kb.list_events(conn, source_id)
         )
 
 
@@ -442,31 +476,28 @@ def test_stale_reconciliation_cannot_regress_manually_resumed_source(
         assert claimed is not None
         source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
         assert kb.unblock_task(conn, source_id)
-        assert kb.complete_task(
-            conn,
-            recovery.id,
-            summary="stale backoff",
-            metadata={
-                "reconciliation": {
-                    "source_task_id": source_id,
-                    "source_event_id": source_event_id,
-                    "outcome": "backoff_scheduled",
-                    "resume_at": int(kb.time.time()) + 60,
-                }
-            },
-            expected_run_id=claimed.current_run_id,
-        )
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="stale backoff",
+                metadata={
+                    "reconciliation": {
+                        "source_task_id": source_id,
+                        "source_event_id": source_event_id,
+                        "outcome": "backoff_scheduled",
+                        "resume_at": int(kb.time.time()) + 60,
+                    }
+                },
+                expected_run_id=claimed.current_run_id,
+            )
         source = kb.get_task(conn, source_id)
         assert source is not None
         assert source.status == "ready"
-        outcomes = [
-            event for event in kb.list_events(conn, source_id)
-            if event.kind == "reconciliation_outcome"
-        ]
-        payload = outcomes[-1].payload or {}
-        assert payload.get("outcome") == "reconciliation_failed"
-        assert payload.get("discarded_outcome") == "backoff_scheduled"
-        assert payload.get("stale") is True
+        assert not any(
+            event.kind == "reconciliation_outcome"
+            for event in kb.list_events(conn, source_id)
+        )
 
 
 def test_terminal_reconciliation_failure_resumes_source_automatically(
