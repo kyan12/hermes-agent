@@ -4059,6 +4059,20 @@ def _latest_reconciliation_source_event_id(
     return latest, source_status
 
 
+def _newer_reconciliation_source_event(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    source_event_id: int,
+) -> Optional[sqlite3.Row]:
+    """Return the first material source change after an assigned occurrence."""
+    return conn.execute(
+        "SELECT id, kind FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', "
+        "'heartbeat', 'claim_extended') ORDER BY id ASC LIMIT 1",
+        (source_task_id, source_event_id),
+    ).fetchone()
+
+
 def _required_reconciliation_text(
     reconciliation: Mapping[str, Any],
     field: str,
@@ -4137,6 +4151,14 @@ def _validate_reconciliation_verdict(
     ).fetchone()
     if source_event is None or source_event["kind"] not in RECONCILIATION_EVENT_KINDS:
         raise ValueError("reconciliation.source_event_id is not a reconciliation occurrence")
+    newer_source_event = _newer_reconciliation_source_event(
+        conn, source_id, source_event_id,
+    )
+    if newer_source_event is not None:
+        raise ValueError(
+            "reconciliation source advanced after source event "
+            f"{source_event_id} via {newer_source_event['kind']}:{newer_source_event['id']}"
+        )
 
     verdict: dict[str, Any] = {
         "outcome": outcome,
@@ -4222,17 +4244,26 @@ def _apply_reconciliation_completion(
     stale_reason: Optional[str] = None
     if latest_event_id != source_event_id:
         stale_reason = f"newer source occurrence {latest_event_id} superseded {source_event_id}"
-    elif expected_source_status and source.status != expected_source_status:
+    else:
+        newer_source_event = _newer_reconciliation_source_event(
+            conn, source_id, source_event_id,
+        )
+        if newer_source_event is not None:
+            stale_reason = (
+                f"source advanced after source event {source_event_id} via "
+                f"{newer_source_event['kind']}:{newer_source_event['id']}"
+            )
+    if stale_reason is None and expected_source_status and source.status != expected_source_status:
         stale_reason = (
             f"source materially advanced from {expected_source_status} to {source.status}"
         )
-    elif not expected_source_status and source.status in {
+    elif stale_reason is None and not expected_source_status and source.status in {
         "done", "archived", "review", "running", "ready", "todo",
     }:
         stale_reason = f"source materially advanced to {source.status}"
-    elif outcome == "genuine_human_gate" and source.status not in {"blocked", "triage"}:
+    elif stale_reason is None and outcome == "genuine_human_gate" and source.status not in {"blocked", "triage"}:
         stale_reason = f"source is no longer awaiting human input ({source.status})"
-    elif outcome in {"continuation_created", "dependency_wait"}:
+    elif stale_reason is None and outcome in {"continuation_created", "dependency_wait"}:
         parent_field = (
             "continuation_task_id"
             if outcome == "continuation_created"
