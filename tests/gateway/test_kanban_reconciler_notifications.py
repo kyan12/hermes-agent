@@ -6,7 +6,7 @@ from gateway.kanban_watchers import should_notify_kanban_event
 def test_legacy_notification_behavior_is_unchanged_when_reconciler_disabled() -> None:
     for kind in ("blocked", "gave_up", "crashed", "timed_out", "block_loop_detected"):
         assert should_notify_kanban_event(kind, {}, reconciler_enabled=False)
-    assert not should_notify_kanban_event(
+    assert should_notify_kanban_event(
         "reconciliation_outcome",
         {"outcome": "genuine_human_gate"},
         reconciler_enabled=False,

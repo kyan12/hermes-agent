@@ -3853,14 +3853,36 @@ def _newer_reconciliation_source_event(
     conn: sqlite3.Connection,
     source_task_id: str,
     source_event_id: int,
+    *,
+    allowed_link_parent_id: Optional[str] = None,
 ) -> Optional[sqlite3.Row]:
-    """Return the first material source change after an assigned occurrence."""
-    return conn.execute(
-        "SELECT id, kind FROM task_events WHERE task_id = ? AND id > ? "
+    """Return the first material source change after an assigned occurrence.
+
+    A continuation/dependency verdict must first create a parent edge through
+    :func:`link_tasks`, which records a ``linked`` event on the source.  That
+    exact edge is evidence for the verdict, not an independent source advance;
+    every other link or material event still invalidates the generation.
+    """
+    rows = conn.execute(
+        "SELECT id, kind, payload FROM task_events WHERE task_id = ? AND id > ? "
         "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', "
-        "'heartbeat', 'claim_extended') ORDER BY id ASC LIMIT 1",
+        "'heartbeat', 'claim_extended') ORDER BY id ASC",
         (source_task_id, source_event_id),
-    ).fetchone()
+    ).fetchall()
+    for row in rows:
+        if row["kind"] == "linked" and allowed_link_parent_id:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if (
+                isinstance(payload, dict)
+                and payload.get("parent") == allowed_link_parent_id
+                and payload.get("child") == source_task_id
+            ):
+                continue
+        return row
+    return None
 
 
 def _required_reconciliation_text(
@@ -3941,14 +3963,6 @@ def _validate_reconciliation_verdict(
     ).fetchone()
     if source_event is None or source_event["kind"] not in RECONCILIATION_EVENT_KINDS:
         raise ValueError("reconciliation.source_event_id is not a reconciliation occurrence")
-    newer_source_event = _newer_reconciliation_source_event(
-        conn, source_id, source_event_id,
-    )
-    if newer_source_event is not None:
-        raise ValueError(
-            "reconciliation source advanced after source event "
-            f"{source_event_id} via {newer_source_event['kind']}:{newer_source_event['id']}"
-        )
 
     verdict: dict[str, Any] = {
         "outcome": outcome,
@@ -4000,6 +4014,22 @@ def _validate_reconciliation_verdict(
             _required_reconciliation_text(reconciliation, "error"),
             limit=2000,
         )
+
+    allowed_link_parent_id = (
+        str(verdict.get("continuation_task_id") or verdict.get("dependency_task_id") or "")
+        or None
+    )
+    newer_source_event = _newer_reconciliation_source_event(
+        conn,
+        source_id,
+        source_event_id,
+        allowed_link_parent_id=allowed_link_parent_id,
+    )
+    if newer_source_event is not None:
+        raise ValueError(
+            "reconciliation source advanced after source event "
+            f"{source_event_id} via {newer_source_event['kind']}:{newer_source_event['id']}"
+        )
     return verdict
 
 
@@ -4036,7 +4066,17 @@ def _apply_reconciliation_completion(
         stale_reason = f"newer source occurrence {latest_event_id} superseded {source_event_id}"
     else:
         newer_source_event = _newer_reconciliation_source_event(
-            conn, source_id, source_event_id,
+            conn,
+            source_id,
+            source_event_id,
+            allowed_link_parent_id=(
+                str(
+                    verdict.get("continuation_task_id")
+                    or verdict.get("dependency_task_id")
+                    or ""
+                )
+                or None
+            ),
         )
         if newer_source_event is not None:
             stale_reason = (
@@ -5296,7 +5336,10 @@ def claim_task(
         ).fetchone()
         candidate_key = candidate["idempotency_key"] if candidate else None
         if (candidate_key or "").startswith(RECONCILIATION_IDEMPOTENCY_PREFIX):
-            max_active = int(_blocker_reconciler_config()["max_active"])
+            reconciler_config = _blocker_reconciler_config()
+            if not reconciler_config["enabled"]:
+                return None
+            max_active = int(reconciler_config["max_active"])
             active = conn.execute(
                 "SELECT COUNT(*) AS n FROM tasks WHERE status = 'running' "
                 "AND idempotency_key LIKE ?",
