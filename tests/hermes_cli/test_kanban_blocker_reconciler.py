@@ -281,6 +281,28 @@ def test_reconciliation_claims_respect_configured_active_cap(
         assert queued.status == "ready"
 
 
+def test_disabling_reconciler_stops_queued_recovery_claims(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="iteration budget", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+
+        from hermes_cli import config as config_module
+
+        monkeypatch.setattr(
+            config_module,
+            "load_config",
+            lambda: {"kanban": {"blocker_reconciler": {"enabled": False}}},
+        )
+        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is None
+        queued = kb.get_task(conn, recovery.id)
+        assert queued is not None
+        assert queued.status == "ready"
+
+
 def test_connection_path_wins_over_mismatched_board_environment(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -637,6 +659,53 @@ def test_task_outcomes_require_linked_parent_lineage(
                     }
                 },
             )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "id_field"),
+    (
+        ("continuation_created", "continuation_task_id"),
+        ("dependency_wait", "dependency_task_id"),
+    ),
+)
+def test_task_outcomes_accept_link_created_by_supported_api(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    id_field: str,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        parent_id = kb.create_task(conn, title="recovery parent", assignee="code-crab")
+        kb.link_tasks(conn, parent_id, source_id)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="linked recovery route created",
+            metadata={
+                "reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": outcome,
+                    id_field: parent_id,
+                }
+            },
+            expected_run_id=claimed.current_run_id,
+        )
+        emitted = [
+            event.payload or {}
+            for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert emitted[-1]["outcome"] == outcome
+        assert emitted[-1][id_field] == parent_id
 
 
 def test_backoff_outcome_rejects_non_future_deadline(

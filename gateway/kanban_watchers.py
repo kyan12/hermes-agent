@@ -45,7 +45,12 @@ def should_notify_kanban_event(
     user. Ordinary completion/review/status notifications are unaffected.
     """
     if not reconciler_enabled:
-        return kind != "reconciliation_outcome"
+        if kind != "reconciliation_outcome":
+            return True
+        # A recovery already running when the kill switch is flipped may still
+        # finish. Preserve its affirmed human gate so disabling automation can
+        # never strand the source after its raw blocker notification was hidden.
+        return bool(payload and payload.get("outcome") == "genuine_human_gate")
     if kind in _RECOVERY_TRIGGER_KINDS:
         return False
     if kind == "reconciliation_outcome":
