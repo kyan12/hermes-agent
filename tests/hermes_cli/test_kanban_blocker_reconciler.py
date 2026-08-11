@@ -350,6 +350,55 @@ def test_reconciliation_completion_requires_valid_verdict(
         assert current.status == "running"
 
 
+@pytest.mark.parametrize("invalid_event_id", [True, 1.0, "1"])
+def test_reconciliation_verdict_rejects_coerced_event_ids(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_event_id: object,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is not None
+        with pytest.raises(ValueError, match="must be an integer"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="coerced lineage",
+                metadata={"reconciliation": {
+                    "outcome": "cleared/resumed",
+                    "source_task_id": source_id,
+                    "source_event_id": invalid_event_id,
+                }},
+            )
+
+
+def test_reconciliation_verdict_rejects_cross_outcome_fields(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        with pytest.raises(ValueError, match="unexpected fields"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="mixed schema",
+                metadata={"reconciliation": {
+                    "outcome": "cleared/resumed",
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "human_action": "not valid for this outcome",
+                }},
+            )
+
+
 def test_stale_reconciliation_cannot_emit_human_gate_after_source_done(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -444,6 +493,50 @@ def test_terminal_reconciliation_failure_resumes_source_automatically(
             e.kind == "reconciliation_outcome" and (e.payload or {}).get("outcome") == "reconciliation_failed"
             for e in kb.list_events(conn, source_id)
         )
+
+
+def test_repeated_reconciliation_failures_escalate_once_instead_of_looping(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        for attempt in range(1, kb.RECONCILIATION_SOURCE_FAILURE_LIMIT + 1):
+            source = kb.get_task(conn, source_id)
+            assert source is not None
+            assert source.status == ("running" if attempt == 1 else "ready")
+            assert kb.block_task(conn, source_id, reason=f"failure {attempt}", kind="transient")
+            recovery = next(
+                task for task in _reconciliation_tasks(conn) if task.status == "ready"
+            )
+            claimed = kb.claim_task(conn, recovery.id, claimer=f"reconciler-{attempt}")
+            assert claimed is not None
+            assert kb.block_task(
+                conn,
+                recovery.id,
+                reason=f"reconciler failure {attempt}",
+                kind="transient",
+                expected_run_id=claimed.current_run_id,
+            )
+            source = kb.get_task(conn, source_id)
+            assert source is not None
+            expected = (
+                "triage"
+                if attempt == kb.RECONCILIATION_SOURCE_FAILURE_LIMIT
+                else "ready"
+            )
+            assert source.status == expected
+
+        outcomes = [
+            event.payload or {} for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert [payload.get("outcome") for payload in outcomes] == [
+            "reconciliation_failed",
+            "reconciliation_failed",
+            "genuine_human_gate",
+        ]
+        assert outcomes[-1].get("failure_count") == kb.RECONCILIATION_SOURCE_FAILURE_LIMIT
 
 
 def test_outcome_specific_metadata_is_validated(
