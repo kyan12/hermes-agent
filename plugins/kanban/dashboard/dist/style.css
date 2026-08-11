@@ -1591,3 +1591,21 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* ---- Blocker reconciliation state ------------------------------------ */
+.hermes-kanban-attention-badge {
+  font-size: 0.62rem;
+  letter-spacing: 0.015em;
+}
+
+.hermes-kanban-attention-badge--human {
+  color: var(--color-destructive, #d14a4a);
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 60%, transparent);
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 10%, var(--color-card));
+}
+
+.hermes-kanban-attention-badge--automation {
+  color: #2f7dd1;
+  border-color: color-mix(in srgb, #2f7dd1 55%, transparent);
+  background: color-mix(in srgb, #2f7dd1 10%, var(--color-card));
+}

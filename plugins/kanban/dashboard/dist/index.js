@@ -2849,6 +2849,17 @@
               ? h(Badge, { className: "hermes-kanban-priority",
                            title: `Priority ${t.priority}. Higher-priority tasks are claimed first by the dispatcher.` }, `P${t.priority}`)
               : null,
+            t.attention_class === "human_input"
+              ? h(Badge, {
+                  className: "hermes-kanban-attention-badge hermes-kanban-attention-badge--human",
+                  title: "Automation recovery verified a genuine human-only gate.",
+                }, "Needs Human Input")
+              : t.attention_class === "automation_recovery"
+                ? h(Badge, {
+                    className: "hermes-kanban-attention-badge hermes-kanban-attention-badge--automation",
+                    title: "A reconciliation agent is diagnosing or continuing this task.",
+                  }, "Automation Recovery")
+                : null,
             t.tenant
               ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
                            title: `Tenant: ${t.tenant}. Free-form tag for grouping tasks (customer, project, team).` }, t.tenant)

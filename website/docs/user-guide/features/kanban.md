@@ -612,6 +612,25 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `blocker_reconciler.enabled` | `false` | Opt in to immediate, event-driven recovery for blocked/crashed/timed-out/gave-up/protocol/quota/routing occurrences. When enabled, raw blocker events stay silent and are labeled **Automation Recovery** until a reconciliation outcome verifies one genuine human-only gate. |
+| `blocker_reconciler.profile` | `default` | Profile assigned to reconciliation tasks. The task envelope carries board/task/event lineage, relationship/principal/legal-scope context, workspace/branch, sanitized comments, and prior runs. |
+| `blocker_reconciler.max_active` | `2` | Maximum reconciliation tasks allowed to run concurrently on one board. Additional idempotent tasks stay ready; repeated occurrences for one source task coalesce into its active reconciliation. |
+
+### Automatic blocker reconciliation
+
+Enable the reconciler when you want Hermes to diagnose operational false blockers before notifying you:
+
+```yaml
+kanban:
+  blocker_reconciler:
+    enabled: true
+    profile: default
+    max_active: 2
+```
+
+Every committed trigger event immediately creates an ordinary Kanban task with the deterministic key `kanban-reconcile:<board>:<source-task>:<event-id>`. There is no polling queue or sidecar state. The reconciliation worker must complete with one machine-readable outcome: `cleared/resumed`, `continuation_created`, `dependency_wait`, `backoff_scheduled`, `genuine_human_gate`, or `reconciliation_failed`. Only `genuine_human_gate` (with one exact requested action) wakes or notifies the origin user; all other outcomes remain automation-owned and auditable in `task_events`.
+
+Turn `enabled` back to `false` for the kill switch. Disabled mode preserves the legacy behavior: no reconciliation tasks are created, and blocker/failure notifications are delivered as before. To canary safely, use an isolated board, verify the source event and recovery task share the expected idempotency lineage, then affirm a synthetic human gate and confirm exactly one notification.
 
 And the two auxiliary LLM slots:
 

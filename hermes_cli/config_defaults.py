@@ -2396,6 +2396,16 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Event-driven blocker recovery. When enabled, every blocker/failure
+        # occurrence immediately creates an idempotent ordinary Kanban task for
+        # the configured profile. Raw blocked events stay in automation recovery;
+        # only a reconciler outcome may affirm a genuine human gate. Disabled by
+        # default so existing installs retain legacy notification/routing behavior.
+        "blocker_reconciler": {
+            "enabled": False,
+            "profile": "default",
+            "max_active": 2,
+        },
         # Orphaned-card reconciliation: each dispatcher tick, requeue
         # 'running' cards whose claim bookkeeping is broken (claim_lock or
         # claim_expires NULL with a dead/gone worker) — zombies invisible
