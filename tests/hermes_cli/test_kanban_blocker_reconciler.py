@@ -1209,6 +1209,23 @@ def test_malformed_present_comment_id_never_uses_legacy_fallback(
             )
 
 
+@pytest.mark.parametrize("malformed_run_id", ("2", True, 2.0))
+def test_append_event_rejects_malformed_run_id(
+    isolated_home: Path,
+    malformed_run_id: object,
+) -> None:
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="event type guard", assignee="default")
+        with pytest.raises(ValueError, match="event run_id must be an integer or None"):
+            kb._append_event(
+                conn,
+                task_id,
+                "commented",
+                {"author": "default", "len": 1},
+                run_id=malformed_run_id,  # type: ignore[arg-type]
+            )
+
+
 @pytest.mark.parametrize(
     ("origin_field", "malformed_value"),
     (

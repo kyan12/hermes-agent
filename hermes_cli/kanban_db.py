@@ -5378,6 +5378,8 @@ def _append_event(
     Reconciliation-trigger kinds are queued in the current outer write
     transaction and drained immediately after COMMIT by :func:`write_txn`.
     """
+    if run_id is not None and type(run_id) is not int:
+        raise ValueError("event run_id must be an integer or None")
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     cur = conn.execute(
