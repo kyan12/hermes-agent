@@ -4169,10 +4169,13 @@ def _is_reconciliation_evidence_comment(
     if not isinstance(payload, dict):
         return False
 
+    comment_id_present = "comment_id" in payload
     comment_id = payload.get("comment_id")
     has_explicit_origin = "origin_task_id" in payload or "origin_run_id" in payload
     comment = None
-    if type(comment_id) is int:
+    if comment_id_present:
+        if type(comment_id) is not int:
+            return False
         comment = conn.execute(
             "SELECT id, author, body, created_at FROM task_comments "
             "WHERE id = ? AND task_id = ?",
