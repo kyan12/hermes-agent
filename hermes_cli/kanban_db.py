@@ -4209,6 +4209,8 @@ def _is_reconciliation_evidence_comment(
     origin_task_id = payload.get("origin_task_id")
     origin_run_id = payload.get("origin_run_id")
     if type(comment_id) is int:
+        if type(origin_task_id) is not str or type(origin_run_id) is not int:
+            return False
         recovery = get_task(conn, recovery_task_id)
         if (
             recovery is None
