@@ -1209,6 +1209,71 @@ def test_malformed_present_comment_id_never_uses_legacy_fallback(
             )
 
 
+@pytest.mark.parametrize(
+    ("origin_field", "malformed_value"),
+    (
+        ("origin_run_id", None),
+        ("origin_run_id", "2"),
+        ("origin_run_id", True),
+        ("origin_run_id", 2.0),
+        ("origin_task_id", None),
+        ("origin_task_id", 123),
+        ("origin_task_id", True),
+    ),
+)
+def test_malformed_explicit_origin_provenance_remains_material(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin_field: str,
+    malformed_value: object,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        comment_id = conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (
+                source_id,
+                "default",
+                f"Reconciliation evidence for source event {source_event_id}: malformed origin.",
+                int(kb.time.time()),
+            ),
+        ).lastrowid
+        payload = {
+            "author": "default",
+            "len": 0,
+            "comment_id": comment_id,
+            "origin_task_id": recovery.id,
+            "origin_run_id": claimed.current_run_id,
+        }
+        payload[origin_field] = malformed_value
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                source_id,
+                "commented",
+                payload,
+                run_id=claimed.current_run_id,
+            )
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject malformed origin",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
 @pytest.mark.parametrize("mismatch", ("wrong_run", "wrong_author", "ended_run"))
 def test_explicit_comment_provenance_must_match_active_recovery_run(
     isolated_home: Path,
