@@ -1164,6 +1164,51 @@ def test_ambiguous_legacy_comment_match_remains_material(
             )
 
 
+@pytest.mark.parametrize("malformed_comment_id", (None, "12", True, 1.5))
+def test_malformed_present_comment_id_never_uses_legacy_fallback(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    malformed_comment_id: object,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        body = f"Reconciliation evidence for source event {source_event_id}: malformed id."
+        now = int(kb.time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (source_id, "default", body, now),
+            )
+            kb._append_event(
+                conn,
+                source_id,
+                "commented",
+                {
+                    "author": "default",
+                    "len": len(body),
+                    "comment_id": malformed_comment_id,
+                },
+            )
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject malformed comment id",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
 @pytest.mark.parametrize("mismatch", ("wrong_run", "wrong_author", "ended_run"))
 def test_explicit_comment_provenance_must_match_active_recovery_run(
     isolated_home: Path,
