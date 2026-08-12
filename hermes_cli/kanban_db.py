@@ -3894,6 +3894,7 @@ def _newer_reconciliation_source_event(
     source_task_id: str,
     source_event_id: int,
     *,
+    recovery_task_id: str,
     allowed_link_parent_id: Optional[str] = None,
 ) -> Optional[sqlite3.Row]:
     """Return the first material source change after an assigned occurrence.
@@ -3904,25 +3905,124 @@ def _newer_reconciliation_source_event(
     every other link or material event still invalidates the generation.
     """
     rows = conn.execute(
-        "SELECT id, kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        "SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? AND id > ? "
         "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', "
         "'heartbeat', 'claim_extended') ORDER BY id ASC",
         (source_task_id, source_event_id),
     ).fetchall()
     for row in rows:
-        if row["kind"] == "linked" and allowed_link_parent_id:
+        if row["kind"] == "linked":
             try:
                 payload = json.loads(row["payload"] or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 payload = {}
-            if (
-                isinstance(payload, dict)
-                and payload.get("parent") == allowed_link_parent_id
-                and payload.get("child") == source_task_id
-            ):
-                continue
+            if isinstance(payload, dict) and payload.get("child") == source_task_id:
+                parent_id = payload.get("parent")
+                mirrored_recovery_parent = conn.execute(
+                    "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (parent_id, recovery_task_id),
+                ).fetchone()
+                if parent_id == allowed_link_parent_id or mirrored_recovery_parent is not None:
+                    continue
+        if row["kind"] == "commented" and _is_reconciliation_evidence_comment(
+            conn,
+            row,
+            source_task_id=source_task_id,
+            source_event_id=source_event_id,
+            recovery_task_id=recovery_task_id,
+        ):
+            continue
         return row
     return None
+
+
+def _is_reconciliation_evidence_comment(
+    conn: sqlite3.Connection,
+    event: sqlite3.Row,
+    *,
+    source_task_id: str,
+    source_event_id: int,
+    recovery_task_id: str,
+) -> bool:
+    """Recognize only comments auditable as recovery-worker evidence.
+
+    New tool writes carry exact task/run/comment provenance.  The bounded
+    legacy branch supports already-durable evidence from deployments that only
+    recorded author/length: it requires the assigned reconciler identity, a
+    comment created during the recovery task's lifetime, and reconciliation-
+    specific prose.  Ordinary operator comments remain material source changes.
+    """
+    try:
+        payload = json.loads(event["payload"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    comment_id = payload.get("comment_id")
+    comment = None
+    if type(comment_id) is int:
+        comment = conn.execute(
+            "SELECT id, author, body, created_at FROM task_comments "
+            "WHERE id = ? AND task_id = ?",
+            (comment_id, source_task_id),
+        ).fetchone()
+    if comment is None:
+        comment = conn.execute(
+            "SELECT id, author, body, created_at FROM task_comments "
+            "WHERE task_id = ? AND author = ? AND length(body) = ? AND created_at = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (
+                source_task_id,
+                payload.get("author"),
+                payload.get("len"),
+                event["created_at"],
+            ),
+        ).fetchone()
+    if comment is None:
+        return False
+
+    body = str(comment["body"] or "")
+    evidence_prefix = f"Reconciliation evidence for source event {source_event_id}:"
+    origin_task_id = payload.get("origin_task_id")
+    origin_run_id = payload.get("origin_run_id")
+    if origin_task_id == recovery_task_id and type(origin_run_id) is int:
+        run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?",
+            (origin_run_id, recovery_task_id),
+        ).fetchone()
+        return run is not None and body.startswith(evidence_prefix)
+
+    recovery = get_task(conn, recovery_task_id)
+    if recovery is None or comment["author"] != recovery.assignee:
+        return False
+    authored_run = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? AND profile = ? "
+        "AND started_at <= ? AND (ended_at IS NULL OR ended_at >= ?) LIMIT 1",
+        (
+            recovery_task_id,
+            comment["author"],
+            comment["created_at"],
+            comment["created_at"],
+        ),
+    ).fetchone()
+    if authored_run is None:
+        return False
+    if body.startswith(evidence_prefix):
+        return True
+    mirrored_parent_ids = {
+        str(parent["parent_id"])
+        for parent in conn.execute(
+            "SELECT source.parent_id FROM task_links AS source "
+            "JOIN task_links AS recovery ON recovery.parent_id = source.parent_id "
+            "WHERE source.child_id = ? AND recovery.child_id = ?",
+            (source_task_id, recovery_task_id),
+        ).fetchall()
+    }
+    return (
+        re.search(r"\breconcil", body, re.IGNORECASE) is not None
+        and any(parent_id in body for parent_id in mirrored_parent_ids)
+    )
 
 
 def _required_reconciliation_text(
@@ -4063,6 +4163,7 @@ def _validate_reconciliation_verdict(
         conn,
         source_id,
         source_event_id,
+        recovery_task_id=recovery_task_id,
         allowed_link_parent_id=allowed_link_parent_id,
     )
     if newer_source_event is not None:
@@ -4109,6 +4210,7 @@ def _apply_reconciliation_completion(
             conn,
             source_id,
             source_event_id,
+            recovery_task_id=recovery_task_id,
             allowed_link_parent_id=(
                 str(
                     verdict.get("continuation_task_id")
@@ -4683,7 +4785,13 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    origin_task_id: Optional[str] = None,
+    origin_run_id: Optional[int] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -4702,8 +4810,14 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        event_payload = {"author": author, "len": len(body), "comment_id": comment_id}
+        if origin_task_id:
+            event_payload["origin_task_id"] = origin_task_id
+        if origin_run_id is not None:
+            event_payload["origin_run_id"] = origin_run_id
+        _append_event(conn, task_id, "commented", event_payload, run_id=origin_run_id)
+        return comment_id
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
