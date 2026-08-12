@@ -62,10 +62,12 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
     return tid
 
 
@@ -367,6 +369,11 @@ def test_comment_happy_path(worker_env):
         # Author defaults to HERMES_PROFILE env we set in the fixture
         assert comments[0].author == "test-worker"
         assert comments[0].body == "hello thread"
+        event = [e for e in kb.list_events(conn, worker_env) if e.kind == "commented"][-1]
+        assert event.payload is not None
+        assert event.payload["comment_id"] == comments[0].id
+        assert event.payload["origin_task_id"] == worker_env
+        assert event.payload["origin_run_id"] == int(os.environ["HERMES_KANBAN_RUN_ID"])
     finally:
         conn.close()
 

@@ -880,6 +880,206 @@ def test_task_outcomes_accept_link_created_by_supported_api(
         assert emitted[-1][id_field] == parent_id
 
 
+def test_dependency_verdict_accepts_reconciler_evidence_comment_and_resumes_after_parent(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        parent_id = kb.create_task(conn, title="recovery parent", assignee="code-crab")
+        kb.link_tasks(conn, parent_id, source_id)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="reconciler",
+            body=f"Reconciliation evidence for source event {source_event_id}: waiting on {parent_id}.",
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="dependency evidence recorded",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "dependency_wait",
+                "dependency_task_id": parent_id,
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "todo"
+        assert kb.complete_task(conn, parent_id, summary="dependency finished")
+        kb.recompute_ready(conn)
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "ready"
+
+
+def test_legacy_reconciler_evidence_comment_is_tied_to_active_recovery_run(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: automation recovered.",
+        )
+
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="legacy evidence accepted",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+
+
+def test_legacy_reconciler_topology_comment_requires_mirrored_parent(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        parent_id = kb.create_task(conn, title="recovery route", assignee="code-crab")
+        kb.link_tasks(conn, parent_id, source_id)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        kb.link_tasks(conn, parent_id, recovery.id)
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconcile this source through canonical remediation {parent_id}; preserve its evidence.",
+        )
+        assert kb.complete_task(conn, parent_id, summary="canonical remediation finished")
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="legacy topology evidence accepted",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+
+
+def test_live_lineage_shape_accepts_mirrored_links_and_both_legacy_evidence_comments(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="workspace routing failure", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        canonical_id = kb.create_task(conn, title="canonical remediation", assignee="code-crab")
+        guard_fix_id = kb.create_task(conn, title="guard remediation", assignee="code-crab")
+        kb.link_tasks(conn, canonical_id, source_id)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        kb.link_tasks(conn, canonical_id, recovery.id)
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=(
+                f"Reconcile this card as superseded by canonical remediation {canonical_id}; "
+                "do not launch duplicate implementation."
+            ),
+        )
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=(
+                f"Reconciliation evidence for source event {source_event_id}: canonical "
+                f"remediation {canonical_id} covers the exact scope."
+            ),
+        )
+        kb.link_tasks(conn, guard_fix_id, source_id)
+        kb.link_tasks(conn, guard_fix_id, recovery.id)
+        assert kb.complete_task(conn, canonical_id, summary="canonical remediation finished")
+        assert kb.complete_task(conn, guard_fix_id, summary="guard remediation finished")
+
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="live lineage reconciled",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "ready"
+
+
+@pytest.mark.parametrize("advance", ("operator_comment", "status", "different_link"))
+def test_reconciliation_evidence_exemption_rejects_unrelated_advances(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    advance: str,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        parent_id = kb.create_task(conn, title="declared parent", assignee="code-crab")
+        kb.link_tasks(conn, parent_id, source_id)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        if advance == "operator_comment":
+            kb.add_comment(conn, source_id, author="operator", body="Change direction now.")
+        elif advance == "status":
+            with kb.write_txn(conn):
+                kb._append_event(conn, source_id, "status", {"status": "blocked"})
+        else:
+            other_parent_id = kb.create_task(conn, title="unrelated parent", assignee="operator")
+            kb.link_tasks(conn, other_parent_id, source_id)
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="stale verdict",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "dependency_wait",
+                    "dependency_task_id": parent_id,
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
 def test_backoff_outcome_rejects_non_future_deadline(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

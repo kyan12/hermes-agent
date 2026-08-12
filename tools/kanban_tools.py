@@ -1104,7 +1104,17 @@ def _handle_comment(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            origin_task_id = os.environ.get("HERMES_KANBAN_TASK") or None
+            cid = kb.add_comment(
+                conn,
+                tid,
+                author=author,
+                body=str(body),
+                origin_task_id=origin_task_id,
+                origin_run_id=(
+                    _worker_run_id(origin_task_id) if origin_task_id else None
+                ),
+            )
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()
