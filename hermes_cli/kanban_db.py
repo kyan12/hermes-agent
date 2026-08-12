@@ -3905,7 +3905,7 @@ def _newer_reconciliation_source_event(
     every other link or material event still invalidates the generation.
     """
     rows = conn.execute(
-        "SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? AND id > ? "
+        "SELECT id, kind, payload, created_at, run_id FROM task_events WHERE task_id = ? AND id > ? "
         "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', "
         "'heartbeat', 'claim_extended') ORDER BY id ASC",
         (source_task_id, source_event_id),
@@ -3960,6 +3960,7 @@ def _is_reconciliation_evidence_comment(
         return False
 
     comment_id = payload.get("comment_id")
+    has_explicit_origin = "origin_task_id" in payload or "origin_run_id" in payload
     comment = None
     if type(comment_id) is int:
         comment = conn.execute(
@@ -3967,46 +3968,64 @@ def _is_reconciliation_evidence_comment(
             "WHERE id = ? AND task_id = ?",
             (comment_id, source_task_id),
         ).fetchone()
-    if comment is None:
-        comment = conn.execute(
+        # Current-format rows never fall back to the compatibility heuristic.
+        # Missing or partial worker provenance is a material source advance.
+        if comment is None or not has_explicit_origin:
+            return False
+    else:
+        # Legacy rows predate durable comment ids and worker provenance.  Fail
+        # closed unless the old author/length/timestamp tuple identifies exactly
+        # one comment; same-second equal-length ambiguity stays material.
+        legacy_comments = conn.execute(
             "SELECT id, author, body, created_at FROM task_comments "
             "WHERE task_id = ? AND author = ? AND length(body) = ? AND created_at = ? "
-            "ORDER BY id DESC LIMIT 1",
+            "ORDER BY id ASC",
             (
                 source_task_id,
                 payload.get("author"),
                 payload.get("len"),
                 event["created_at"],
             ),
-        ).fetchone()
-    if comment is None:
-        return False
+        ).fetchall()
+        if has_explicit_origin or len(legacy_comments) != 1:
+            return False
+        comment = legacy_comments[0]
 
     body = str(comment["body"] or "")
     evidence_prefix = f"Reconciliation evidence for source event {source_event_id}:"
     origin_task_id = payload.get("origin_task_id")
     origin_run_id = payload.get("origin_run_id")
-    if origin_task_id == recovery_task_id and type(origin_run_id) is int:
+    if type(comment_id) is int:
+        recovery = get_task(conn, recovery_task_id)
+        if (
+            recovery is None
+            or recovery.current_run_id != origin_run_id
+            or origin_task_id != recovery_task_id
+            or event["run_id"] != origin_run_id
+        ):
+            return False
         run = conn.execute(
-            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?",
+            "SELECT profile, status, started_at, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
             (origin_run_id, recovery_task_id),
         ).fetchone()
-        return run is not None and body.startswith(evidence_prefix)
+        return bool(
+            run is not None
+            and run["profile"] == comment["author"]
+            and run["status"] == "running"
+            and run["ended_at"] is None
+            and int(run["started_at"]) <= int(comment["created_at"])
+            and body.startswith(evidence_prefix)
+        )
 
+    # Bounded compatibility for already-durable pre-provenance events.  The
+    # event must be uniquely attributable to the recovery assignee, postdate
+    # recovery creation, and either name the exact source occurrence or a parent
+    # mirrored onto the recovery card.  New writes cannot enter this branch.
     recovery = get_task(conn, recovery_task_id)
     if recovery is None or comment["author"] != recovery.assignee:
         return False
-    authored_run = conn.execute(
-        "SELECT 1 FROM task_runs WHERE task_id = ? AND profile = ? "
-        "AND started_at <= ? AND (ended_at IS NULL OR ended_at >= ?) LIMIT 1",
-        (
-            recovery_task_id,
-            comment["author"],
-            comment["created_at"],
-            comment["created_at"],
-        ),
-    ).fetchone()
-    if authored_run is None:
+    if int(comment["created_at"]) < int(recovery.created_at):
         return False
     if body.startswith(evidence_prefix):
         return True

@@ -53,6 +53,19 @@ def _reconciliation_tasks(conn) -> list[kb.Task]:
     ]
 
 
+def _add_legacy_comment(conn, task_id: str, *, author: str, body: str) -> None:
+    """Insert the pre-provenance comment/event shape used by live old rows."""
+    now = int(kb.time.time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, author, body, now),
+        )
+        kb._append_event(
+            conn, task_id, "commented", {"author": author, "len": len(body)},
+        )
+
+
 def test_iteration_budget_block_enqueues_one_reconciliation_without_human_gate(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -896,7 +909,7 @@ def test_dependency_verdict_accepts_reconciler_evidence_comment_and_resumes_afte
         kb.add_comment(
             conn,
             source_id,
-            author="reconciler",
+            author="default",
             body=f"Reconciliation evidence for source event {source_event_id}: waiting on {parent_id}.",
             origin_task_id=recovery.id,
             origin_run_id=claimed.current_run_id,
@@ -933,7 +946,7 @@ def test_legacy_reconciler_evidence_comment_is_tied_to_active_recovery_run(
         claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
         assert claimed is not None
         source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
-        kb.add_comment(
+        _add_legacy_comment(
             conn,
             source_id,
             author="default",
@@ -967,7 +980,7 @@ def test_legacy_reconciler_topology_comment_requires_mirrored_parent(
         assert claimed is not None
         kb.link_tasks(conn, parent_id, recovery.id)
         source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
-        kb.add_comment(
+        _add_legacy_comment(
             conn,
             source_id,
             author="default",
@@ -1002,7 +1015,7 @@ def test_live_lineage_shape_accepts_mirrored_links_and_both_legacy_evidence_comm
         assert claimed is not None
         kb.link_tasks(conn, canonical_id, recovery.id)
         source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
-        kb.add_comment(
+        _add_legacy_comment(
             conn,
             source_id,
             author="default",
@@ -1011,7 +1024,7 @@ def test_live_lineage_shape_accepts_mirrored_links_and_both_legacy_evidence_comm
                 "do not launch duplicate implementation."
             ),
         )
-        kb.add_comment(
+        _add_legacy_comment(
             conn,
             source_id,
             author="default",
@@ -1075,6 +1088,127 @@ def test_reconciliation_evidence_exemption_rejects_unrelated_advances(
                     "source_event_id": source_event_id,
                     "outcome": "dependency_wait",
                     "dependency_task_id": parent_id,
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
+def test_current_comment_without_origin_provenance_remains_material(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: forged externally.",
+        )
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
+def test_ambiguous_legacy_comment_match_remains_material(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        evidence = f"Reconciliation evidence for source event {source_event_id}: valid."
+        operator = "X" * len(evidence)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (source_id, "default", evidence, 1_700_000_000),
+            )
+            kb._append_event(
+                conn, source_id, "commented", {"author": "default", "len": len(evidence)},
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (source_id, "default", operator, 1_700_000_000),
+            )
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject ambiguity",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
+@pytest.mark.parametrize("mismatch", ("wrong_run", "wrong_author", "ended_run"))
+def test_explicit_comment_provenance_must_match_active_recovery_run(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        origin_run_id = int(claimed.current_run_id)
+        author = "default"
+        if mismatch == "wrong_run":
+            origin_run_id = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at) VALUES (?, ?, ?, ?)",
+                (recovery.id, "default", "running", int(kb.time.time())),
+            ).lastrowid
+        elif mismatch == "wrong_author":
+            author = "operator"
+        else:
+            conn.execute(
+                "UPDATE task_runs SET ended_at = ? WHERE id = ?",
+                (int(kb.time.time()) - 1, origin_run_id),
+            )
+        kb.add_comment(
+            conn,
+            source_id,
+            author=author,
+            body=f"Reconciliation evidence for source event {source_event_id}: invalid provenance.",
+            origin_task_id=recovery.id,
+            origin_run_id=int(origin_run_id),
+        )
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject provenance mismatch",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
                 }},
                 expected_run_id=claimed.current_run_id,
             )
