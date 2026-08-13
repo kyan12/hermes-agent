@@ -81,7 +81,7 @@ def _activate_root_inline(
     summary: str,
     metadata: dict[str, Any],
 ) -> bool:
-    """Inline blocked→done CAS flip + event insert for the swarm root.
+    """Inline ready→done CAS flip + event insert for the swarm root.
 
     Runs INSIDE create_swarm's outer write_txn, so it must not call
     ``kb.complete_task`` — that helper opens its own transaction and fires
@@ -102,7 +102,7 @@ def _activate_root_inline(
                claim_expires= NULL,
                worker_pid   = NULL
          WHERE id = ?
-           AND status = 'blocked'
+           AND status = 'ready'
         """,
         (now, root_id),
     )
@@ -165,7 +165,7 @@ def create_swarm(
             idempotency_key=idempotency_key,
         )
         root = kb.get_task(conn, created.root_id)
-        if root is not None and root.status == "blocked":
+        if root is not None and root.status == "ready":
             if not _activate_root_inline(
                 conn,
                 created.root_id,
@@ -244,7 +244,7 @@ def _create_swarm_uncommitted(
         tenant=tenant,
         priority=priority,
         idempotency_key=idempotency_key,
-        initial_status="blocked",
+        initial_status="running",
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
     )

@@ -8,6 +8,7 @@ from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
+    tool_result_requests_terminal_transition,
 )
 
 
@@ -72,6 +73,15 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_terminal_transition_signal_requires_successful_result():
+    assert tool_result_requests_terminal_transition(
+        '{"ok": true, "terminal_transition": true}'
+    ) is True
+    assert tool_result_requests_terminal_transition(
+        '{"error": "failed", "terminal_transition": true}'
+    ) is False
 
 
 

@@ -50,6 +50,22 @@ def _make_running_again(conn, tid):
     assert kb.claim_task(conn, tid, claimer="worker") is not None
 
 
+@pytest.mark.parametrize("kind", [None, "needs_input", "capability", "transient"])
+def test_raw_worker_blocks_enter_machine_owned_recovery(
+    kanban_home: Path, kind: str | None,
+) -> None:
+    """Raw worker assertions are occurrences, never affirmed human gates."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+
+        assert kb.block_task(conn, tid, reason="worker cannot continue", kind=kind)
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "automation_recovery"
+        assert kb.attention_class(conn, tid, reconciler_enabled=False) == "automation_recovery"
+        assert any(event.kind == "recovery_occurrence" for event in kb.list_events(conn, tid))
+
+
 # ---------------------------------------------------------------------------
 # Loop breaker
 # ---------------------------------------------------------------------------

@@ -13,11 +13,14 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete", "kanban_block", "kanban_request_review", "kanban_request_changes",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -66,6 +69,19 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def tool_result_requests_terminal_transition(result: Any) -> bool:
+    """Return whether a successful tool result asks the worker loop to exit."""
+    try:
+        payload = json.loads(result) if isinstance(result, str) else result
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("ok") is True
+        and payload.get("terminal_transition") is True
+    )
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -105,4 +121,5 @@ __all__ = [
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
+    "tool_result_requests_terminal_transition",
 ]

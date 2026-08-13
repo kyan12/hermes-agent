@@ -429,7 +429,7 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
 
         assert kb.heartbeat_worker(conn, tid, note="current", expected_run_id=run2.id)
         assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id)
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).status == "automation_recovery"
     finally:
         conn.close()
 
@@ -1359,7 +1359,7 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         # Third consecutive violation: streak hits the bound — blocked.
         _drive_protocol_violation(conn, tid, 991003)
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "automation_recovery"
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
         assert len(gave_up) == 1
         assert (gave_up[0].payload or {}).get("protocol_violations") == \

@@ -628,15 +628,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_block.add_argument("--ids", nargs="+", default=None,
                          help="Additional task ids to block with the same reason (bulk mode)")
     p_block.add_argument(
-        "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
+        "--kind", required=True, choices=sorted(kb.VALID_BLOCK_KINDS),
         help=(
             "Typed block reason. 'dependency' waits in todo (auto-promoted "
-            "when parents finish, no human); 'needs_input'/'capability' go to "
-            "blocked for a human; 'transient' marks a maybe-flaky failure. "
+            "when parents finish, no human); all other kinds enter machine-owned "
+            "automation recovery for verification. "
             "Repeated same-kind re-blocks after unblock route the task to "
-            "triage to break unblock loops. Omit for a generic block."
+            "automation recovery to break unblock loops."
         ),
     )
+    p_block.add_argument("--attention-owner", default=None)
+    p_block.add_argument("--human-action", default=None)
+    p_block.add_argument("--why-automation-cannot-perform", default=None)
+    p_block.add_argument("--current-evidence", default=None)
 
     p_schedule = sub.add_parser(
         "schedule", help="Park work under an explicit durable hold/wake contract"
@@ -2365,6 +2369,22 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
+                gate_values = (
+                    getattr(args, "attention_owner", None),
+                    getattr(args, "human_action", None),
+                    getattr(args, "why_automation_cannot_perform", None),
+                    getattr(args, "current_evidence", None),
+                )
+                if any(value is not None for value in gate_values):
+                    if not all(str(value or "").strip() for value in gate_values):
+                        raise ValueError("all four human gate flags are required together")
+                    kb.affirm_human_gate(
+                        conn, tid, attention_owner=gate_values[0],
+                        human_action=gate_values[1],
+                        why_automation_cannot_perform=gate_values[2],
+                        current_evidence=gate_values[3],
+                        affirmed_by=f"operator:{author}",
+                    )
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)

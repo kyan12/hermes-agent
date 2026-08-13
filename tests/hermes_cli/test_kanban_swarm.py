@@ -44,6 +44,8 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
         assert set(kb.parent_ids(conn, created.verifier_id)) == set(created.worker_ids)
         assert kb.parent_ids(conn, created.synthesizer_id) == [created.verifier_id]
         assert all(created.root_id in (task.body or "") for task in workers)
+        created_events = [e for e in kb.list_events(conn, created.root_id) if e.kind == "created"]
+        assert created_events[-1].payload.get("status") != "blocked"
     finally:
         conn.close()
 
