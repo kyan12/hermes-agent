@@ -101,7 +101,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
-VALID_SCHEDULE_KINDS = {"dependency", "timed", "external", "physical", "completed"}
+VALID_SCHEDULE_KINDS = {"dependency", "timed", "external", "physical"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -4431,7 +4431,7 @@ def reconcile_stale_reconciliation_wrappers(conn: sqlite3.Connection) -> list[st
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, idempotency_key FROM tasks WHERE idempotency_key LIKE ? "
-            "AND status IN ('todo','ready','running','blocked','triage','review','scheduled')",
+            "AND status IN ('todo','ready','blocked','triage','scheduled')",
             (RECONCILIATION_IDEMPOTENCY_PREFIX + "%",),
         ).fetchall()
         for row in rows:
@@ -4445,11 +4445,14 @@ def reconcile_stale_reconciliation_wrappers(conn: sqlite3.Connection) -> list[st
                 "WHERE l.child_id=? AND t.status IN ('ready','running','review','done') "
                 "ORDER BY t.created_at DESC LIMIT 1", (source.id,),
             ).fetchone()
+            _end_run(
+                conn, recovery.id,
+                outcome="reconciliation_coalesced", status="archived",
+            )
             conn.execute(
                 "UPDATE tasks SET status='archived', claim_lock=NULL, claim_expires=NULL, "
                 "worker_pid=NULL, current_run_id=NULL WHERE id=?", (recovery.id,),
             )
-            _end_run(conn, recovery.id, outcome="reconciliation_coalesced", status="archived")
             payload = {
                 "source_task_id": source.id, "source_event_id": source_event_id,
                 "source_status": source.status,
@@ -8835,8 +8838,8 @@ def schedule_task(
 
     ``timed`` requires ``wake_at``. ``dependency`` requires an existing parent
     edge and wakes after all parents become terminal. ``external``/``physical``
-    require both a durable cron ``wake_job_id`` and a bounded ``checkpoint_at``.
-    ``completed`` is compatibility-only and is immediately archived.
+    require both a durable enabled cron ``wake_job_id`` and a bounded
+    ``checkpoint_at``.
     """
     kind = str(schedule_kind or "").strip().lower()
     if kind not in VALID_SCHEDULE_KINDS:
@@ -8859,10 +8862,17 @@ def schedule_task(
             raise ValueError(f"{kind} schedules require a positive checkpoint_at")
         wake_job_id = str(wake_job_id).strip()
         checkpoint_at = int(checkpoint_at)
+        try:
+            from cron.jobs import get_job
+            wake_job = get_job(wake_job_id)
+        except Exception as exc:
+            raise ValueError("could not verify wake_job_id") from exc
+        if not wake_job or not wake_job.get("enabled", True):
+            raise ValueError("wake_job_id must identify an enabled durable cron job")
     elif wake_job_id is not None or checkpoint_at is not None:
         raise ValueError("wake_job_id/checkpoint_at are only valid for external/physical schedules")
     now = int(time.time())
-    target_status = "archived" if kind == "completed" else "scheduled"
+    target_status = "scheduled"
     with write_txn(conn):
         params: list[Any] = [
             target_status, now, wake_at, kind, wake_job_id, checkpoint_at, task_id,
@@ -8889,8 +8899,6 @@ def schedule_task(
             "wake_job_id": wake_job_id, "checkpoint_at": checkpoint_at,
         }
         _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
-        if kind == "completed":
-            _append_event(conn, task_id, "schedule_coalesced", {"reason": "completed"})
         return True
 
 
@@ -8948,7 +8956,7 @@ def audit_scheduled_tasks(
     current = int(time.time()) if now is None else int(now)
     counts = {name: 0 for name in (
         "timed_due", "timed_future", "dependency_ready", "dependency_wait",
-        "external", "physical", "legacy", "completed",
+        "external", "physical", "legacy",
     )}
     items: list[dict[str, Any]] = []
     repaired: list[str] = []
@@ -8964,17 +8972,13 @@ def audit_scheduled_tasks(
                 category = "timed_due" if row["wake_at"] is not None and int(row["wake_at"]) <= current else "timed_future"
             elif kind == "dependency":
                 category = "dependency_ready" if _parents_satisfied(conn, row["id"]) else "dependency_wait"
-            elif kind in {"external", "physical", "completed"}:
+            elif kind in {"external", "physical"}:
                 category = kind
             else:
                 category = "legacy"
             counts[category] += 1
-            if repair and category in {"timed_due", "dependency_ready", "completed"}:
-                if category == "completed":
-                    conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ? AND status = 'scheduled'", (row["id"],))
-                    _append_event(conn, row["id"], "schedule_coalesced", {"reason": "completed"})
-                    repaired.append(row["id"])
-                elif _wake_scheduled_task_in_txn(conn, row["id"], now=current, source="schedule_audit"):
+            if repair and category in {"timed_due", "dependency_ready"}:
+                if _wake_scheduled_task_in_txn(conn, row["id"], now=current, source="schedule_audit"):
                     repaired.append(row["id"])
             items.append({**dict(row), "category": category, "repaired": row["id"] in repaired})
     return {"now": current, "counts": counts, "repaired": repaired, "tasks": items}

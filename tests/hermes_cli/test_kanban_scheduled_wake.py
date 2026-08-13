@@ -63,7 +63,8 @@ def test_ambiguous_and_incomplete_holds_are_rejected(kanban_home):
             kb.schedule_task(conn, task_id, schedule_kind="physical", wake_job_id="job_123")
 
 
-def test_external_hold_persists_wake_job_and_checkpoint(kanban_home):
+def test_external_hold_persists_wake_job_and_checkpoint(kanban_home, monkeypatch):
+    monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {"id": job_id, "enabled": True})
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="external", assignee="worker")
         assert kb.schedule_task(
@@ -77,12 +78,20 @@ def test_external_hold_persists_wake_job_and_checkpoint(kanban_home):
         )
 
 
-def test_completed_compatibility_hold_archives_immediately(kanban_home):
+def test_external_hold_rejects_missing_or_disabled_wake_job(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="external", assignee="worker")
+        monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: None)
+        with pytest.raises(ValueError, match="enabled durable cron job"):
+            kb.schedule_task(conn, task_id, schedule_kind="external",
+                             wake_job_id="missing", checkpoint_at=9_000_000)
+
+
+def test_completed_is_not_a_public_schedule_kind(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="stale wrapper", assignee="worker")
-        assert kb.schedule_task(conn, task_id, schedule_kind="completed")
-        assert kb.get_task(conn, task_id).status == "archived"
-        assert any(e.kind == "schedule_coalesced" for e in kb.list_events(conn, task_id))
+        with pytest.raises(ValueError, match="schedule_kind"):
+            kb.schedule_task(conn, task_id, schedule_kind="completed")
 
 
 def test_schedule_audit_never_infers_legacy_intent(kanban_home, monkeypatch):
