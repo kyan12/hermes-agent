@@ -379,13 +379,22 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 @router.get("/health/scheduled")
 def scheduled_health(
-    repair: bool = Query(False),
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        return kanban_db.audit_scheduled_tasks(conn, repair=repair)
+        return kanban_db.audit_scheduled_tasks(conn, repair=False)
+    finally:
+        conn.close()
+
+
+@router.post("/health/scheduled/repair")
+def repair_scheduled_health(board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return kanban_db.audit_scheduled_tasks(conn, repair=True)
     finally:
         conn.close()
 

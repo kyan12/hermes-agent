@@ -1397,6 +1397,9 @@ def test_backoff_outcome_resumes_when_deadline_elapses(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable(monkeypatch)
+    monkeypatch.setattr(
+        "cron.jobs.get_job", lambda job_id: {"id": job_id, "enabled": True},
+    )
     with kb.connect_closing() as conn:
         source_id = _running(conn)
         assert kb.block_task(conn, source_id, reason="quota reset", kind="transient")

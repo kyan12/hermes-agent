@@ -647,7 +647,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help="Additional task ids to schedule with the same contract")
     p_schedule.add_argument(
         "--kind", required=True, choices=sorted(kb.VALID_SCHEDULE_KINDS),
-        help="dependency, timed, external, physical, or completed",
+        help="dependency, timed, external, or physical",
     )
     p_schedule.add_argument("--wake-at", type=int, default=None,
                             help="Unix timestamp (required for timed)")

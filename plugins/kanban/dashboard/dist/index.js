@@ -87,13 +87,14 @@
   }
 
   // Board column display order; any backend status not listed here renders after these.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
@@ -104,6 +105,7 @@
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
+    scheduled: "Durable timed, dependency, external, or physical hold",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
@@ -156,6 +158,7 @@
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
+    scheduled: "hermes-kanban-dot-todo",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
@@ -193,6 +196,28 @@
       return null;
     }
     return Object.assign({}, patch, { result: summary, summary });
+  }
+
+  function withScheduleContract(patch) {
+    if (!patch || patch.status !== "scheduled") return patch;
+    const kind = (window.prompt(
+      "Schedule kind: dependency, timed, external, or physical", "timed",
+    ) || "").trim().toLowerCase();
+    if (!["dependency", "timed", "external", "physical"].includes(kind)) {
+      window.alert("A valid schedule kind is required.");
+      return null;
+    }
+    const next = Object.assign({}, patch, { schedule_kind: kind });
+    if (kind === "timed") {
+      const wakeAt = Number(window.prompt("Wake at (Unix timestamp)", ""));
+      if (!Number.isInteger(wakeAt) || wakeAt <= 0) return null;
+      next.wake_at = wakeAt;
+    } else if (kind === "external" || kind === "physical") {
+      next.wake_job_id = (window.prompt("Existing enabled cron wake job id", "") || "").trim();
+      next.checkpoint_at = Number(window.prompt("Escalation checkpoint (Unix timestamp)", ""));
+      if (!next.wake_job_id || !Number.isInteger(next.checkpoint_at) || next.checkpoint_at <= 0) return null;
+    }
+    return next;
   }
 
   const API = "/api/plugins/kanban";
@@ -722,7 +747,9 @@
     const moveTask = useCallback(function (taskId, newStatus) {
       const confirmMsg = getDestructiveConfirm(t, newStatus);
       if (confirmMsg && !window.confirm(confirmMsg)) return;
-      const patch = withCompletionSummary({ status: newStatus }, 1, t);
+      const patch = withScheduleContract(
+        withCompletionSummary({ status: newStatus }, 1, t),
+      );
       if (!patch) return;
       setBoardData(function (b) {
         if (!b) return b;
@@ -759,7 +786,9 @@
       const confirmMsg = DESTRUCTIVE_TRANSITIONS[newStatus];
       if (confirmMsg && !window.confirm(confirmMsg)) return;
       if (selectedIds.size === 0) return;
-      const patch = withCompletionSummary({ status: newStatus }, selectedIds.size);
+      const patch = withScheduleContract(
+        withCompletionSummary({ status: newStatus }, selectedIds.size),
+      );
       if (!patch) return;
       const ids = Array.from(selectedIds);
       // Optimistic UI: remove selected from all columns and prepend to target.
