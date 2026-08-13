@@ -759,7 +759,7 @@ def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagn
     step. This compatibility diagnostic is graph-aware but deliberately leaves
     both the dependency graph and the user's sticky block unchanged.
     """
-    if _task_field(task, "status") != "blocked":
+    if _task_field(task, "status") not in {"automation_recovery", "blocked"}:
         return []
 
     latest_block = None

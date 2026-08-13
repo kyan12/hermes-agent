@@ -100,8 +100,8 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "automation_recovery", "blocked", "review", "done", "archived"}
+VALID_INITIAL_STATUSES = {"running"}
 VALID_SCHEDULE_KINDS = {"dependency", "timed", "external", "physical"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -3866,7 +3866,10 @@ def _reconciliation_prompt(envelope: Mapping[str, Any]) -> str:
         '"source_event_id":<latest>,"resume_at":<future unix timestamp>}}\n'
         '{"reconciliation":{"outcome":"genuine_human_gate",'
         f'"source_task_id":"{lineage["source_task_id"]}",'
-        '"source_event_id":<latest>,"human_action":"one atomic action"}}\n'
+        '"source_event_id":<latest>,"attention_owner":"Kevin Yan",'
+        '"human_action":"one atomic action",'
+        '"why_automation_cannot_perform":"why no agent or automation can do it",'
+        '"current_evidence":"current evidence proving the gate still exists"}}\n'
         '{"reconciliation":{"outcome":"reconciliation_failed",'
         f'"source_task_id":"{lineage["source_task_id"]}",'
         '"source_event_id":<latest>,"error":"sanitized failure"}}.\n'
@@ -3954,7 +3957,7 @@ def _handle_terminal_reconciliation_failure(
         return None
     source_id, source_event_id = _reconciliation_source_from_key(recovery)
     source = get_task(conn, source_id) if source_id else None
-    if source is None or source.status not in {"blocked", "triage", "scheduled"}:
+    if source is None or source.status not in {"automation_recovery", "blocked", "triage", "scheduled"}:
         return recovery.id
     failure_count = _reconciliation_resumed_failure_count(conn, source.id) + 1
     exhausted = (
@@ -3964,7 +3967,7 @@ def _handle_terminal_reconciliation_failure(
         or failure_count >= RECONCILIATION_SOURCE_FAILURE_LIMIT
     )
     next_status = (
-        "triage"
+        "automation_recovery"
         if exhausted
         else ("ready" if _parents_satisfied(conn, source.id) else "todo")
     )
@@ -3972,7 +3975,7 @@ def _handle_terminal_reconciliation_failure(
         conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
             "worker_pid = NULL, block_kind = NULL WHERE id = ? "
-            "AND status IN ('blocked', 'triage', 'scheduled')",
+            "AND status IN ('automation_recovery', 'blocked', 'triage', 'scheduled')",
             (next_status, source.id),
         )
         _append_event(
@@ -3980,9 +3983,7 @@ def _handle_terminal_reconciliation_failure(
             source.id,
             "reconciliation_outcome",
             {
-                "outcome": (
-                    "genuine_human_gate" if exhausted else "reconciliation_failed"
-                ),
+                "outcome": "reconciliation_failed",
                 "source_event_id": source_event_id,
                 "reconciliation_task_id": recovery.id,
                 "recovery_failure_event_id": event.id,
@@ -3993,10 +3994,7 @@ def _handle_terminal_reconciliation_failure(
                 "fallback": (
                     "automation_exhausted" if exhausted else "source_resumed"
                 ),
-                "human_action": (
-                    "Inspect the blocker reconciler failures for this source task and resume it."
-                    if exhausted else None
-                ),
+                "human_action": None,
             },
             run_id=event.run_id,
         )
@@ -4163,7 +4161,7 @@ def _newer_reconciliation_source_event(
     """
     rows = conn.execute(
         "SELECT id, kind, payload, created_at, run_id FROM task_events WHERE task_id = ? AND id > ? "
-        "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', "
+        "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', 'recovery_occurrence', "
         "'heartbeat', 'claim_extended') ORDER BY id ASC",
         (source_task_id, source_event_id),
     ).fetchall()
@@ -4352,6 +4350,10 @@ def _validate_reconciliation_verdict(
     allowed_fields = {"outcome", "source_task_id", "source_event_id"}
     if outcome_field:
         allowed_fields.add(outcome_field)
+    if outcome == "genuine_human_gate":
+        allowed_fields.update({
+            "attention_owner", "why_automation_cannot_perform", "current_evidence",
+        })
     unexpected_fields = sorted(
         str(field) for field in reconciliation.keys() if field not in allowed_fields
     )
@@ -4426,9 +4428,19 @@ def _validate_reconciliation_verdict(
         verdict["resume_at"] = resume_at
     elif outcome == "genuine_human_gate":
         verdict["human_action"] = _redact_reconciliation_text(
-            _required_reconciliation_text(reconciliation, "human_action"),
-            limit=1000,
+            _required_reconciliation_text(reconciliation, "human_action"), limit=1000,
         )
+        owner = _required_reconciliation_text(reconciliation, "attention_owner")
+        if owner != "Kevin Yan":
+            raise ValueError("reconciliation.attention_owner must be exactly Kevin Yan")
+        verdict["attention_owner"] = owner
+        for field, limit in (
+            ("why_automation_cannot_perform", 2000),
+            ("current_evidence", 4000),
+        ):
+            verdict[field] = _redact_reconciliation_text(
+                _required_reconciliation_text(reconciliation, field), limit=limit,
+            )
     elif outcome == "reconciliation_failed":
         verdict["error"] = _redact_reconciliation_text(
             _required_reconciliation_text(reconciliation, "error"),
@@ -4530,7 +4542,7 @@ def _apply_reconciliation_completion(
         "done", "archived", "review", "running", "ready", "todo",
     }:
         stale_reason = f"source materially advanced to {source.status}"
-    elif stale_reason is None and outcome == "genuine_human_gate" and source.status not in {"blocked", "triage"}:
+    elif stale_reason is None and outcome == "genuine_human_gate" and source.status not in {"automation_recovery", "blocked", "triage"}:
         stale_reason = f"source is no longer awaiting human input ({source.status})"
     elif stale_reason is None and outcome in {"continuation_created", "dependency_wait"}:
         parent_field = (
@@ -4551,6 +4563,9 @@ def _apply_reconciliation_completion(
         "source_event_id": source_event_id,
         "reconciliation_task_id": recovery_task_id,
         "human_action": verdict.get("human_action"),
+        "attention_owner": verdict.get("attention_owner"),
+        "why_automation_cannot_perform": verdict.get("why_automation_cannot_perform"),
+        "current_evidence": verdict.get("current_evidence"),
         "continuation_task_id": verdict.get("continuation_task_id"),
     }
     for field in ("dependency_task_id", "resume_at", "error"):
@@ -4580,52 +4595,23 @@ def _apply_reconciliation_completion(
         and _reconciliation_generation_count(conn, source_id)
         >= RECONCILIATION_SOURCE_FAILURE_LIMIT - 1
     )
-    automation_outcomes = resumptive_outcomes | {"reconciliation_failed"}
-    if (
-        outcome in automation_outcomes
-        and (source.status == "triage" or generation_exhausted)
-    ):
-        payload.update(
-            {
-                "outcome": "genuine_human_gate",
-                "discarded_outcome": outcome,
-                "fallback": "automation_exhausted",
-                "human_action": (
-                    "Inspect the repeated blocker/recovery loop for this source task and resume it."
-                ),
-            }
-        )
-        conn.execute(
-            "UPDATE tasks SET status = 'triage', claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'triage', 'scheduled', 'todo', 'ready')",
-            (source_id,),
-        )
-        _append_event(conn, source_id, "reconciliation_outcome", payload)
-        return
+    if outcome in resumptive_outcomes and (source.status == "triage" or generation_exhausted):
+        payload.update({
+            "outcome": "reconciliation_failed",
+            "discarded_outcome": outcome,
+            "fallback": "automation_exhausted",
+            "error": "bounded automation recovery exhausted",
+        })
+        outcome = "reconciliation_failed"
 
     if outcome == "reconciliation_failed":
         failure_count = _reconciliation_resumed_failure_count(conn, source_id) + 1
         payload["failure_count"] = failure_count
-        if failure_count >= RECONCILIATION_SOURCE_FAILURE_LIMIT:
-            payload.update(
-                {
-                    "outcome": "genuine_human_gate",
-                    "fallback": "automation_exhausted",
-                    "human_action": (
-                        "Inspect the blocker reconciler failures for this source task and resume it."
-                    ),
-                }
+        if payload.get("fallback") != "automation_exhausted":
+            payload["fallback"] = (
+                "automation_exhausted" if failure_count >= RECONCILIATION_SOURCE_FAILURE_LIMIT
+                else "source_resumed"
             )
-            conn.execute(
-                "UPDATE tasks SET status = 'triage', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
-                "WHERE id = ? AND status IN ('blocked', 'triage', 'scheduled', 'todo', 'ready')",
-                (source_id,),
-            )
-            _append_event(conn, source_id, "reconciliation_outcome", payload)
-            return
-        payload["fallback"] = "source_resumed"
 
     if outcome in {
         "cleared/resumed",
@@ -4634,7 +4620,11 @@ def _apply_reconciliation_completion(
         "backoff_scheduled",
         "reconciliation_failed",
     }:
-        if outcome == "dependency_wait":
+        if payload.get("fallback") == "automation_exhausted" or (
+            source.block_recurrences >= BLOCK_RECURRENCE_LIMIT
+        ):
+            next_status = "automation_recovery"
+        elif outcome == "dependency_wait":
             next_status = "todo"
         elif outcome == "backoff_scheduled":
             next_status = "scheduled"
@@ -4648,10 +4638,30 @@ def _apply_reconciliation_completion(
             "scheduled_at = CASE WHEN ? IS NULL THEN scheduled_at ELSE ? END, "
             "wake_at = CASE WHEN ? IS NULL THEN wake_at ELSE ? END, "
             "schedule_kind = CASE WHEN ? IS NULL THEN schedule_kind ELSE 'timed' END "
-            "WHERE id = ? AND status IN ('blocked', 'triage', 'scheduled', 'todo', 'ready')",
+            "WHERE id = ? AND status IN ('automation_recovery', 'blocked', 'triage', 'scheduled', 'todo', 'ready')",
             (next_status, backoff_at, int(time.time()), backoff_at, backoff_at,
              backoff_at, source_id),
         )
+    elif outcome == "genuine_human_gate":
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=? AND status='automation_recovery'",
+            (source_id,),
+        )
+        if cur.rowcount == 1:
+            _append_event(
+                conn,
+                source_id,
+                "human_gate_affirmed",
+                {
+                    "attention_owner": payload["attention_owner"],
+                    "human_action": payload["human_action"],
+                    "why_automation_cannot_perform": payload["why_automation_cannot_perform"],
+                    "current_evidence": payload["current_evidence"],
+                    "affirmed_by": f"reconciler:{recovery_task_id}",
+                    "source_event_id": source_event_id,
+                },
+            )
     _append_event(conn, source_id, "reconciliation_outcome", payload)
 
 
@@ -4712,14 +4722,17 @@ def attention_class(
 ) -> Optional[str]:
     """Return ``human_input`` or ``automation_recovery`` for board surfaces."""
     task = get_task(conn, task_id)
-    if task is None or task.status not in {"blocked", "triage"}:
+    if task is None or task.status not in {"automation_recovery", "blocked", "triage"}:
         return None
+    if task.status == "automation_recovery":
+        return "automation_recovery"
     enabled = blocker_reconciler_enabled() if reconciler_enabled is None else reconciler_enabled
     if not enabled:
-        return "human_input"
+        return "automation_recovery"
     row = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'reconciliation_outcome' ORDER BY id DESC LIMIT 1",
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('human_gate_affirmed', 'reconciliation_outcome') "
+        "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if row and row["payload"]:
@@ -4727,14 +4740,57 @@ def attention_class(
             payload = json.loads(row["payload"])
         except (TypeError, json.JSONDecodeError):
             payload = {}
-        if payload.get("outcome") == "genuine_human_gate":
+        required = (
+            payload.get("attention_owner") == "Kevin Yan"
+            and all(str(payload.get(field) or "").strip() for field in (
+                "human_action", "why_automation_cannot_perform", "current_evidence",
+            ))
+        )
+        if required and (
+            row["kind"] == "human_gate_affirmed"
+            or payload.get("outcome") == "genuine_human_gate"
+        ):
             return "human_input"
     active_recovery = conn.execute(
         "SELECT 1 FROM tasks WHERE idempotency_key LIKE ? "
         "AND status IN ('todo', 'ready', 'running', 'review', 'scheduled') LIMIT 1",
         (f"{RECONCILIATION_IDEMPOTENCY_PREFIX}%:{task_id}:%",),
     ).fetchone()
-    return "automation_recovery" if active_recovery else "human_input"
+    return "automation_recovery" if active_recovery or task.status == "blocked" else None
+
+
+def affirm_human_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    attention_owner: str,
+    human_action: str,
+    why_automation_cannot_perform: str,
+    current_evidence: str,
+    affirmed_by: str,
+) -> bool:
+    """Operator-only boundary for converting recovery into a Kevin gate."""
+    if attention_owner != "Kevin Yan":
+        raise ValueError("attention_owner must be exactly Kevin Yan")
+    fields = {
+        "human_action": human_action,
+        "why_automation_cannot_perform": why_automation_cannot_perform,
+        "current_evidence": current_evidence,
+        "affirmed_by": affirmed_by,
+    }
+    if any(not str(value or "").strip() for value in fields.values()):
+        raise ValueError("all human gate fields are required")
+    payload = {"attention_owner": attention_owner, **{k: str(v).strip() for k, v in fields.items()}}
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=? AND status='automation_recovery'",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("human gates may only be affirmed from automation_recovery")
+        _append_event(conn, task_id, "human_gate_affirmed", payload)
+    return True
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -6716,7 +6772,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'automation_recovery', 'blocked', 'review')
                 """,
                 (result, now, task_id),
             )
@@ -6733,7 +6789,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'automation_recovery', 'blocked', 'review')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -7448,8 +7504,9 @@ def block_task(
       promotes it automatically once its parents finish. No human, no cron, no
       retry storm. This is Dale's "Type 2 — dependency blocked".
 
-    * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
-      "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
+    * ``needs_input`` / ``capability`` / ``transient`` / ``None`` are raw
+      worker occurrences. They land in machine-owned ``automation_recovery``
+      and can become visible ``blocked`` only through an affirmed gate. Each time such a task
       is re-blocked for the SAME kind after having been unblocked, the
       unblock-loop counter (``block_recurrences``) increments. When it reaches
       :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
@@ -7493,6 +7550,8 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            if not parent_ids(conn, task_id):
+                raise ValueError("dependency blocks require at least one parent")
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -7553,7 +7612,7 @@ def block_task(
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'triage',
+                   SET status        = 'automation_recovery',
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -7592,7 +7651,7 @@ def block_task(
                 cur = conn.execute(
                     """
                     UPDATE tasks
-                       SET status        = 'blocked',
+                       SET status        = 'automation_recovery',
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
@@ -7607,7 +7666,7 @@ def block_task(
                 cur = conn.execute(
                     """
                     UPDATE tasks
-                       SET status        = 'blocked',
+                       SET status        = 'automation_recovery',
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
@@ -7644,6 +7703,16 @@ def block_task(
                 },
                 run_id=run_id,
             )
+        _append_event(
+            conn, task_id, "recovery_occurrence",
+            {
+                "reason": reason,
+                "kind": kind,
+                "recurrences": recurrences,
+                "source_status": source_status,
+            },
+            run_id=run_id,
+        )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -8090,7 +8159,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if current and current["status"] == "blocked"
+            if current and current["status"] in {"automation_recovery", "blocked"}
             else "ready"
         )
         _reclaim_dangling_run(
@@ -8117,7 +8186,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "WHERE id = ? AND status IN ('automation_recovery', 'blocked', 'scheduled')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -9361,9 +9430,9 @@ def board_health(
     ]
     for row in conn.execute(
         "SELECT id, status, assignee FROM tasks "
-        "WHERE status IN ('blocked','triage','ready') ORDER BY created_at"
+        "WHERE status IN ('automation_recovery','blocked','triage','ready') ORDER BY created_at"
     ):
-        no_path = row["status"] in {"blocked", "triage"}
+        no_path = row["status"] in {"automation_recovery", "blocked", "triage"}
         if row["status"] == "ready":
             try:
                 from hermes_cli.profiles import profile_exists
@@ -10619,21 +10688,21 @@ def _record_task_failure(
     through here so the ``consecutive_failures`` counter and the
     auto-block threshold stay consistent.
 
-    Returns True when the task was auto-blocked (counter reached
+    Returns True when the task entered automation recovery (counter reached
     ``failure_limit``), False when it was just updated in place.
 
     Modes:
 
     * ``release_claim=True, end_run=True`` — spawn-failure path.
       Caller has a running task with an open run; this transitions
-      it back to its source phase (or ``blocked`` when the breaker trips),
+      it back to its source phase (or ``automation_recovery`` when the breaker trips),
       releases the claim, and closes the run with ``outcome=<outcome>``.
 
     * ``release_claim=False, end_run=False`` — timeout/crash path.
       Caller has ALREADY restored the task's source phase and closed the
       run with the appropriate outcome. This just increments the
       counter; if the breaker trips, the task is re-transitioned
-      into ``blocked`` and a ``gave_up`` event is emitted.
+      into ``automation_recovery`` and a ``gave_up`` event is emitted.
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -10688,7 +10757,7 @@ def _record_task_failure(
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "UPDATE tasks SET status = 'automation_recovery', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
@@ -10696,10 +10765,10 @@ def _record_task_failure(
                 )
             else:
                 # Timeout/crash path: source phase already restored with claim
-                # cleared; just flip to blocked + update
+                # cleared; just flip to machine-owned recovery + update
                 # counter fields.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
+                    "UPDATE tasks SET status = 'automation_recovery', "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'review', 'running')",
                     (failures, error[:500], task_id),

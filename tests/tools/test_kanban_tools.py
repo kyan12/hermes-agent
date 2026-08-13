@@ -219,13 +219,13 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({"reason": "need clarification", "kind": "needs_input"})
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, worker_env).status == "blocked"
+        assert kb.get_task(conn, worker_env).status == "automation_recovery"
     finally:
         conn.close()
 
@@ -269,7 +269,7 @@ def test_block_goal_mode_rejects_missing_kind(monkeypatch, tmp_path):
     out = kt._handle_block({"reason": "giving up"})
     d = json.loads(out)
     assert "error" in d
-    assert "goal_mode" in d["error"]
+    assert "kind is required" in d["error"]
 
     conn = kb.connect()
     try:
@@ -443,7 +443,7 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="blocked", assignee="worker")
-        kb.block_task(conn, tid, reason="waiting")
+        kb.block_task(conn, tid, reason="waiting", kind="needs_input")
     finally:
         conn.close()
 
@@ -676,7 +676,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         other = kb.create_task(conn, title="blocked sibling", assignee="peer")
-        kb.block_task(conn, other, reason="waiting")
+        kb.block_task(conn, other, reason="waiting", kind="needs_input")
     finally:
         conn.close()
 
@@ -690,7 +690,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
 
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, other).status == "blocked"
+        assert kb.get_task(conn, other).status == "automation_recovery"
     finally:
         conn.close()
 

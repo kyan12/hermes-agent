@@ -172,6 +172,9 @@ def test_explicit_needs_input_is_preflighted_and_only_affirmation_is_human_gate(
                     "source_task_id": source_id,
                     "source_event_id": source_event.id,
                     "human_action": "Approve the paid public deployment.",
+                    "attention_owner": "Kevin Yan",
+                    "why_automation_cannot_perform": "Only the owner can authorize payment.",
+                    "current_evidence": "The deployment is paid and public.",
                 }
             },
             expected_run_id=claimed.current_run_id,
@@ -185,7 +188,23 @@ def test_explicit_needs_input_is_preflighted_and_only_affirmation_is_human_gate(
             "source_event_id": source_event.id,
             "reconciliation_task_id": recovery.id,
             "human_action": "Approve the paid public deployment.",
+            "attention_owner": "Kevin Yan",
+            "why_automation_cannot_perform": "Only the owner can authorize payment.",
+            "current_evidence": "The deployment is paid and public.",
             "continuation_task_id": None,
+        }
+        human_gate_events = [
+            e for e in kb.list_events(conn, source_id)
+            if e.kind == "human_gate_affirmed"
+        ]
+        assert len(human_gate_events) == 1
+        assert human_gate_events[0].payload == {
+            "attention_owner": "Kevin Yan",
+            "human_action": "Approve the paid public deployment.",
+            "why_automation_cannot_perform": "Only the owner can authorize payment.",
+            "current_evidence": "The deployment is paid and public.",
+            "affirmed_by": f"reconciler:{recovery.id}",
+            "source_event_id": source_event.id,
         }
 
 
@@ -273,14 +292,14 @@ def test_quota_and_workspace_routing_are_automation_recovery() -> None:
     ) == "automation_recovery"
 
 
-def test_config_disabled_preserves_legacy_block_and_notification_behavior(
+def test_config_disabled_keeps_raw_block_machine_owned(
     isolated_home: Path,
 ) -> None:
     with kb.connect_closing() as conn:
         source_id = _running(conn)
         assert kb.block_task(conn, source_id, reason="legacy", kind=None)
         assert _reconciliation_tasks(conn) == []
-        assert kb.attention_class(conn, source_id, reconciler_enabled=False) == "human_input"
+        assert kb.attention_class(conn, source_id, reconciler_enabled=False) == "automation_recovery"
 
 
 def test_multiple_boards_keep_reconciliation_tasks_isolated(
@@ -512,6 +531,9 @@ def test_stale_reconciliation_cannot_emit_human_gate_after_source_done(
                         "source_event_id": source_event_id,
                         "outcome": "genuine_human_gate",
                         "human_action": "Choose one option",
+                        "attention_owner": "Kevin Yan",
+                        "why_automation_cannot_perform": "Only Kevin can choose.",
+                        "current_evidence": "A current choice is still required.",
                     }
                 },
             )
@@ -546,6 +568,9 @@ def test_stale_reconciliation_rejects_same_status_round_trip(
                     "source_task_id": source_id,
                     "source_event_id": source_event_id,
                     "human_action": "This stale verdict must not notify",
+                    "attention_owner": "Kevin Yan",
+                    "why_automation_cannot_perform": "Only Kevin can act.",
+                    "current_evidence": "This evidence is stale.",
                 }},
             )
         assert not any(
@@ -657,7 +682,7 @@ def test_successful_looking_recovery_generations_are_bounded(
                 assert source.status == "ready"
                 assert kb.claim_task(conn, source_id, claimer=f"source-{index}") is not None
             else:
-                assert source.status == "triage"
+                assert source.status == "automation_recovery"
 
         gates = [
             event.payload or {}
@@ -665,11 +690,14 @@ def test_successful_looking_recovery_generations_are_bounded(
             if event.kind == "reconciliation_outcome"
             and (event.payload or {}).get("outcome") == "genuine_human_gate"
         ]
-        assert len(gates) == 1
-        assert gates[0]["fallback"] == "automation_exhausted"
+        assert gates == []
+        assert all(
+            (event.payload or {}).get("outcome") != "genuine_human_gate"
+            for event in kb.list_events(conn, source_id)
+        )
 
 
-def test_block_loop_triage_cannot_be_auto_resumed(
+def test_block_loop_stays_machine_owned_recovery(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable(monkeypatch)
@@ -681,7 +709,7 @@ def test_block_loop_triage_cannot_be_auto_resumed(
         assert kb.block_task(conn, source_id, reason="same blocker", kind="capability")
         source = kb.get_task(conn, source_id)
         assert source is not None
-        assert source.status == "triage"
+        assert source.status == "automation_recovery"
 
         recovery = next(task for task in _reconciliation_tasks(conn) if task.status == "ready")
         claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
@@ -704,17 +732,17 @@ def test_block_loop_triage_cannot_be_auto_resumed(
         )
         source = kb.get_task(conn, source_id)
         assert source is not None
-        assert source.status == "triage"
+        assert source.status == "automation_recovery"
         gates = [
             event.payload or {}
             for event in kb.list_events(conn, source_id)
             if event.kind == "reconciliation_outcome"
             and (event.payload or {}).get("outcome") == "genuine_human_gate"
         ]
-        assert len(gates) == 1
+        assert gates == []
 
 
-def test_failed_reconciliation_cannot_resume_block_loop_triage(
+def test_failed_reconciliation_keeps_block_loop_machine_owned(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable(monkeypatch)
@@ -747,16 +775,16 @@ def test_failed_reconciliation_cannot_resume_block_loop_triage(
         )
         source = kb.get_task(conn, source_id)
         assert source is not None
-        assert source.status == "triage"
+        assert source.status == "automation_recovery"
         outcomes = [
             event.payload or {}
             for event in kb.list_events(conn, source_id)
             if event.kind == "reconciliation_outcome"
         ]
-        assert outcomes[-1]["outcome"] == "genuine_human_gate"
+        assert outcomes[-1]["outcome"] == "reconciliation_failed"
 
 
-def test_manual_triage_without_active_recovery_is_human_input(
+def test_manual_triage_without_affirmed_gate_is_not_human_input(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable(monkeypatch)
@@ -764,7 +792,7 @@ def test_manual_triage_without_active_recovery_is_human_input(
         source_id = kb.create_task(conn, title="manual triage", assignee="code-crab")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (source_id,))
-        assert kb.attention_class(conn, source_id, reconciler_enabled=True) == "human_input"
+        assert kb.attention_class(conn, source_id, reconciler_enabled=True) is None
 
 
 def test_repeated_reconciliation_failures_escalate_once_instead_of_looping(
@@ -793,7 +821,7 @@ def test_repeated_reconciliation_failures_escalate_once_instead_of_looping(
             source = kb.get_task(conn, source_id)
             assert source is not None
             expected = (
-                "triage"
+                "automation_recovery"
                 if attempt == kb.RECONCILIATION_SOURCE_FAILURE_LIMIT
                 else "ready"
             )
@@ -806,9 +834,10 @@ def test_repeated_reconciliation_failures_escalate_once_instead_of_looping(
         assert [payload.get("outcome") for payload in outcomes] == [
             "reconciliation_failed",
             "reconciliation_failed",
-            "genuine_human_gate",
+            "reconciliation_failed",
         ]
         assert outcomes[-1].get("failure_count") == kb.RECONCILIATION_SOURCE_FAILURE_LIMIT
+        assert outcomes[-1].get("fallback") == "automation_exhausted"
 
 
 def test_outcome_specific_metadata_is_validated(
@@ -997,7 +1026,12 @@ def test_reconciliation_owned_comment_does_not_invalidate_original_occurrence(
             kb.link_tasks(conn, continuation, source_id)
             reconciliation["continuation_task_id"] = continuation
         else:
-            reconciliation["human_action"] = "Approve the bounded action."
+            reconciliation.update({
+                "human_action": "Approve the bounded action.",
+                "attention_owner": "Kevin Yan",
+                "why_automation_cannot_perform": "Only Kevin can approve it.",
+                "current_evidence": "The approval requirement is current.",
+            })
         kb.add_comment(
             conn, source_id, author="default",
             body="Mandatory recovery evidence recorded from current source truth.",

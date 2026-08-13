@@ -979,8 +979,8 @@ def test_board_and_stats_separate_automation_recovery_from_human_input(
         conn.close()
 
     board = client.get("/api/plugins/kanban/board").json()
-    blocked = next(c for c in board["columns"] if c["name"] == "blocked")
-    source = next(item for item in blocked["tasks"] if item["id"] == task["id"])
+    recovery = next(c for c in board["columns"] if c["name"] == "automation_recovery")
+    source = next(item for item in recovery["tasks"] if item["id"] == task["id"])
     assert source["attention_class"] == "automation_recovery"
 
     stats = client.get("/api/plugins/kanban/stats").json()

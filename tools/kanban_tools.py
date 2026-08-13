@@ -804,7 +804,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            return _ok(task_id=tid, run_id=run.id if run else None, terminal_transition=True)
         finally:
             conn.close()
     except ValueError as e:
@@ -832,13 +832,17 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    if kind is None:
+        return tool_error(
+            "kind is required — choose dependency, needs_input, capability, or transient"
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
-                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
+                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)}"
             )
         # Goal-mode block gate (Issue #38696, sibling of the kanban_complete
         # judge gate in #38367). kanban_block is a second exit path out of
@@ -883,8 +887,9 @@ def _handle_block(args: dict, **kw) -> str:
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
-                status=landed.status if landed else "blocked",
+                status=landed.status if landed else "automation_recovery",
                 block_kind=kind,
+                terminal_transition=True,
             )
         finally:
             conn.close()
@@ -963,6 +968,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 task_id=tid,
                 run_id=run.id if run else None,
                 status=landed.status if landed else "review",
+                terminal_transition=True,
             )
         finally:
             conn.close()
@@ -1011,6 +1017,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "ready",
                 implementer=detail,
+                terminal_transition=True,
             )
         finally:
             conn.close()
@@ -1900,13 +1907,13 @@ KANBAN_BLOCK_SCHEMA = {
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
-                    "Omit only if none apply."
+                    "resumes automatically; the others enter machine-owned "
+                    "automation recovery for verification. This field is required."
                 ),
             },
             "board": _board_schema_prop(),
         },
-        "required": ["reason"],
+        "required": ["reason", "kind"],
     },
 }
 
@@ -2249,12 +2256,10 @@ KANBAN_CREATE_SCHEMA = {
             },
             "initial_status": {
                 "type": "string",
-                "enum": ["running", "blocked"],
+                "enum": ["running"],
                 "description": (
-                    "Initial card status. Use 'blocked' for tasks that "
-                    "require immediate human ops (R3 gate) to skip the "
-                    "brief running-to-blocked transition. Defaults to "
-                    "'running', which preserves the usual dispatch path."
+                    "Initial card status. New tasks always enter the normal "
+                    "machine-owned dispatcher lifecycle."
                 ),
             },
             "skills": {

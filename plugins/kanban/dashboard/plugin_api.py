@@ -148,7 +148,7 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "automation_recovery", "blocked", "review", "done",
 ]
 
 
@@ -514,7 +514,7 @@ def get_board(
                 kanban_db.attention_class(
                     conn, t.id, reconciler_enabled=reconciler_enabled,
                 )
-                if t.status in {"blocked", "triage"}
+                if t.status in {"automation_recovery", "blocked", "triage"}
                 else None
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
@@ -877,6 +877,13 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 # PATCH /tasks/:id  (status / assignee / priority / title / body)
 # ---------------------------------------------------------------------------
 
+class HumanGateBody(BaseModel):
+    attention_owner: str
+    human_action: str
+    why_automation_cannot_perform: str
+    current_evidence: str
+
+
 class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
     assignee: Optional[str] = None
@@ -885,6 +892,7 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    human_gate: Optional[HumanGateBody] = None
     schedule_kind: Optional[str] = None
     wake_at: Optional[int] = None
     wake_job_id: Optional[str] = None
@@ -960,7 +968,22 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                if payload.human_gate is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="blocked requires an explicit structured Kevin Yan human gate",
+                    )
+                gate = payload.human_gate
+                try:
+                    ok = kanban_db.affirm_human_gate(
+                        conn, task_id, attention_owner=gate.attention_owner,
+                        human_action=gate.human_action,
+                        why_automation_cannot_perform=gate.why_automation_cannot_perform,
+                        current_evidence=gate.current_evidence,
+                        affirmed_by="operator:dashboard",
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc))
             elif s == "scheduled":
                 try:
                     ok = kanban_db.schedule_task(
@@ -1368,6 +1391,7 @@ class BulkTaskBody(BaseModel):
     result: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    human_gate: Optional[HumanGateBody] = None
     schedule_kind: Optional[str] = None
     wake_at: Optional[int] = None
     wake_job_id: Optional[str] = None
@@ -1417,7 +1441,21 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             metadata=payload.metadata,
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        if payload.human_gate is None:
+                            entry.update(
+                                ok=False,
+                                error="blocked requires an explicit structured Kevin Yan human gate",
+                            )
+                            results.append(entry)
+                            continue
+                        gate = payload.human_gate
+                        ok = kanban_db.affirm_human_gate(
+                            conn, tid, attention_owner=gate.attention_owner,
+                            human_action=gate.human_action,
+                            why_automation_cannot_perform=gate.why_automation_cannot_perform,
+                            current_evidence=gate.current_evidence,
+                            affirmed_by="operator:dashboard",
+                        )
                     elif s == "review":
                         # Non-block review handoff (mirror of PATCH /tasks/{id}).
                         ok = kanban_db.request_review(
@@ -2289,7 +2327,7 @@ def get_stats(board: Optional[str] = Query(None)):
         attention_counts = {"human_input": 0, "automation_recovery": 0}
         reconciler_enabled = kanban_db.blocker_reconciler_enabled()
         for row in conn.execute(
-            "SELECT id FROM tasks WHERE status IN ('blocked', 'triage') "
+            "SELECT id FROM tasks WHERE status IN ('automation_recovery', 'blocked', 'triage') "
             "AND status != 'archived'"
         ).fetchall():
             classification = kanban_db.attention_class(
