@@ -4451,6 +4451,23 @@ def _validate_reconciliation_verdict(
             "reconciliation source advanced after source event "
             f"{source_event_id} via {newer_source_event['kind']}:{newer_source_event['id']}"
         )
+    if outcome in {"continuation_created", "genuine_human_gate"}:
+        evidence = conn.execute(
+            "SELECT id, kind, payload, created_at, run_id FROM task_events "
+            "WHERE task_id=? AND id>? AND kind='commented' ORDER BY id",
+            (source_id, source_event_id),
+        ).fetchall()
+        if not any(
+            _is_reconciliation_evidence_comment(
+                conn, event, source_task_id=source_id,
+                source_event_id=source_event_id,
+                recovery_task_id=recovery_task_id,
+            )
+            for event in evidence
+        ):
+            raise ValueError(
+                f"{outcome} requires a provenance-bearing reconciliation evidence comment"
+            )
     return verdict
 
 
@@ -9273,10 +9290,20 @@ def audit_scheduled_tasks(
                     row["checkpoint_at"] is not None
                     and int(row["checkpoint_at"]) <= current
                 )
+                next_run_at = wake_job.get("next_run_at") if wake_job else None
+                try:
+                    next_run_epoch = int(datetime.fromisoformat(str(next_run_at)).timestamp())
+                except (TypeError, ValueError):
+                    next_run_epoch = 0
+                future_wake_live = bool(
+                    next_run_epoch > current
+                    and row["checkpoint_at"] is not None
+                    and next_run_epoch <= int(row["checkpoint_at"])
+                )
                 category = (
                     "healthy_hold"
                     if wake_job and wake_job.get("enabled", True)
-                    and not terminal_after_hold and not checkpoint_due
+                    and future_wake_live and not terminal_after_hold and not checkpoint_due
                     else "wake_broken"
                 )
             else:
@@ -9302,16 +9329,18 @@ def board_health(
     ready = int(conn.execute(
         "SELECT COUNT(*) AS n FROM tasks WHERE status='ready'"
     ).fetchone()["n"])
-    cap = int(max_in_progress) if max_in_progress is not None else None
+    cap_overridden = max_in_progress is not None
+    cap = int(max_in_progress) if cap_overridden else None
     per_profile_cap = None
     config: dict[str, Any] = {}
     if cap is None or per_profile_cap is None:
         try:
             from hermes_cli.config import load_config
             config = (load_config() or {}).get("kanban", {})
-            raw_cap = config.get("max_in_progress")
-            parsed_cap = int(raw_cap) if raw_cap is not None else 0
-            cap = parsed_cap if parsed_cap >= 1 else None
+            if not cap_overridden:
+                raw_cap = config.get("max_in_progress")
+                parsed_cap = int(raw_cap) if raw_cap is not None else 0
+                cap = parsed_cap if parsed_cap >= 1 else None
             raw_profile_cap = config.get("max_in_progress_per_profile")
             parsed_profile_cap = int(raw_profile_cap) if raw_profile_cap is not None else 0
             per_profile_cap = parsed_profile_cap if parsed_profile_cap >= 1 else None

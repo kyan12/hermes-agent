@@ -141,7 +141,10 @@ def test_audit_classifies_external_wake_health(
             conn, task_id, schedule_kind="external", wake_job_id="job_123",
             checkpoint_at=9_000_000,
         )
-        monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: job_state)
+        live_job_state = job_state
+        if job_state and job_state.get("enabled", True):
+            live_job_state = {**job_state, "next_run_at": "1970-04-05T00:00:00+00:00"}
+        monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: live_job_state)
         monkeypatch.setattr("cron.executions.latest_execution", lambda _job_id: execution)
         report = kb.audit_scheduled_tasks(conn, now=8_000_000)
         assert report["tasks"][0]["category"] == category
