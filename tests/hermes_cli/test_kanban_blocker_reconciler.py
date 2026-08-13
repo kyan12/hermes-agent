@@ -66,6 +66,34 @@ def _add_legacy_comment(conn, task_id: str, *, author: str, body: str) -> None:
         )
 
 
+def test_terminal_source_with_active_replacement_coalesces_stale_wrapper(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live regression: archived source + running replacement is no human gate."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn, title="spawn-failed source")
+        assert kb.block_task(conn, source_id, reason="workspace unresolved", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        replacement_id = kb.create_task(conn, title="executable replacement", assignee="code-crab")
+        assert kb.claim_task(conn, replacement_id, claimer="replacement") is not None
+        assert kb.archive_task(conn, source_id)
+        kb.link_tasks(conn, replacement_id, source_id)
+
+        closed = kb.reconcile_stale_reconciliation_wrappers(conn)
+
+        assert closed == [recovery.id]
+        assert kb.get_task(conn, recovery.id).status == "archived"
+        outcome = [
+            e for e in kb.list_events(conn, source_id)
+            if e.kind == "reconciliation_outcome"
+        ][-1]
+        assert outcome.payload["outcome"] == "cleared/resumed"
+        assert outcome.payload["stale"] is True
+        assert outcome.payload["replacement_task_id"] == replacement_id
+        assert outcome.payload.get("human_action") is None
+
+
 def test_iteration_budget_block_enqueues_one_reconciliation_without_human_gate(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1403,7 +1431,14 @@ def test_backoff_outcome_resumes_when_deadline_elapses(
 
         # A later, unrelated operator/cron park must not be released by the
         # stale backoff outcome that already elapsed above.
-        assert kb.schedule_task(conn, source_id, reason="wait for external window")
+        assert kb.schedule_task(
+            conn,
+            source_id,
+            reason="wait for external window",
+            schedule_kind="external",
+            wake_job_id="test-window-wake",
+            checkpoint_at=resume_at + 3600,
+        )
         assert kb.recompute_ready(conn) == 0
         source = kb.get_task(conn, source_id)
         assert source is not None
