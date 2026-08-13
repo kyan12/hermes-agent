@@ -16,7 +16,16 @@ type KanbanMessages = {
   newTaskCommand: string
   countTip: (running: number, ready: number) => string
   col: Record<
-    'archived' | 'automation_recovery' | 'blocked' | 'done' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
+    | 'archived'
+    | 'automation_recovery'
+    | 'blocked'
+    | 'done'
+    | 'ready'
+    | 'review'
+    | 'running'
+    | 'scheduled'
+    | 'todo'
+    | 'triage',
     { label: string; help: string }
   >
   locked: { review: string; running: string; scheduled: string }
@@ -198,8 +207,14 @@ const en: KanbanMessages = {
     scheduled: { label: 'Scheduled', help: 'Waiting for a scheduled time to arrive.' },
     ready: { label: 'Ready', help: 'Dependencies satisfied — assign a profile and the dispatcher runs it.' },
     running: { label: 'Running', help: 'Claimed by a worker — an agent is on it. Set by the dispatcher.' },
-    automation_recovery: { label: 'Automation recovery', help: 'Machine-owned diagnosis and recovery; no human action is requested.' },
-    blocked: { label: 'Blocked', help: 'A complete current gate was affirmed and requires a specific action by Kevin Yan.' },
+    automation_recovery: {
+      label: 'Automation recovery',
+      help: 'Machine-owned diagnosis and recovery; no human action is requested.'
+    },
+    blocked: {
+      label: 'Blocked',
+      help: 'A complete current gate was affirmed and requires a specific action by Kevin Yan.'
+    },
     review: { label: 'Review', help: 'A review agent is checking the work. Set by the dispatcher.' },
     done: { label: 'Done', help: 'Completed; dependent children become ready.' },
     archived: { label: 'Archived', help: 'Hidden from the default board view.' }
