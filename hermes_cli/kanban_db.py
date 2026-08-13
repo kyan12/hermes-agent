@@ -5448,7 +5448,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` tasks to ``ready`` when all parents are accepted ``done``.
 
     Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
     MUST be called OUTSIDE any open write transaction (plain ``write_txn``
@@ -5553,7 +5553,7 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(p["status"] == "done" for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -5595,12 +5595,12 @@ def recompute_ready(
 # ---------------------------------------------------------------------------
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
+    """Return whether every direct parent has an accepted completion."""
     return conn.execute(
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        "AND p.status != 'done' LIMIT 1",
         (task_id,),
     ).fetchone() is None
 
@@ -5632,7 +5632,7 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -7795,7 +7795,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        "AND p.status != 'done' LIMIT 1",
         (task_id,),
     ).fetchone()
     return "todo" if undone_parents else "ready"
@@ -8938,11 +8938,14 @@ def reconcile_scheduled(
         rows = conn.execute(
             "SELECT id, schedule_kind FROM tasks WHERE status = 'scheduled' AND ("
             "(schedule_kind = 'timed' AND wake_at IS NOT NULL AND wake_at <= ?) OR "
-            "schedule_kind = 'dependency') ORDER BY COALESCE(wake_at, created_at)",
+            "schedule_kind = 'dependency' OR "
+            "(schedule_kind IS NULL AND EXISTS ("
+            "SELECT 1 FROM task_links l WHERE l.child_id = tasks.id"
+            ")) ) ORDER BY COALESCE(wake_at, created_at)",
             (current,),
         ).fetchall()
         for row in rows:
-            if row["schedule_kind"] == "dependency" and not _parents_satisfied(conn, row["id"]):
+            if row["schedule_kind"] in {"dependency", None} and not _parents_satisfied(conn, row["id"]):
                 continue
             if _wake_scheduled_task_in_txn(conn, row["id"], now=current, source="dispatcher"):
                 woken.append(row["id"])
@@ -8956,7 +8959,7 @@ def audit_scheduled_tasks(
     current = int(time.time()) if now is None else int(now)
     counts = {name: 0 for name in (
         "timed_due", "timed_future", "dependency_ready", "dependency_wait",
-        "external", "physical", "legacy",
+        "dependency_unaccepted", "healthy_hold", "wake_broken", "legacy",
     )}
     items: list[dict[str, Any]] = []
     repaired: list[str] = []
@@ -8971,9 +8974,32 @@ def audit_scheduled_tasks(
             if kind == "timed":
                 category = "timed_due" if row["wake_at"] is not None and int(row["wake_at"]) <= current else "timed_future"
             elif kind == "dependency":
-                category = "dependency_ready" if _parents_satisfied(conn, row["id"]) else "dependency_wait"
+                parents = conn.execute(
+                    "SELECT p.status FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+                    "WHERE l.child_id=?", (row["id"],),
+                ).fetchall()
+                if parents and all(parent["status"] == "done" for parent in parents):
+                    category = "dependency_ready"
+                elif any(parent["status"] == "archived" for parent in parents):
+                    category = "dependency_unaccepted"
+                else:
+                    category = "dependency_wait"
             elif kind in {"external", "physical"}:
-                category = kind
+                try:
+                    from cron.jobs import get_job
+                    from cron.executions import latest_execution
+                    wake_job = get_job(row["wake_job_id"]) if row["wake_job_id"] else None
+                    execution = latest_execution(row["wake_job_id"]) if row["wake_job_id"] else None
+                except Exception:
+                    wake_job = None
+                    execution = None
+                execution_status = execution.get("status") if isinstance(execution, dict) else None
+                category = (
+                    "healthy_hold"
+                    if wake_job and wake_job.get("enabled", True)
+                    and execution_status not in {"failed", "completed", "unknown"}
+                    else "wake_broken"
+                )
             else:
                 category = "legacy"
             counts[category] += 1
@@ -8982,6 +9008,47 @@ def audit_scheduled_tasks(
                     repaired.append(row["id"])
             items.append({**dict(row), "category": category, "repaired": row["id"] in repaired})
     return {"now": current, "counts": counts, "repaired": repaired, "tasks": items}
+
+
+def board_health(
+    conn: sqlite3.Connection, *, now: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return queue shape, dependency gates, wake health, and free capacity."""
+    current = int(time.time()) if now is None else int(now)
+    scheduled = audit_scheduled_tasks(conn, now=current, repair=False)
+    running = int(conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE status='running'"
+    ).fetchone()["n"])
+    ready = int(conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE status='ready'"
+    ).fetchone()["n"])
+    cap = int(max_in_progress) if max_in_progress is not None else None
+    gated = []
+    for row in conn.execute("SELECT id FROM tasks WHERE status='todo' ORDER BY created_at"):
+        blockers = [p["id"] for p in conn.execute(
+            "SELECT p.id FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+            "WHERE l.child_id=? AND p.status!='done' ORDER BY p.created_at", (row["id"],),
+        )]
+        if blockers:
+            gated.append({"id": row["id"], "blocking_parents": blockers})
+    actionable = [
+        item["id"] for item in scheduled["tasks"]
+        if item["category"] in {"timed_due", "dependency_ready", "dependency_unaccepted", "wake_broken", "legacy"}
+    ]
+    return {
+        "now": current,
+        "healthy": bool(running or ready or not actionable),
+        "capacity": {
+            "running": running, "limit": cap,
+            "available": None if cap is None else max(0, cap - running),
+            "full": False if cap is None else running >= cap,
+        },
+        "ready": ready,
+        "todo": {"gated": gated},
+        "scheduled": scheduled,
+        "actionable_task_ids": actionable,
+    }
 
 
 # Dispatcher (one-shot pass)
