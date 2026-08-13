@@ -1078,6 +1078,46 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_scheduled_hold(task, events, runs, now, cfg) -> list[Diagnostic]:
+    if _task_field(task, "status") != "scheduled":
+        return []
+    kind = _task_field(task, "schedule_kind")
+    wake_at = _task_field(task, "wake_at")
+    checkpoint_at = _task_field(task, "checkpoint_at")
+    task_id = str(_task_field(task, "id", ""))
+    actions = [DiagnosticAction(
+        kind="cli_hint", label="Audit scheduled holds",
+        payload={"command": "hermes kanban schedule-audit"}, suggested=True,
+    )]
+    if not kind:
+        return [Diagnostic(
+            kind="legacy_scheduled_hold", severity="error",
+            title="Legacy scheduled hold has no durable wake contract",
+            detail="Intent is unknown and is never inferred from prose; classify or repair it explicitly.",
+            actions=actions, first_seen_at=int(_task_field(task, "created_at", now)),
+            last_seen_at=now, data={"task_id": task_id},
+        )]
+    if kind == "timed" and wake_at is not None and int(wake_at) <= now:
+        return [Diagnostic(
+            kind="due_scheduled_hold", severity="error",
+            title="Timed scheduled hold is overdue",
+            detail="The next dispatcher tick should wake this task; run dispatch/audit if it remains parked.",
+            actions=actions, first_seen_at=int(wake_at), last_seen_at=now,
+            data={"task_id": task_id, "wake_at": int(wake_at)},
+        )]
+    if kind in {"external", "physical"} and checkpoint_at is not None and int(checkpoint_at) <= now:
+        return [Diagnostic(
+            kind="overdue_scheduled_checkpoint", severity="critical",
+            title=f"{kind.capitalize()} hold missed its escalation checkpoint",
+            detail="Verify the durable wake job and either resume, re-schedule, or escalate this hold.",
+            actions=actions, first_seen_at=int(checkpoint_at), last_seen_at=now,
+            data={"task_id": task_id, "schedule_kind": kind,
+                  "wake_job_id": _task_field(task, "wake_job_id"),
+                  "checkpoint_at": int(checkpoint_at)},
+        )]
+    return []
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -1089,6 +1129,7 @@ _RULES: list[RuleFn] = [
     _rule_review_dependency_deadlock,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_scheduled_hold,
     _rule_stranded_in_ready,
 ]
 
@@ -1104,6 +1145,9 @@ DIAGNOSTIC_KINDS = (
     "review_dependency_deadlock",
     "stuck_in_blocked",
     "block_unblock_cycling",
+    "legacy_scheduled_hold",
+    "due_scheduled_hold",
+    "overdue_scheduled_checkpoint",
     "stranded_in_ready",
 )
 
