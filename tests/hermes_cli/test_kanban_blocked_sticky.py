@@ -66,14 +66,14 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             reason="review-required: please verify ACL change",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).status == "automation_recovery"
 
         # Hammer the promotion code — exactly the dispatcher loop's
         # behaviour, just compressed in time.
         for _ in range(5):
             promoted = kb.recompute_ready(conn)
             assert promoted == 0, "worker-blocked task must not auto-promote"
-            assert kb.get_task(conn, tid).status == "blocked"
+            assert kb.get_task(conn, tid).status == "automation_recovery"
 
 
 
@@ -123,11 +123,11 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
             reason="review-required: human eyes please",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).status == "automation_recovery"
 
         # First dispatcher tick — must NOT promote.
         assert kb.recompute_ready(conn) == 0
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).status == "automation_recovery"
 
         # Simulate the (hypothetical) protocol_violation + gave_up
         # entries that the dispatcher would have written if the bug
@@ -152,7 +152,7 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
         for _ in range(3):
             promoted = kb.recompute_ready(conn)
             assert promoted == 0
-            assert kb.get_task(conn, tid).status == "blocked"
+            assert kb.get_task(conn, tid).status == "automation_recovery"
 
 
 # ---------------------------------------------------------------------------

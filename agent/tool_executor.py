@@ -301,6 +301,12 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+def _terminal_transition_result(result: Any) -> bool:
+    from agent.kanban_stop import tool_result_requests_terminal_transition
+
+    return tool_result_requests_terminal_transition(result)
+
+
 def _emit_cancelled_terminal_post_tool_call(
     agent,
     *,
@@ -2273,6 +2279,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         ):
             return
 
+        if _terminal_transition_result(function_result):
+            agent._kanban_terminal_transition = True
+            for skipped_tc in assistant_message.tool_calls[i:]:
+                skipped_name = skipped_tc.function.name
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    f"[Tool execution cancelled — {skipped_name} was not started because the worker already completed a terminal Kanban transition]",
+                    skipped_tc.id,
+                    effect_disposition="none",
+                ))
+                if not _flush_session_db_after_tool_progress(
+                    agent, messages, stage=f"terminal transition cancellation {skipped_name}",
+                ):
+                    return
+            break
+
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
         if not _execution_blocked and agent.tool_progress_callback:
@@ -2395,6 +2417,15 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_kanban_terminal_transition", False):
+            for skipped_tc in calls:
+                messages.append(make_tool_result_message(
+                    skipped_tc.function.name,
+                    f"[Tool execution cancelled — {skipped_tc.function.name} was not started because the worker already completed a terminal Kanban transition]",
+                    skipped_tc.id,
+                    effect_disposition="none",
+                ))
+            continue
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(

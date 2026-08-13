@@ -83,7 +83,7 @@ class TestCollectKanbanNotifications:
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]
         conn = kb.connect()
         try:
-            kb.block_task(conn, tid, reason="waiting on review")
+            kb.block_task(conn, tid, reason="waiting on review", kind="needs_input")
         finally:
             conn.close()
 
@@ -91,12 +91,10 @@ class TestCollectKanbanNotifications:
             first = _collect_kanban_notifications(_session())
             second = _collect_kanban_notifications(_session())
 
-        assert len(first) == 1
-        assert "blocked" in first[0]
-        assert "waiting on review" in first[0]
+        assert first == []
         assert second == []
         assert spy_connect.called
-        # Blocked is not a final status -> subscription stays alive so a
+        # Recovery is not a final status -> subscription stays alive so a
         # respawned task's next terminal event still reaches the user.
         rows = _sub_rows(tid)
         assert len(rows) == 1
@@ -202,13 +200,22 @@ class TestFormatKanbanEventText:
             assert _format_kanban_event_text(self.SUB, self.TASK, ev, "main") is None
 
     def test_blocked_includes_reason(self):
-        ev = SimpleNamespace(kind="blocked", payload={"reason": "needs creds"})
+        ev = SimpleNamespace(kind="human_gate_affirmed", payload={
+            "attention_owner": "Kevin Yan",
+            "human_action": "Approve access",
+            "why_automation_cannot_perform": "Personal authorization",
+            "current_evidence": "Current policy requires approval",
+        })
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
         assert "t_abc123" in text
         assert "blocked" in text
-        assert "needs creds" in text
+        assert "Approve access" in text
         assert "[main]" in text
         assert "@worker" in text
+
+    def test_raw_blocked_event_is_silent(self):
+        ev = SimpleNamespace(kind="blocked", payload={"reason": "needs creds"})
+        assert _format_kanban_event_text(self.SUB, self.TASK, ev, "main") is None
 
     def test_completed_prefers_payload_summary(self):
         ev = SimpleNamespace(kind="completed", payload={"summary": "first line\nsecond"})

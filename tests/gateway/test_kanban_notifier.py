@@ -152,6 +152,14 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
             notifier_profile="main",
         )
         kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        kb.affirm_human_gate(
+            conn, tid,
+            attention_owner="Kevin Yan",
+            human_action="Approve publication",
+            why_automation_cannot_perform="Personal authorization is required",
+            current_evidence=reason,
+            affirmed_by="test-operator",
+        )
     finally:
         conn.close()
 
@@ -291,7 +299,7 @@ class ReportedFailureAdapter:
         return SendResult(success=False, error="Not connected")
 
 
-def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
+def test_notifier_suppresses_repeated_machine_recovery_events(tmp_path, monkeypatch):
     """A retry cycle (crashed → reclaimed → crashed) notifies the user twice.
 
     Before #21398 the notifier auto-unsubscribed on any terminal event kind
@@ -320,9 +328,8 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # First crash delivered.
-    assert len(adapter.sent) == 1
-    assert "crashed" in adapter.sent[0]["text"].lower()
+    # Raw recovery signals are cursor-claimed but never delivered.
+    assert adapter.sent == []
 
     # Subscription survives — the cursor advanced past event #1, but the
     # row is still there.
@@ -346,11 +353,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 2, (
-        f"Second crashed event should also notify; got {len(adapter.sent)} "
-        f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
-    )
-    assert "crashed" in adapter.sent[1]["text"].lower()
+    assert adapter.sent == []
 
 
 def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
@@ -469,7 +472,7 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     assert tid_good in adapter.sent[0]["text"]
 
 
-def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
+def test_notifier_claims_block_loop_detected_without_human_ping(tmp_path, monkeypatch):
     """A `block_loop_detected` event must reach the subscriber as a triage ping.
 
     Regression for the silent-triage gap (PR #62712): kanban_db routes a task
@@ -501,11 +504,7 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
-    text = adapter.sent[0]["text"]
-    assert "TRIAGE" in text
-    assert tid in text
-    assert "needs credentials" in text
+    assert adapter.sent == []
     # Cursor advanced: the event is claimed and not re-delivered.
     conn = kb.connect()
     try:

@@ -3,12 +3,19 @@ from __future__ import annotations
 from gateway.kanban_watchers import should_notify_kanban_event
 
 
-def test_legacy_notification_behavior_is_unchanged_when_reconciler_disabled() -> None:
+def test_raw_recovery_events_never_notify_even_when_reconciler_disabled() -> None:
     for kind in ("blocked", "gave_up", "crashed", "timed_out", "block_loop_detected"):
-        assert should_notify_kanban_event(kind, {}, reconciler_enabled=False)
-    assert should_notify_kanban_event(
+        assert not should_notify_kanban_event(kind, {}, reconciler_enabled=False)
+    assert not should_notify_kanban_event(
         "reconciliation_outcome",
         {"outcome": "genuine_human_gate"},
+        reconciler_enabled=False,
+    )
+    assert should_notify_kanban_event(
+        "human_gate_affirmed",
+        {"attention_owner": "Kevin Yan", "human_action": "Approve once.",
+         "why_automation_cannot_perform": "Personal authorization.",
+         "current_evidence": "Current policy requires approval."},
         reconciler_enabled=False,
     )
 
@@ -40,9 +47,16 @@ def test_only_affirmed_human_gate_outcome_notifies() -> None:
             {"outcome": outcome},
             reconciler_enabled=True,
         )
-    assert should_notify_kanban_event(
+    assert not should_notify_kanban_event(
         "reconciliation_outcome",
         {"outcome": "genuine_human_gate"},
+        reconciler_enabled=True,
+    )
+    assert should_notify_kanban_event(
+        "human_gate_affirmed",
+        {"attention_owner": "Kevin Yan", "human_action": "Approve once.",
+         "why_automation_cannot_perform": "Personal authorization.",
+         "current_evidence": "Current policy requires approval."},
         reconciler_enabled=True,
     )
     assert should_notify_kanban_event("completed", {}, reconciler_enabled=True)

@@ -9069,7 +9069,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
+    "status", "archived", "unblocked", "block_loop_detected",
+    "reconciliation_outcome", "human_gate_affirmed",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -9101,9 +9102,9 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
             lines = str(task.result).strip().splitlines()
             handoff = f"\n{lines[0][:160]}" if lines else ""
         return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
-    if kind == "blocked":
-        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
-        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+    if kind == "human_gate_affirmed":
+        action = str(payload.get("human_action") or "")[:160]
+        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked — needs Kevin: {action}"
     if kind == "gave_up":
         err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
         return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
@@ -9207,6 +9208,13 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
                 for ev in events:
+                    from gateway.kanban_watchers import should_notify_kanban_event
+                    if not should_notify_kanban_event(
+                        ev.kind,
+                        ev.payload,
+                        reconciler_enabled=_kb.blocker_reconciler_enabled(),
+                    ):
+                        continue
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
                         texts.append(text)

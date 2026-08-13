@@ -6765,6 +6765,11 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                if getattr(agent, "_kanban_terminal_transition", False):
+                    _turn_exit_reason = "kanban_terminal_transition"
+                    final_response = "Kanban terminal transition completed."
+                    break
+
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
                     # the in-memory result back to the model or project any

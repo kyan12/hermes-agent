@@ -39,22 +39,22 @@ def should_notify_kanban_event(
 ) -> bool:
     """Gate user notification so automation recovery stays silent.
 
-    With the reconciler disabled, legacy terminal-event notifications remain
-    unchanged. With it enabled, raw blocker/failure events are internal recovery
-    signals and only an affirmed ``genuine_human_gate`` outcome may ping/wake the
-    user. Ordinary completion/review/status notifications are unaffected.
+    Raw blocker/failure events are internal recovery signals regardless of the
+    reconciler kill switch. Only a complete ``human_gate_affirmed`` event may
+    ping/wake the user. Ordinary completion/review/status notifications remain.
     """
-    if not reconciler_enabled:
-        if kind != "reconciliation_outcome":
-            return True
-        # A recovery already running when the kill switch is flipped may still
-        # finish. Preserve its affirmed human gate so disabling automation can
-        # never strand the source after its raw blocker notification was hidden.
-        return bool(payload and payload.get("outcome") == "genuine_human_gate")
     if kind in _RECOVERY_TRIGGER_KINDS:
         return False
     if kind == "reconciliation_outcome":
-        return bool(payload and payload.get("outcome") == "genuine_human_gate")
+        return False
+    if kind == "human_gate_affirmed":
+        return bool(
+            payload
+            and payload.get("attention_owner") == "Kevin Yan"
+            and all(str(payload.get(field) or "").strip() for field in (
+                "human_action", "why_automation_cannot_perform", "current_evidence",
+            ))
+        )
     return True
 
 
@@ -211,7 +211,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # done/archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "reconciliation_outcome")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "reconciliation_outcome", "human_gate_affirmed")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -495,11 +495,12 @@ class GatewayKanbanWatchersMixin:
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
                             )
-                        elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                        elif kind == "human_gate_affirmed":
+                            action = str((ev.payload or {}).get("human_action") or "")[:160]
+                            msg = (
+                                f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked"
+                                f" — needs Kevin: {action}"
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
