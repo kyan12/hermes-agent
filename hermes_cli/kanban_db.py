@@ -84,6 +84,7 @@ import sys
 import threading
 import logging
 import time
+from datetime import datetime
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9240,10 +9241,25 @@ def audit_scheduled_tasks(
                     wake_job = None
                     execution = None
                 execution_status = execution.get("status") if isinstance(execution, dict) else None
+                finished_at = execution.get("finished_at") if isinstance(execution, dict) else None
+                finished_epoch = None
+                if finished_at:
+                    try:
+                        finished_epoch = int(datetime.fromisoformat(str(finished_at)).timestamp())
+                    except (TypeError, ValueError):
+                        finished_epoch = None
+                terminal_after_hold = (
+                    execution_status in {"failed", "completed", "unknown"}
+                    and (finished_epoch is None or finished_epoch >= int(row["scheduled_at"] or 0))
+                )
+                checkpoint_due = (
+                    row["checkpoint_at"] is not None
+                    and int(row["checkpoint_at"]) <= current
+                )
                 category = (
                     "healthy_hold"
                     if wake_job and wake_job.get("enabled", True)
-                    and execution_status not in {"failed", "completed", "unknown"}
+                    and not terminal_after_hold and not checkpoint_due
                     else "wake_broken"
                 )
             else:
@@ -9270,6 +9286,14 @@ def board_health(
         "SELECT COUNT(*) AS n FROM tasks WHERE status='ready'"
     ).fetchone()["n"])
     cap = int(max_in_progress) if max_in_progress is not None else None
+    if cap is None:
+        try:
+            from hermes_cli.config import load_config
+            raw_cap = (load_config() or {}).get("kanban", {}).get("max_in_progress")
+            parsed_cap = int(raw_cap) if raw_cap is not None else 0
+            cap = parsed_cap if parsed_cap >= 1 else None
+        except (TypeError, ValueError, ImportError, AttributeError):
+            cap = None
     gated = []
     for row in conn.execute("SELECT id FROM tasks WHERE status='todo' ORDER BY created_at"):
         blockers = [p["id"] for p in conn.execute(
@@ -9282,9 +9306,22 @@ def board_health(
         item["id"] for item in scheduled["tasks"]
         if item["category"] in {"timed_due", "dependency_ready", "dependency_unaccepted", "wake_broken", "legacy"}
     ]
+    for row in conn.execute(
+        "SELECT id, status, assignee FROM tasks "
+        "WHERE status IN ('blocked','triage','ready') ORDER BY created_at"
+    ):
+        no_path = row["status"] in {"blocked", "triage"}
+        if row["status"] == "ready":
+            try:
+                from hermes_cli.profiles import profile_exists
+                no_path = not row["assignee"] or not profile_exists(row["assignee"])
+            except Exception:
+                no_path = not row["assignee"]
+        if no_path and row["id"] not in actionable:
+            actionable.append(row["id"])
     return {
         "now": current,
-        "healthy": bool(running or ready or not actionable),
+        "healthy": not actionable,
         "capacity": {
             "running": running, "limit": cap,
             "available": None if cap is None else max(0, cap - running),
