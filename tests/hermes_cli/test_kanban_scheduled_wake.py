@@ -136,6 +136,46 @@ def test_audit_classifies_external_wake_health(
         assert report["counts"][category] == 1
 
 
+def test_audit_ignores_pre_hold_completion_when_future_run_is_live(
+    kanban_home, monkeypatch,
+):
+    now = 8_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(
+        "cron.jobs.get_job",
+        lambda _job_id: {"id": "job_123", "enabled": True, "next_run_at": "1970-04-04T15:06:40+00:00"},
+    )
+    monkeypatch.setattr(
+        "cron.executions.latest_execution",
+        lambda _job_id: {"status": "completed", "finished_at": "1970-03-01T00:00:00+00:00"},
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="future recurring wake", assignee="worker")
+        assert kb.schedule_task(
+            conn, task_id, schedule_kind="external", wake_job_id="job_123",
+            checkpoint_at=now + 200_000,
+        )
+        report = kb.audit_scheduled_tasks(conn, now=now)
+        assert report["tasks"][0]["category"] == "healthy_hold"
+
+
+def test_audit_marks_elapsed_external_checkpoint_actionable(kanban_home, monkeypatch):
+    monkeypatch.setattr(
+        "cron.jobs.get_job", lambda _job_id: {"id": "job_123", "enabled": True},
+    )
+    monkeypatch.setattr(
+        "cron.executions.latest_execution", lambda _job_id: {"status": "running"},
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="missed external checkpoint", assignee="worker")
+        assert kb.schedule_task(
+            conn, task_id, schedule_kind="external", wake_job_id="job_123",
+            checkpoint_at=7_999_999,
+        )
+        report = kb.audit_scheduled_tasks(conn, now=8_000_000)
+        assert report["tasks"][0]["category"] == "wake_broken"
+
+
 def test_board_health_exposes_gated_todo_capacity_and_broken_wake(
     kanban_home, monkeypatch,
 ):
@@ -160,6 +200,34 @@ def test_board_health_exposes_gated_todo_capacity_and_broken_wake(
         assert report["todo"]["gated"] == [{"id": child, "blocking_parents": [parent]}]
         assert report["scheduled"]["counts"]["wake_broken"] == 1
         assert held in report["actionable_task_ids"]
+
+
+def test_board_health_flags_blocked_and_unspawnable_ready_even_with_running_work(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: name == "worker")
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="worker")
+        assert kb.claim_task(conn, running) is not None
+        blocked = kb.create_task(conn, title="blocked", assignee="worker")
+        assert kb.block_task(conn, blocked, reason="input", kind="needs_input")
+        unspawnable = kb.create_task(conn, title="no profile", assignee="missing")
+        report = kb.board_health(conn, max_in_progress=2)
+        assert report["healthy"] is False
+        assert set(report["actionable_task_ids"]) >= {blocked, unspawnable}
+
+
+def test_board_health_uses_configured_capacity_when_not_overridden(kanban_home, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: {"kanban": {"max_in_progress": 1}},
+    )
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="worker")
+        assert kb.claim_task(conn, running) is not None
+        report = kb.board_health(conn)
+        assert report["capacity"] == {
+            "running": 1, "limit": 1, "available": 0, "full": True,
+        }
 
 
 def test_completed_is_not_a_public_schedule_kind(kanban_home):
