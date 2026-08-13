@@ -389,6 +389,19 @@ def scheduled_health(
         conn.close()
 
 
+@router.get("/health/board")
+def board_health(
+    board: Optional[str] = Query(None),
+    max_in_progress: Optional[int] = Query(None, ge=1),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return kanban_db.board_health(conn, max_in_progress=max_in_progress)
+    finally:
+        conn.close()
+
+
 @router.post("/health/scheduled/repair")
 def repair_scheduled_health(board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -472,6 +485,10 @@ def get_board(
         # summary for the card badge (so cards don't carry the detail
         # text; the drawer fetches that via /tasks/:id or /diagnostics).
         diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+        queue_health = kanban_db.board_health(conn)
+        schedule_health = {
+            item["id"]: item for item in queue_health["scheduled"]["tasks"]
+        }
 
         latest_event_id = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
@@ -503,6 +520,7 @@ def get_board(
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            d["schedule_health"] = schedule_health.get(t.id)
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render
@@ -540,6 +558,7 @@ def get_board(
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
+            "queue_health": queue_health,
         }
     finally:
         conn.close()

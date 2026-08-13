@@ -1037,6 +1037,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule_audit.add_argument("--json", action="store_true",
                                   help="Emit the audit report as JSON")
 
+    p_board_health = sub.add_parser(
+        "board-health",
+        help="Report nonterminal work without a valid execution or wake path",
+    )
+    p_board_health.add_argument("--max-in-progress", type=int, default=None)
+    p_board_health.add_argument("--json", action="store_true")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1153,6 +1160,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "schedule-audit": _cmd_schedule_audit,
+            "board-health": _cmd_board_health,
             "unblock":  _cmd_unblock,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
@@ -2436,6 +2444,24 @@ def _cmd_schedule_audit(args: argparse.Namespace) -> int:
     for task in report["tasks"]:
         print(f"  {task['id']} [{task['category']}] {task['title']}")
     return 0
+
+
+def _cmd_board_health(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        report = kb.board_health(conn, max_in_progress=args.max_in_progress)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        state = "healthy" if report["healthy"] else "actionable"
+        capacity = report["capacity"]
+        print(
+            f"Board health: {state}; running={capacity['running']} "
+            f"limit={capacity['limit']} ready={report['ready']} "
+            f"gated_todo={len(report['todo']['gated'])}"
+        )
+        for task_id in report["actionable_task_ids"]:
+            print(f"  actionable: {task_id}")
+    return 0 if report["healthy"] else 1
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:

@@ -50,6 +50,31 @@ def test_dependency_hold_wakes_only_after_all_parents_terminal(kanban_home):
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_legacy_scheduled_child_with_done_parents_wakes_exactly_once(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="accepted parent", assignee="worker")
+        child = kb.create_task(conn, title="legacy child", assignee="worker", parents=[parent])
+        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (child,))
+        assert kb.complete_task(conn, parent, result="accepted")
+
+        assert kb.reconcile_scheduled(conn) == [child]
+        assert kb.reconcile_scheduled(conn) == []
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_dependency_hold_does_not_wake_for_archived_unaccepted_parent(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="rejected parent", assignee="worker")
+        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+        assert kb.schedule_task(conn, child, schedule_kind="dependency")
+        assert kb.archive_task(conn, parent)
+
+        assert kb.reconcile_scheduled(conn) == []
+        assert kb.get_task(conn, child).status == "scheduled"
+        report = kb.audit_scheduled_tasks(conn)
+        assert report["counts"]["dependency_unaccepted"] == 1
+
+
 def test_ambiguous_and_incomplete_holds_are_rejected(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="hold", assignee="worker")
@@ -85,6 +110,56 @@ def test_external_hold_rejects_missing_or_disabled_wake_job(kanban_home, monkeyp
         with pytest.raises(ValueError, match="enabled durable cron job"):
             kb.schedule_task(conn, task_id, schedule_kind="external",
                              wake_job_id="missing", checkpoint_at=9_000_000)
+
+
+@pytest.mark.parametrize("job_state,execution,category", [
+    (None, None, "wake_broken"),
+    ({"id": "job_123", "enabled": False}, None, "wake_broken"),
+    ({"id": "job_123", "enabled": True}, {"status": "failed"}, "wake_broken"),
+    ({"id": "job_123", "enabled": True}, {"status": "completed"}, "wake_broken"),
+    ({"id": "job_123", "enabled": True}, {"status": "running"}, "healthy_hold"),
+])
+def test_audit_classifies_external_wake_health(
+    kanban_home, monkeypatch, job_state, execution, category,
+):
+    monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: {"id": "job_123", "enabled": True})
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="external", assignee="worker")
+        assert kb.schedule_task(
+            conn, task_id, schedule_kind="external", wake_job_id="job_123",
+            checkpoint_at=9_000_000,
+        )
+        monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: job_state)
+        monkeypatch.setattr("cron.executions.latest_execution", lambda _job_id: execution)
+        report = kb.audit_scheduled_tasks(conn, now=8_000_000)
+        assert report["tasks"][0]["category"] == category
+        assert report["counts"][category] == 1
+
+
+def test_board_health_exposes_gated_todo_capacity_and_broken_wake(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {"id": job_id, "enabled": True})
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = kb.create_task(conn, title="gated child", assignee="worker", parents=[parent])
+        # Model a stranded nonterminal source with no executable path.
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (parent,))
+        held = kb.create_task(conn, title="broken wake", assignee="worker")
+        assert kb.schedule_task(
+            conn, held, schedule_kind="external", wake_job_id="job_123",
+            checkpoint_at=9_000_000,
+        )
+        monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: None)
+        monkeypatch.setattr("cron.executions.latest_execution", lambda _job_id: None)
+
+        report = kb.board_health(conn, now=8_000_000, max_in_progress=2)
+
+        assert report["healthy"] is False
+        assert report["capacity"]["full"] is False
+        assert report["todo"]["gated"] == [{"id": child, "blocking_parents": [parent]}]
+        assert report["scheduled"]["counts"]["wake_broken"] == 1
+        assert held in report["actionable_task_ids"]
 
 
 def test_completed_is_not_a_public_schedule_kind(kanban_home):
