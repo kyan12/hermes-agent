@@ -12,12 +12,16 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
     db_path = kb.kanban_db_path(board="default")
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     kb.init_db()
+    assert kb.kanban_db_path().resolve().is_relative_to(home.resolve())
     return home
 
 
@@ -89,7 +93,9 @@ def test_ambiguous_and_incomplete_holds_are_rejected(kanban_home):
 
 
 def test_external_hold_persists_wake_job_and_checkpoint(kanban_home, monkeypatch):
-    monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {"id": job_id, "enabled": True})
+    monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {
+        "id": job_id, "enabled": True, "next_run_at": "1970-04-05T00:00:00+00:00",
+    })
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="external", assignee="worker")
         assert kb.schedule_task(
@@ -122,7 +128,13 @@ def test_external_hold_rejects_missing_or_disabled_wake_job(kanban_home, monkeyp
 def test_audit_classifies_external_wake_health(
     kanban_home, monkeypatch, job_state, execution, category,
 ):
-    monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: {"id": "job_123", "enabled": True})
+    monkeypatch.setattr(
+        "cron.jobs.get_job",
+        lambda _job_id: {
+            "id": "job_123", "enabled": True,
+            "next_run_at": "1970-04-05T00:00:00+00:00",
+        },
+    )
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="external", assignee="worker")
         assert kb.schedule_task(
@@ -179,7 +191,9 @@ def test_audit_marks_elapsed_external_checkpoint_actionable(kanban_home, monkeyp
 def test_board_health_exposes_gated_todo_capacity_and_broken_wake(
     kanban_home, monkeypatch,
 ):
-    monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {"id": job_id, "enabled": True})
+    monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {
+        "id": job_id, "enabled": True, "next_run_at": "1970-04-05T00:00:00+00:00",
+    })
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = kb.create_task(conn, title="gated child", assignee="worker", parents=[parent])
@@ -227,7 +241,25 @@ def test_board_health_uses_configured_capacity_when_not_overridden(kanban_home, 
         report = kb.board_health(conn)
         assert report["capacity"] == {
             "running": 1, "limit": 1, "available": 0, "full": True,
+            "per_profile": {},
         }
+
+
+def test_board_health_exposes_profile_caps_and_stranded_todo(kanban_home, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"max_in_progress": 4, "max_in_progress_per_profile": 1}},
+    )
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="busy", assignee="worker")
+        assert kb.claim_task(conn, running) is not None
+        capped = kb.create_task(conn, title="waiting capacity", assignee="worker")
+        stranded = kb.create_task(conn, title="stranded todo", assignee="worker")
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (stranded,))
+        report = kb.board_health(conn)
+        assert report["capacity"]["per_profile"]["worker"]["full"] is True
+        assert capped in report["capacity"]["per_profile"]["worker"]["ready_task_ids"]
+        assert stranded in report["actionable_task_ids"]
 
 
 def test_completed_is_not_a_public_schedule_kind(kanban_home):

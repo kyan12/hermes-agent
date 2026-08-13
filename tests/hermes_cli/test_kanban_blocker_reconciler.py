@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -963,6 +964,49 @@ def test_dependency_verdict_accepts_reconciler_evidence_comment_and_resumes_afte
         assert source is not None and source.status == "ready"
 
 
+@pytest.mark.parametrize("outcome", ["continuation_created", "genuine_human_gate"])
+def test_reconciliation_owned_comment_does_not_invalidate_original_occurrence(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="operator decision", kind="needs_input")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        reconciliation = {
+            "source_task_id": source_id,
+            "source_event_id": source_event_id,
+            "outcome": outcome,
+        }
+        if outcome == "continuation_created":
+            continuation = kb.create_task(conn, title="continuation", assignee="code-crab")
+            kb.link_tasks(conn, continuation, source_id)
+            reconciliation["continuation_task_id"] = continuation
+        else:
+            reconciliation["human_action"] = "Approve the bounded action."
+        kb.add_comment(
+            conn, source_id, author="default",
+            body="Mandatory recovery evidence recorded from current source truth.",
+            origin_task_id=recovery.id, origin_run_id=claimed.current_run_id,
+        )
+
+        assert kb.complete_task(
+            conn, recovery.id, summary="verdict accepted",
+            metadata={"reconciliation": reconciliation},
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == ("todo" if outcome == "continuation_created" else "blocked")
+        assert not any(
+            event.kind == "reconciliation_verdict_discarded"
+            for event in kb.list_events(conn, source_id)
+        )
+
+
 def test_legacy_reconciler_evidence_comment_is_tied_to_active_recovery_run(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1398,7 +1442,13 @@ def test_backoff_outcome_resumes_when_deadline_elapses(
 ) -> None:
     _enable(monkeypatch)
     monkeypatch.setattr(
-        "cron.jobs.get_job", lambda job_id: {"id": job_id, "enabled": True},
+        "cron.jobs.get_job",
+        lambda job_id: {
+            "id": job_id, "enabled": True,
+            "next_run_at": datetime.fromtimestamp(
+                int(kb.time.time()) + 120, tz=timezone.utc,
+            ).isoformat(),
+        },
     )
     with kb.connect_closing() as conn:
         source_id = _running(conn)

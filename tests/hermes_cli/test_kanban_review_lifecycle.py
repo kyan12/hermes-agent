@@ -459,6 +459,16 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert ready_id not in spawned_ids
         assert guarded.get(ready_id) == "active_pr"
 
+        # A later explicit phase advance means the old PR comment is historical,
+        # not proof the current ready lane is still represented by an active PR.
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'promoted', NULL, ?)",
+                (ready_id, int(__import__("time").time()) + 1),
+            )
+        assert kb.check_respawn_guard(conn, ready_id) is None
+
         # Rate-limit cooldown still defers the review lane.
         _now = int(__import__("time").time())
         with kb.write_txn(conn):
