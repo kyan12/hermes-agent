@@ -3094,6 +3094,16 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
+    parents = tuple(p for p in parents if p)
+    # Worker-created children normally name only their parent edge. Carry the
+    # parent's canonical project route forward automatically so a project-linked
+    # worktree child cannot reach ready with a null repository path.
+    if project_id is None and len(parents) == 1:
+        parent_task = get_task(conn, parents[0])
+        if parent_task and parent_task.project_id:
+            project_id = parent_task.project_id
+            project_source_task_id = parent_task.id
+
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
     # (deterministic worktree + branch) without each surface repeating it.
@@ -3194,8 +3204,6 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
-
-    parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -4059,7 +4067,6 @@ def _is_reconciliation_evidence_comment(
             and run["status"] == "running"
             and run["ended_at"] is None
             and int(run["started_at"]) <= int(comment["created_at"])
-            and body.startswith(evidence_prefix)
         )
 
     # Bounded compatibility for already-durable pre-provenance events.  The
@@ -8843,6 +8850,7 @@ def schedule_task(
     ``checkpoint_at``.
     """
     kind = str(schedule_kind or "").strip().lower()
+    now = int(time.time())
     if kind not in VALID_SCHEDULE_KINDS:
         raise ValueError(
             "schedule_kind must be one of " + ", ".join(sorted(VALID_SCHEDULE_KINDS))
@@ -8870,9 +8878,18 @@ def schedule_task(
             raise ValueError("could not verify wake_job_id") from exc
         if not wake_job or not wake_job.get("enabled", True):
             raise ValueError("wake_job_id must identify an enabled durable cron job")
+        if checkpoint_at > now:
+            next_run_at = wake_job.get("next_run_at")
+            try:
+                next_run_epoch = int(datetime.fromisoformat(str(next_run_at)).timestamp())
+            except (TypeError, ValueError):
+                next_run_epoch = 0
+            if next_run_epoch <= now:
+                raise ValueError("wake_job_id must have a durable future next_run_at")
+            if next_run_epoch > int(checkpoint_at):
+                raise ValueError("wake_job_id next_run_at must not exceed checkpoint_at")
     elif wake_job_id is not None or checkpoint_at is not None:
         raise ValueError("wake_job_id/checkpoint_at are only valid for external/physical schedules")
-    now = int(time.time())
     target_status = "scheduled"
     with write_txn(conn):
         params: list[Any] = [
@@ -9040,14 +9057,21 @@ def board_health(
         "SELECT COUNT(*) AS n FROM tasks WHERE status='ready'"
     ).fetchone()["n"])
     cap = int(max_in_progress) if max_in_progress is not None else None
-    if cap is None:
+    per_profile_cap = None
+    config: dict[str, Any] = {}
+    if cap is None or per_profile_cap is None:
         try:
             from hermes_cli.config import load_config
-            raw_cap = (load_config() or {}).get("kanban", {}).get("max_in_progress")
+            config = (load_config() or {}).get("kanban", {})
+            raw_cap = config.get("max_in_progress")
             parsed_cap = int(raw_cap) if raw_cap is not None else 0
             cap = parsed_cap if parsed_cap >= 1 else None
+            raw_profile_cap = config.get("max_in_progress_per_profile")
+            parsed_profile_cap = int(raw_profile_cap) if raw_profile_cap is not None else 0
+            per_profile_cap = parsed_profile_cap if parsed_profile_cap >= 1 else None
         except (TypeError, ValueError, ImportError, AttributeError):
             cap = None
+            per_profile_cap = None
     gated = []
     for row in conn.execute("SELECT id FROM tasks WHERE status='todo' ORDER BY created_at"):
         blockers = [p["id"] for p in conn.execute(
@@ -9073,6 +9097,30 @@ def board_health(
                 no_path = not row["assignee"]
         if no_path and row["id"] not in actionable:
             actionable.append(row["id"])
+    for item in gated:
+        if item["id"] not in actionable:
+            actionable.append(item["id"])
+    gated_ids = {item["id"] for item in gated}
+    for row in conn.execute("SELECT id FROM tasks WHERE status='todo' ORDER BY created_at"):
+        if row["id"] not in gated_ids and row["id"] not in actionable:
+            actionable.append(row["id"])
+    per_profile: dict[str, Any] = {}
+    if per_profile_cap is not None:
+        for row in conn.execute(
+            "SELECT assignee, "
+            "SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running, "
+            "GROUP_CONCAT(CASE WHEN status='ready' THEN id END) AS ready_ids "
+            "FROM tasks WHERE assignee IS NOT NULL GROUP BY assignee"
+        ):
+            profile_running = int(row["running"] or 0)
+            ready_ids = [value for value in str(row["ready_ids"] or "").split(",") if value]
+            per_profile[row["assignee"]] = {
+                "running": profile_running,
+                "limit": per_profile_cap,
+                "available": max(0, per_profile_cap - profile_running),
+                "full": profile_running >= per_profile_cap,
+                "ready_task_ids": ready_ids,
+            }
     return {
         "now": current,
         "healthy": not actionable,
@@ -9080,6 +9128,7 @@ def board_health(
             "running": running, "limit": cap,
             "available": None if cap is None else max(0, cap - running),
             "full": False if cap is None else running >= cap,
+            "per_profile": per_profile,
         },
         "ready": ready,
         "todo": {"gated": gated},
@@ -10626,10 +10675,17 @@ def check_respawn_guard(
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            advanced = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? AND created_at > ? "
+                "AND kind IN ('promoted','unblocked','reclaimed','status') LIMIT 1",
+                (task_id, int(c["created_at"])),
+            ).fetchone()
+            if advanced:
+                continue
             return "active_pr"
 
     return None

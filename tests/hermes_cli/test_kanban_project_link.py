@@ -28,8 +28,10 @@ def _make_project(name="Web App", repo="/tmp/webapp"):
 
 def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn):
     proj = _make_project()
+    assert proj is not None
     tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
     task = kb.get_task(kanban_conn, tid)
+    assert task is not None
 
     assert task.project_id == proj.id
     assert task.workspace_kind == "worktree"
@@ -37,6 +39,25 @@ def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn)
     assert task.workspace_path == os.path.join(proj.primary_path, ".worktrees", tid)
     # Deterministic branch: <slug>/<task-id>-<title-slug>. NOT a random wt/...
     assert task.branch_name == f"{proj.slug}/{tid}-add-login"
+
+
+def test_single_parent_child_automatically_inherits_project_route(
+    tmp_path, kanban_conn,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as conn:
+        proj_id = pdb.create_project(conn, name="Widget", primary_path=str(repo))
+        proj = pdb.get_project(conn, proj_id)
+    assert proj is not None
+    parent = kb.create_task(kanban_conn, title="parent", project_id=proj.id)
+    child = kb.create_task(kanban_conn, title="child", parents=[parent])
+    task = kb.get_task(kanban_conn, child)
+    assert task is not None
+    assert task.project_id == proj.id
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(repo / ".worktrees" / child)
+    assert task.branch_name is not None
     assert not task.branch_name.startswith("wt/")
 
 
