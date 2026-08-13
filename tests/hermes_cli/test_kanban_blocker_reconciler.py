@@ -157,6 +157,11 @@ def test_explicit_needs_input_is_preflighted_and_only_affirmation_is_human_gate(
         claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
         assert claimed is not None
         source_event = [e for e in kb.list_events(conn, source_id) if e.kind == "blocked"][-1]
+        kb.add_comment(
+            conn, source_id, author="default",
+            body="Verified current human-only gate evidence.",
+            origin_task_id=recovery.id, origin_run_id=claimed.current_run_id,
+        )
         assert kb.complete_task(
             conn,
             recovery.id,
@@ -898,6 +903,12 @@ def test_task_outcomes_accept_link_created_by_supported_api(
         claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
         assert claimed is not None
         source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        if outcome == "continuation_created":
+            kb.add_comment(
+                conn, source_id, author="default",
+                body="Verified linked continuation from current source truth.",
+                origin_task_id=recovery.id, origin_run_id=claimed.current_run_id,
+            )
 
         assert kb.complete_task(
             conn,
