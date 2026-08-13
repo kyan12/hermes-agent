@@ -733,16 +733,24 @@ class GatewayKanbanWatchersMixin:
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "reconciliation_outcome", "human_gate_affirmed")
-                        _wake_kinds = {
-                            ev.kind
-                            for ev in d["events"]
-                            if ev.kind in _WAKE_KINDS
-                            and should_notify_kanban_event(
-                                ev.kind,
-                                ev.payload,
+                        _wake_kinds: set[str] = set()
+                        for wake_event in d["events"]:
+                            if wake_event.kind not in _WAKE_KINDS:
+                                continue
+                            if not should_notify_kanban_event(
+                                wake_event.kind,
+                                wake_event.payload,
                                 reconciler_enabled=reconciler_enabled,
-                            )
-                        }
+                            ):
+                                continue
+                            if wake_event.kind == "human_gate_affirmed" and not await asyncio.to_thread(
+                                current_human_gate_event,
+                                sub["task_id"],
+                                wake_event.id,
+                                board=board_slug,
+                            ):
+                                continue
+                            _wake_kinds.add(wake_event.kind)
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)

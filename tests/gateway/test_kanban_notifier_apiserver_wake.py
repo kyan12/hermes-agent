@@ -136,3 +136,41 @@ def test_apiserver_sub_wakes_real_session_via_self_post(tmp_path, monkeypatch):
     # once the wake succeeds.
     assert _unseen_terminal_events(tid, "api_server", "raw-sid-123") == []
 
+
+def test_apiserver_sub_does_not_wake_for_revoked_human_gate(tmp_path, monkeypatch):
+    """A gate resolved before notifier delivery must not wake the creator."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "revoked-gate.db"))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="revoked gate", assignee="worker", session_id="raw-sid-456",
+        )
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="api_server", chat_id="raw-sid-456",
+        )
+        assert kb.block_task(conn, tid, reason="preflight", kind="needs_input")
+        assert kb.affirm_human_gate(
+            conn,
+            tid,
+            attention_owner="Kevin Yan",
+            human_action="Approve once",
+            why_automation_cannot_perform="Personal authorization",
+            current_evidence="Current policy requires approval",
+            affirmed_by="operator:test",
+        )
+        assert kb.unblock_task(conn, tid)
+
+    posts = []
+
+    async def fake_self_post(adapter, *, text, session_id):
+        posts.append({"text": text, "session_id": session_id})
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+    adapter = ApiServerLikeAdapter()
+    runner = _make_runner({Platform.API_SERVER: adapter})
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert posts == []
+
