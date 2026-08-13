@@ -9208,11 +9208,18 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
                 for ev in events:
-                    from gateway.kanban_watchers import should_notify_kanban_event
+                    from gateway.kanban_watchers import (
+                        current_human_gate_event,
+                        should_notify_kanban_event,
+                    )
                     if not should_notify_kanban_event(
                         ev.kind,
                         ev.payload,
                         reconciler_enabled=_kb.blocker_reconciler_enabled(),
+                    ):
+                        continue
+                    if ev.kind == "human_gate_affirmed" and not current_human_gate_event(
+                        sub["task_id"], ev.id, board=slug,
                     ):
                         continue
                     text = _format_kanban_event_text(sub, task, ev, slug)

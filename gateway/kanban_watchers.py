@@ -58,6 +58,31 @@ def should_notify_kanban_event(
     return True
 
 
+def current_human_gate_event(task_id: str, event_id: int, *, board: Optional[str] = None) -> bool:
+    """Revalidate an affirmed gate immediately before delivery."""
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect(board=board)
+    try:
+        task = kb.get_task(conn, task_id)
+        if task is None or task.status != "blocked":
+            return False
+        row = conn.execute(
+            "SELECT id, kind FROM task_events WHERE task_id=? "
+            "AND kind IN ('human_gate_affirmed', 'unblocked', 'completed', 'archived', "
+            "'review_requested', 'changes_requested', 'status') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return bool(
+            row
+            and int(row["id"]) == int(event_id)
+            and row["kind"] == "human_gate_affirmed"
+        )
+    finally:
+        conn.close()
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -468,6 +493,13 @@ class GatewayKanbanWatchersMixin:
                             reconciler_enabled=reconciler_enabled,
                         ):
                             continue
+                        if kind == "human_gate_affirmed" and not await asyncio.to_thread(
+                            current_human_gate_event,
+                            sub["task_id"],
+                            ev.id,
+                            board=board_slug,
+                        ):
+                            continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -700,7 +732,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "reconciliation_outcome")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "reconciliation_outcome", "human_gate_affirmed")
                         _wake_kinds = {
                             ev.kind
                             for ev in d["events"]
@@ -728,6 +760,7 @@ class GatewayKanbanWatchersMixin:
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
                             if "reconciliation_outcome" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "human_gate_affirmed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
