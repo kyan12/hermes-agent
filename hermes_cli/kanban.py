@@ -638,11 +638,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
-    p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
+    p_schedule = sub.add_parser(
+        "schedule", help="Park work under an explicit durable hold/wake contract"
+    )
     p_schedule.add_argument("task_id")
-    p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
+    p_schedule.add_argument("reason", nargs="*", help="Reason/timing note")
     p_schedule.add_argument("--ids", nargs="+", default=None,
-                            help="Additional task ids to schedule with the same reason (bulk mode)")
+                            help="Additional task ids to schedule with the same contract")
+    p_schedule.add_argument(
+        "--kind", required=True, choices=sorted(kb.VALID_SCHEDULE_KINDS),
+        help="dependency, timed, external, physical, or completed",
+    )
+    p_schedule.add_argument("--wake-at", type=int, default=None,
+                            help="Unix timestamp (required for timed)")
+    p_schedule.add_argument("--wake-job-id", default=None,
+                            help="Existing cron job id (required for external/physical)")
+    p_schedule.add_argument("--checkpoint-at", type=int, default=None,
+                            help="Unix escalation checkpoint (required for external/physical)")
 
     p_unblock = sub.add_parser(
         "unblock",
@@ -994,6 +1006,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_repair.add_argument("--json", action="store_true",
                           help="Emit the repair report as JSON")
 
+    p_schedule_audit = sub.add_parser(
+        "schedule-audit",
+        help="Classify scheduled holds and optionally repair provably due rows",
+    )
+    p_schedule_audit.add_argument(
+        "--repair", action="store_true",
+        help="Wake due timed/dependency holds and archive completed wrappers",
+    )
+    p_schedule_audit.add_argument("--json", action="store_true",
+                                  help="Emit the audit report as JSON")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1109,6 +1132,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
+            "schedule-audit": _cmd_schedule_audit,
             "unblock":  _cmd_unblock,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
@@ -2363,6 +2387,10 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 conn,
                 tid,
                 reason=reason,
+                schedule_kind=args.kind,
+                wake_at=args.wake_at,
+                wake_job_id=args.wake_job_id,
+                checkpoint_at=args.checkpoint_at,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
@@ -2370,6 +2398,23 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
             else:
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_schedule_audit(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        report = kb.audit_scheduled_tasks(conn, repair=bool(args.repair))
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    counts = report["counts"]
+    print("Scheduled holds: " + ", ".join(
+        f"{name}={count}" for name, count in counts.items() if count
+    ) if any(counts.values()) else "Scheduled holds: none")
+    if report["repaired"]:
+        print("Repaired: " + ", ".join(report["repaired"]))
+    for task in report["tasks"]:
+        print(f"  {task['id']} [{task['category']}] {task['title']}")
+    return 0
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:

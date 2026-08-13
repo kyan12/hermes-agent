@@ -374,6 +374,23 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# GET /health/scheduled — durable hold observability
+# ---------------------------------------------------------------------------
+
+@router.get("/health/scheduled")
+def scheduled_health(
+    repair: bool = Query(False),
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return kanban_db.audit_scheduled_tasks(conn, repair=repair)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
 
@@ -840,6 +857,10 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    schedule_kind: Optional[str] = None
+    wake_at: Optional[int] = None
+    wake_job_id: Optional[str] = None
+    checkpoint_at: Optional[int] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -913,7 +934,16 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
-                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+                try:
+                    ok = kanban_db.schedule_task(
+                        conn, task_id, reason=payload.block_reason,
+                        schedule_kind=payload.schedule_kind,
+                        wake_at=payload.wake_at,
+                        wake_job_id=payload.wake_job_id,
+                        checkpoint_at=payload.checkpoint_at,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
             elif s == "review":
                 # Manual "request review" from the board. Routes through
                 # request_review so it is NOT a
@@ -1297,6 +1327,10 @@ class BulkTaskBody(BaseModel):
     result: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    schedule_kind: Optional[str] = None
+    wake_at: Optional[int] = None
+    wake_job_id: Optional[str] = None
+    checkpoint_at: Optional[int] = None
     reclaim_first: bool = False
     # Bulk model/provider override — same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
@@ -1370,7 +1404,11 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         results.append(entry)
                         continue
                     elif s == "scheduled":
-                        ok = kanban_db.schedule_task(conn, tid)
+                        ok = kanban_db.schedule_task(
+                            conn, tid, schedule_kind=payload.schedule_kind,
+                            wake_at=payload.wake_at, wake_job_id=payload.wake_job_id,
+                            checkpoint_at=payload.checkpoint_at,
+                        )
                     elif s in {"todo", "triage"}:
                         # Fetch lazily: only review->todo needs reopen.
                         cur = kanban_db.get_task(conn, tid) if s == "todo" else None
