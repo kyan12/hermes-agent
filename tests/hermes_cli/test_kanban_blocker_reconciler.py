@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,34 @@ def _add_legacy_comment(conn, task_id: str, *, author: str, body: str) -> None:
         )
 
 
+def test_terminal_source_with_active_replacement_coalesces_stale_wrapper(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live regression: archived source + running replacement is no human gate."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn, title="spawn-failed source")
+        assert kb.block_task(conn, source_id, reason="workspace unresolved", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        replacement_id = kb.create_task(conn, title="executable replacement", assignee="code-crab")
+        assert kb.claim_task(conn, replacement_id, claimer="replacement") is not None
+        assert kb.archive_task(conn, source_id)
+        kb.link_tasks(conn, replacement_id, source_id)
+
+        closed = kb.reconcile_stale_reconciliation_wrappers(conn)
+
+        assert closed == [recovery.id]
+        assert kb.get_task(conn, recovery.id).status == "archived"
+        outcome = [
+            e for e in kb.list_events(conn, source_id)
+            if e.kind == "reconciliation_outcome"
+        ][-1]
+        assert outcome.payload["outcome"] == "cleared/resumed"
+        assert outcome.payload["stale"] is True
+        assert outcome.payload["replacement_task_id"] == replacement_id
+        assert outcome.payload.get("human_action") is None
+
+
 def test_iteration_budget_block_enqueues_one_reconciliation_without_human_gate(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -128,6 +157,11 @@ def test_explicit_needs_input_is_preflighted_and_only_affirmation_is_human_gate(
         claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
         assert claimed is not None
         source_event = [e for e in kb.list_events(conn, source_id) if e.kind == "blocked"][-1]
+        kb.add_comment(
+            conn, source_id, author="default",
+            body="Verified current human-only gate evidence.",
+            origin_task_id=recovery.id, origin_run_id=claimed.current_run_id,
+        )
         assert kb.complete_task(
             conn,
             recovery.id,
@@ -869,6 +903,12 @@ def test_task_outcomes_accept_link_created_by_supported_api(
         claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
         assert claimed is not None
         source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        if outcome == "continuation_created":
+            kb.add_comment(
+                conn, source_id, author="default",
+                body="Verified linked continuation from current source truth.",
+                origin_task_id=recovery.id, origin_run_id=claimed.current_run_id,
+            )
 
         assert kb.complete_task(
             conn,
@@ -933,6 +973,49 @@ def test_dependency_verdict_accepts_reconciler_evidence_comment_and_resumes_afte
         kb.recompute_ready(conn)
         source = kb.get_task(conn, source_id)
         assert source is not None and source.status == "ready"
+
+
+@pytest.mark.parametrize("outcome", ["continuation_created", "genuine_human_gate"])
+def test_reconciliation_owned_comment_does_not_invalidate_original_occurrence(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="operator decision", kind="needs_input")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        reconciliation = {
+            "source_task_id": source_id,
+            "source_event_id": source_event_id,
+            "outcome": outcome,
+        }
+        if outcome == "continuation_created":
+            continuation = kb.create_task(conn, title="continuation", assignee="code-crab")
+            kb.link_tasks(conn, continuation, source_id)
+            reconciliation["continuation_task_id"] = continuation
+        else:
+            reconciliation["human_action"] = "Approve the bounded action."
+        kb.add_comment(
+            conn, source_id, author="default",
+            body="Mandatory recovery evidence recorded from current source truth.",
+            origin_task_id=recovery.id, origin_run_id=claimed.current_run_id,
+        )
+
+        assert kb.complete_task(
+            conn, recovery.id, summary="verdict accepted",
+            metadata={"reconciliation": reconciliation},
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None
+        assert source.status == ("todo" if outcome == "continuation_created" else "blocked")
+        assert not any(
+            event.kind == "reconciliation_verdict_discarded"
+            for event in kb.list_events(conn, source_id)
+        )
 
 
 def test_legacy_reconciler_evidence_comment_is_tied_to_active_recovery_run(
@@ -1369,6 +1452,15 @@ def test_backoff_outcome_resumes_when_deadline_elapses(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable(monkeypatch)
+    monkeypatch.setattr(
+        "cron.jobs.get_job",
+        lambda job_id: {
+            "id": job_id, "enabled": True,
+            "next_run_at": datetime.fromtimestamp(
+                int(kb.time.time()) + 120, tz=timezone.utc,
+            ).isoformat(),
+        },
+    )
     with kb.connect_closing() as conn:
         source_id = _running(conn)
         assert kb.block_task(conn, source_id, reason="quota reset", kind="transient")
@@ -1403,7 +1495,14 @@ def test_backoff_outcome_resumes_when_deadline_elapses(
 
         # A later, unrelated operator/cron park must not be released by the
         # stale backoff outcome that already elapsed above.
-        assert kb.schedule_task(conn, source_id, reason="wait for external window")
+        assert kb.schedule_task(
+            conn,
+            source_id,
+            reason="wait for external window",
+            schedule_kind="external",
+            wake_job_id="test-window-wake",
+            checkpoint_at=resume_at + 3600,
+        )
         assert kb.recompute_ready(conn) == 0
         source = kb.get_task(conn, source_id)
         assert source is not None

@@ -84,6 +84,7 @@ import sys
 import threading
 import logging
 import time
+from datetime import datetime
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -101,6 +102,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_SCHEDULE_KINDS = {"dependency", "timed", "external", "physical"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1176,6 +1178,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Durable scheduled-hold contract. Legacy scheduled rows have all five
+    # fields NULL and are surfaced for explicit audit instead of inferred.
+    scheduled_at: Optional[int] = None
+    wake_at: Optional[int] = None
+    schedule_kind: Optional[str] = None
+    wake_job_id: Optional[str] = None
+    checkpoint_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1270,6 +1279,11 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            scheduled_at=(int(row["scheduled_at"]) if "scheduled_at" in keys and row["scheduled_at"] is not None else None),
+            wake_at=(int(row["wake_at"]) if "wake_at" in keys and row["wake_at"] is not None else None),
+            schedule_kind=(row["schedule_kind"] if "schedule_kind" in keys and row["schedule_kind"] else None),
+            wake_job_id=(row["wake_job_id"] if "wake_job_id" in keys and row["wake_job_id"] else None),
+            checkpoint_at=(int(row["checkpoint_at"]) if "checkpoint_at" in keys and row["checkpoint_at"] is not None else None),
         )
 
 
@@ -1457,7 +1471,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Durable scheduled-hold contract. NULL fields on existing scheduled rows
+    -- deliberately mean legacy/ambiguous and require explicit repair.
+    scheduled_at         INTEGER,
+    wake_at              INTEGER,
+    schedule_kind        TEXT,
+    wake_job_id          TEXT,
+    checkpoint_at        INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2677,6 +2698,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    for name, ddl in (
+        ("scheduled_at", "scheduled_at INTEGER"),
+        ("wake_at", "wake_at INTEGER"),
+        ("schedule_kind", "schedule_kind TEXT"),
+        ("wake_job_id", "wake_job_id TEXT"),
+        ("checkpoint_at", "checkpoint_at INTEGER"),
+    ):
+        if name not in cols:
+            _add_column_if_missing(conn, "tasks", name, ddl)
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2691,6 +2722,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    # Synthetic/minimal migration fixtures may intentionally omit core columns;
+    # only create the composite wake index for a real tasks table shape.
+    final_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if {"status", "schedule_kind", "wake_at", "checkpoint_at"} <= final_cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_schedule_wake "
+            "ON tasks(status, schedule_kind, wake_at, checkpoint_at)"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -3261,6 +3300,16 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
+    parents = tuple(p for p in parents if p)
+    # Worker-created children normally name only their parent edge. Carry the
+    # parent's canonical project route forward automatically so a project-linked
+    # worktree child cannot reach ready with a null repository path.
+    if project_id is None and len(parents) == 1:
+        parent_task = get_task(conn, parents[0])
+        if parent_task and parent_task.project_id:
+            project_id = parent_task.project_id
+            project_source_task_id = parent_task.id
+
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
     # (deterministic worktree + branch) without each surface repeating it.
@@ -3361,8 +3410,6 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
-
-    parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -4230,7 +4277,6 @@ def _is_reconciliation_evidence_comment(
             and run["status"] == "running"
             and run["ended_at"] is None
             and int(run["started_at"]) <= int(comment["created_at"])
-            and body.startswith(evidence_prefix)
         )
 
     # Bounded compatibility for already-durable pre-provenance events.  The
@@ -4405,6 +4451,23 @@ def _validate_reconciliation_verdict(
             "reconciliation source advanced after source event "
             f"{source_event_id} via {newer_source_event['kind']}:{newer_source_event['id']}"
         )
+    if outcome in {"continuation_created", "genuine_human_gate"}:
+        evidence = conn.execute(
+            "SELECT id, kind, payload, created_at, run_id FROM task_events "
+            "WHERE task_id=? AND id>? AND kind='commented' ORDER BY id",
+            (source_id, source_event_id),
+        ).fetchall()
+        if not any(
+            _is_reconciliation_evidence_comment(
+                conn, event, source_task_id=source_id,
+                source_event_id=source_event_id,
+                recovery_task_id=recovery_task_id,
+            )
+            for event in evidence
+        ):
+            raise ValueError(
+                f"{outcome} requires a provenance-bearing reconciliation evidence comment"
+            )
     return verdict
 
 
@@ -4577,14 +4640,68 @@ def _apply_reconciliation_completion(
             next_status = "scheduled"
         else:
             next_status = _landing_status_after_parents(conn, source_id)
+        backoff_at = int(verdict["resume_at"]) if outcome == "backoff_scheduled" else None
         conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
             "worker_pid = NULL, current_run_id = NULL, block_kind = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL WHERE id = ? "
-            "AND status IN ('blocked', 'triage', 'scheduled', 'todo', 'ready')",
-            (next_status, source_id),
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "scheduled_at = CASE WHEN ? IS NULL THEN scheduled_at ELSE ? END, "
+            "wake_at = CASE WHEN ? IS NULL THEN wake_at ELSE ? END, "
+            "schedule_kind = CASE WHEN ? IS NULL THEN schedule_kind ELSE 'timed' END "
+            "WHERE id = ? AND status IN ('blocked', 'triage', 'scheduled', 'todo', 'ready')",
+            (next_status, backoff_at, int(time.time()), backoff_at, backoff_at,
+             backoff_at, source_id),
         )
     _append_event(conn, source_id, "reconciliation_outcome", payload)
+
+
+def reconcile_stale_reconciliation_wrappers(conn: sqlite3.Connection) -> list[str]:
+    """Archive active recovery wrappers whose source already reached truth.
+
+    A terminal source (done/archived), including one superseded by a linked
+    active replacement, cannot still justify a human gate. Coalesce it from
+    current DB truth without requiring a worker verdict for a stale event id.
+    """
+    closed: list[str] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, idempotency_key FROM tasks WHERE idempotency_key LIKE ? "
+            "AND status IN ('todo','ready','blocked','triage','scheduled')",
+            (RECONCILIATION_IDEMPOTENCY_PREFIX + "%",),
+        ).fetchall()
+        for row in rows:
+            recovery = get_task(conn, row["id"])
+            source_id, source_event_id = _reconciliation_source_from_key(recovery) if recovery else (None, None)
+            source = get_task(conn, source_id) if source_id else None
+            if source is None or source.status not in {"done", "archived"}:
+                continue
+            replacement = conn.execute(
+                "SELECT t.id, t.status FROM task_links l JOIN tasks t ON t.id=l.parent_id "
+                "WHERE l.child_id=? AND t.status IN ('ready','running','review','done') "
+                "ORDER BY t.created_at DESC LIMIT 1", (source.id,),
+            ).fetchone()
+            _end_run(
+                conn, recovery.id,
+                outcome="reconciliation_coalesced", status="archived",
+            )
+            conn.execute(
+                "UPDATE tasks SET status='archived', claim_lock=NULL, claim_expires=NULL, "
+                "worker_pid=NULL, current_run_id=NULL WHERE id=?", (recovery.id,),
+            )
+            payload = {
+                "source_task_id": source.id, "source_event_id": source_event_id,
+                "source_status": source.status,
+                "replacement_task_id": replacement["id"] if replacement else None,
+                "replacement_status": replacement["status"] if replacement else None,
+                "reason": "source_terminal_current_truth",
+            }
+            _append_event(conn, recovery.id, "reconciliation_coalesced", payload)
+            _append_event(conn, source.id, "reconciliation_outcome", {
+                **payload, "outcome": "cleared/resumed", "stale": True,
+                "reconciliation_task_id": recovery.id,
+            })
+            closed.append(recovery.id)
+    return closed
 
 
 def attention_class(
@@ -5583,7 +5700,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` tasks to ``ready`` when all parents are accepted ``done``.
 
     Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
     MUST be called OUTSIDE any open write transaction (plain ``write_txn``
@@ -5688,7 +5805,7 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(p["status"] == "done" for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -5730,12 +5847,12 @@ def recompute_ready(
 # ---------------------------------------------------------------------------
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
+    """Return whether every direct parent has an accepted completion."""
     return conn.execute(
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        "AND p.status != 'done' LIMIT 1",
         (task_id,),
     ).fetchone() is None
 
@@ -5767,7 +5884,7 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -7949,7 +8066,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        "AND p.status != 'done' LIMIT 1",
         (task_id,),
     ).fetchone()
     return "todo" if undone_parents else "ready"
@@ -8982,24 +9099,72 @@ def schedule_task(
     task_id: str,
     *,
     reason: Optional[str] = None,
+    schedule_kind: Optional[str] = None,
+    wake_at: Optional[int] = None,
+    wake_job_id: Optional[str] = None,
+    checkpoint_at: Optional[int] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Park a task in ``scheduled`` so it is waiting on time, not human input.
+    """Park a task under an explicit durable hold/wake contract.
 
-    ``scheduled`` tasks are intentionally not dispatchable; an external cron,
-    human action, or automation can later call ``unblock_task`` to re-gate them
-    to ``ready`` (or ``todo`` if parents are still incomplete).
+    ``timed`` requires ``wake_at``. ``dependency`` requires an existing parent
+    edge and wakes after all parents become terminal. ``external``/``physical``
+    require both a durable enabled cron ``wake_job_id`` and a bounded
+    ``checkpoint_at``.
     """
+    kind = str(schedule_kind or "").strip().lower()
+    now = int(time.time())
+    if kind not in VALID_SCHEDULE_KINDS:
+        raise ValueError(
+            "schedule_kind must be one of " + ", ".join(sorted(VALID_SCHEDULE_KINDS))
+        )
+    if kind == "timed":
+        if wake_at is None or int(wake_at) <= 0:
+            raise ValueError("timed schedules require a positive wake_at")
+        wake_at = int(wake_at)
+    elif wake_at is not None:
+        raise ValueError("wake_at is only valid for timed schedules")
+    if kind == "dependency":
+        if not parent_ids(conn, task_id):
+            raise ValueError("dependency schedules require at least one parent")
+    elif kind in {"external", "physical"}:
+        if not str(wake_job_id or "").strip():
+            raise ValueError(f"{kind} schedules require wake_job_id")
+        if checkpoint_at is None or int(checkpoint_at) <= 0:
+            raise ValueError(f"{kind} schedules require a positive checkpoint_at")
+        wake_job_id = str(wake_job_id).strip()
+        checkpoint_at = int(checkpoint_at)
+        try:
+            from cron.jobs import get_job
+            wake_job = get_job(wake_job_id)
+        except Exception as exc:
+            raise ValueError("could not verify wake_job_id") from exc
+        if not wake_job or not wake_job.get("enabled", True):
+            raise ValueError("wake_job_id must identify an enabled durable cron job")
+        if checkpoint_at > now:
+            next_run_at = wake_job.get("next_run_at")
+            try:
+                next_run_epoch = int(datetime.fromisoformat(str(next_run_at)).timestamp())
+            except (TypeError, ValueError):
+                next_run_epoch = 0
+            if next_run_epoch <= now:
+                raise ValueError("wake_job_id must have a durable future next_run_at")
+            if next_run_epoch > int(checkpoint_at):
+                raise ValueError("wake_job_id next_run_at must not exceed checkpoint_at")
+    elif wake_job_id is not None or checkpoint_at is not None:
+        raise ValueError("wake_job_id/checkpoint_at are only valid for external/physical schedules")
+    target_status = "scheduled"
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        params: list[Any] = [
+            target_status, now, wake_at, kind, wake_job_id, checkpoint_at, task_id,
+        ]
         sql = """
             UPDATE tasks
-               SET status       = 'scheduled',
-                   claim_lock   = NULL,
-                   claim_expires= NULL,
-                   worker_pid   = NULL
+               SET status = ?, claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL, scheduled_at = ?, wake_at = ?,
+                   schedule_kind = ?, wake_job_id = ?, checkpoint_at = ?
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'scheduled')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -9008,18 +9173,243 @@ def schedule_task(
         if cur.rowcount != 1:
             return False
         run_id = _end_run(
-            conn, task_id,
-            outcome="scheduled", status="scheduled",
-            summary=reason,
+            conn, task_id, outcome="scheduled", status=target_status, summary=reason,
         )
-        if run_id is None and reason:
-            run_id = _synthesize_ended_run(
-                conn, task_id,
-                outcome="scheduled",
-                summary=reason,
-            )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload = {
+            "reason": reason, "schedule_kind": kind, "wake_at": wake_at,
+            "wake_job_id": wake_job_id, "checkpoint_at": checkpoint_at,
+        }
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
+
+
+def _wake_scheduled_task_in_txn(
+    conn: sqlite3.Connection, task_id: str, *, now: int, source: str,
+) -> bool:
+    row = conn.execute(
+        "SELECT scheduled_at, wake_at, schedule_kind FROM tasks "
+        "WHERE id = ? AND status = 'scheduled'", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    target = _landing_status_after_parents(conn, task_id)
+    cur = conn.execute(
+        "UPDATE tasks SET status = ?, scheduled_at = NULL, wake_at = NULL, "
+        "schedule_kind = NULL, wake_job_id = NULL, checkpoint_at = NULL "
+        "WHERE id = ? AND status = 'scheduled'", (target, task_id),
+    )
+    if cur.rowcount != 1:
+        return False
+    wake_at = row["wake_at"]
+    _append_event(conn, task_id, "schedule_woke", {
+        "source": source, "status": target, "scheduled_at": row["scheduled_at"],
+        "wake_at": wake_at, "schedule_kind": row["schedule_kind"],
+        "missed_by_seconds": max(0, now - int(wake_at)) if wake_at else None,
+    })
+    return True
+
+
+def reconcile_scheduled(
+    conn: sqlite3.Connection, *, now: Optional[int] = None,
+) -> list[str]:
+    """Wake due timed/dependency holds before dispatcher capacity accounting."""
+    current = int(time.time()) if now is None else int(now)
+    woken: list[str] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, schedule_kind FROM tasks WHERE status = 'scheduled' AND ("
+            "(schedule_kind = 'timed' AND wake_at IS NOT NULL AND wake_at <= ?) OR "
+            "schedule_kind = 'dependency' OR "
+            "(schedule_kind IS NULL AND EXISTS ("
+            "SELECT 1 FROM task_links l WHERE l.child_id = tasks.id"
+            ")) ) ORDER BY COALESCE(wake_at, created_at)",
+            (current,),
+        ).fetchall()
+        for row in rows:
+            if row["schedule_kind"] in {"dependency", None} and not _parents_satisfied(conn, row["id"]):
+                continue
+            if _wake_scheduled_task_in_txn(conn, row["id"], now=current, source="dispatcher"):
+                woken.append(row["id"])
+    return woken
+
+
+def audit_scheduled_tasks(
+    conn: sqlite3.Connection, *, now: Optional[int] = None, repair: bool = False,
+) -> dict[str, Any]:
+    """Classify scheduled holds; optionally wake only provably resolved rows."""
+    current = int(time.time()) if now is None else int(now)
+    counts = {name: 0 for name in (
+        "timed_due", "timed_future", "dependency_ready", "dependency_wait",
+        "dependency_unaccepted", "healthy_hold", "wake_broken", "legacy",
+    )}
+    items: list[dict[str, Any]] = []
+    repaired: list[str] = []
+    ctx = write_txn(conn) if repair else contextlib.nullcontext()
+    with ctx:
+        rows = conn.execute(
+            "SELECT id, title, scheduled_at, wake_at, schedule_kind, wake_job_id, checkpoint_at "
+            "FROM tasks WHERE status = 'scheduled' ORDER BY created_at"
+        ).fetchall()
+        for row in rows:
+            kind = row["schedule_kind"]
+            if kind == "timed":
+                category = "timed_due" if row["wake_at"] is not None and int(row["wake_at"]) <= current else "timed_future"
+            elif kind == "dependency":
+                parents = conn.execute(
+                    "SELECT p.status FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+                    "WHERE l.child_id=?", (row["id"],),
+                ).fetchall()
+                if parents and all(parent["status"] == "done" for parent in parents):
+                    category = "dependency_ready"
+                elif any(parent["status"] == "archived" for parent in parents):
+                    category = "dependency_unaccepted"
+                else:
+                    category = "dependency_wait"
+            elif kind in {"external", "physical"}:
+                try:
+                    from cron.jobs import get_job
+                    from cron.executions import latest_execution
+                    wake_job = get_job(row["wake_job_id"]) if row["wake_job_id"] else None
+                    execution = latest_execution(row["wake_job_id"]) if row["wake_job_id"] else None
+                except Exception:
+                    wake_job = None
+                    execution = None
+                execution_status = execution.get("status") if isinstance(execution, dict) else None
+                finished_at = execution.get("finished_at") if isinstance(execution, dict) else None
+                finished_epoch = None
+                if finished_at:
+                    try:
+                        finished_epoch = int(datetime.fromisoformat(str(finished_at)).timestamp())
+                    except (TypeError, ValueError):
+                        finished_epoch = None
+                terminal_after_hold = (
+                    execution_status in {"failed", "completed", "unknown"}
+                    and (finished_epoch is None or finished_epoch >= int(row["scheduled_at"] or 0))
+                )
+                checkpoint_due = (
+                    row["checkpoint_at"] is not None
+                    and int(row["checkpoint_at"]) <= current
+                )
+                next_run_at = wake_job.get("next_run_at") if wake_job else None
+                try:
+                    next_run_epoch = int(datetime.fromisoformat(str(next_run_at)).timestamp())
+                except (TypeError, ValueError):
+                    next_run_epoch = 0
+                future_wake_live = bool(
+                    next_run_epoch > current
+                    and row["checkpoint_at"] is not None
+                    and next_run_epoch <= int(row["checkpoint_at"])
+                )
+                category = (
+                    "healthy_hold"
+                    if wake_job and wake_job.get("enabled", True)
+                    and future_wake_live and not terminal_after_hold and not checkpoint_due
+                    else "wake_broken"
+                )
+            else:
+                category = "legacy"
+            counts[category] += 1
+            if repair and category in {"timed_due", "dependency_ready"}:
+                if _wake_scheduled_task_in_txn(conn, row["id"], now=current, source="schedule_audit"):
+                    repaired.append(row["id"])
+            items.append({**dict(row), "category": category, "repaired": row["id"] in repaired})
+    return {"now": current, "counts": counts, "repaired": repaired, "tasks": items}
+
+
+def board_health(
+    conn: sqlite3.Connection, *, now: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return queue shape, dependency gates, wake health, and free capacity."""
+    current = int(time.time()) if now is None else int(now)
+    scheduled = audit_scheduled_tasks(conn, now=current, repair=False)
+    running = int(conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE status='running'"
+    ).fetchone()["n"])
+    ready = int(conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE status='ready'"
+    ).fetchone()["n"])
+    cap_overridden = max_in_progress is not None
+    cap = int(max_in_progress) if cap_overridden else None
+    per_profile_cap = None
+    config: dict[str, Any] = {}
+    if cap is None or per_profile_cap is None:
+        try:
+            from hermes_cli.config import load_config
+            config = (load_config() or {}).get("kanban", {})
+            if not cap_overridden:
+                raw_cap = config.get("max_in_progress")
+                parsed_cap = int(raw_cap) if raw_cap is not None else 0
+                cap = parsed_cap if parsed_cap >= 1 else None
+            raw_profile_cap = config.get("max_in_progress_per_profile")
+            parsed_profile_cap = int(raw_profile_cap) if raw_profile_cap is not None else 0
+            per_profile_cap = parsed_profile_cap if parsed_profile_cap >= 1 else None
+        except (TypeError, ValueError, ImportError, AttributeError):
+            cap = None
+            per_profile_cap = None
+    gated = []
+    for row in conn.execute("SELECT id FROM tasks WHERE status='todo' ORDER BY created_at"):
+        blockers = [p["id"] for p in conn.execute(
+            "SELECT p.id FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+            "WHERE l.child_id=? AND p.status!='done' ORDER BY p.created_at", (row["id"],),
+        )]
+        if blockers:
+            gated.append({"id": row["id"], "blocking_parents": blockers})
+    actionable = [
+        item["id"] for item in scheduled["tasks"]
+        if item["category"] in {"timed_due", "dependency_ready", "dependency_unaccepted", "wake_broken", "legacy"}
+    ]
+    for row in conn.execute(
+        "SELECT id, status, assignee FROM tasks "
+        "WHERE status IN ('blocked','triage','ready') ORDER BY created_at"
+    ):
+        no_path = row["status"] in {"blocked", "triage"}
+        if row["status"] == "ready":
+            try:
+                from hermes_cli.profiles import profile_exists
+                no_path = not row["assignee"] or not profile_exists(row["assignee"])
+            except Exception:
+                no_path = not row["assignee"]
+        if no_path and row["id"] not in actionable:
+            actionable.append(row["id"])
+    for item in gated:
+        if item["id"] not in actionable:
+            actionable.append(item["id"])
+    gated_ids = {item["id"] for item in gated}
+    for row in conn.execute("SELECT id FROM tasks WHERE status='todo' ORDER BY created_at"):
+        if row["id"] not in gated_ids and row["id"] not in actionable:
+            actionable.append(row["id"])
+    per_profile: dict[str, Any] = {}
+    if per_profile_cap is not None:
+        for row in conn.execute(
+            "SELECT assignee, "
+            "SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running, "
+            "GROUP_CONCAT(CASE WHEN status='ready' THEN id END) AS ready_ids "
+            "FROM tasks WHERE assignee IS NOT NULL GROUP BY assignee"
+        ):
+            profile_running = int(row["running"] or 0)
+            ready_ids = [value for value in str(row["ready_ids"] or "").split(",") if value]
+            per_profile[row["assignee"]] = {
+                "running": profile_running,
+                "limit": per_profile_cap,
+                "available": max(0, per_profile_cap - profile_running),
+                "full": profile_running >= per_profile_cap,
+                "ready_task_ids": ready_ids,
+            }
+    return {
+        "now": current,
+        "healthy": not actionable,
+        "capacity": {
+            "running": running, "limit": cap,
+            "available": None if cap is None else max(0, cap - running),
+            "full": False if cap is None else running >= cap,
+            "per_profile": per_profile,
+        },
+        "ready": ready,
+        "todo": {"gated": gated},
+        "scheduled": scheduled,
+        "actionable_task_ids": actionable,
+    }
 
 
 # Dispatcher (one-shot pass)
@@ -9123,6 +9513,8 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    woken: list[str] = field(default_factory=list)
+    """Due timed/dependency scheduled tasks woken before capacity accounting."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -10586,10 +10978,17 @@ def check_respawn_guard(
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            advanced = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? AND created_at > ? "
+                "AND kind IN ('promoted','unblocked','reclaimed','status') LIMIT 1",
+                (task_id, int(c["created_at"])),
+            ).fetchone()
+            if advanced:
+                continue
             return "active_pr"
 
     return None
@@ -10799,6 +11198,7 @@ def _dispatch_once_locked(
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
+    reconcile_stale_reconciliation_wrappers(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
@@ -10825,6 +11225,7 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    result.woken = reconcile_scheduled(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Both knobs are total in-flight caps. Collapse them before either lane

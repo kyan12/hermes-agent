@@ -374,6 +374,45 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# GET /health/scheduled — durable hold observability
+# ---------------------------------------------------------------------------
+
+@router.get("/health/scheduled")
+def scheduled_health(
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return kanban_db.audit_scheduled_tasks(conn, repair=False)
+    finally:
+        conn.close()
+
+
+@router.get("/health/board")
+def board_health(
+    board: Optional[str] = Query(None),
+    max_in_progress: Optional[int] = Query(None, ge=1),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return kanban_db.board_health(conn, max_in_progress=max_in_progress)
+    finally:
+        conn.close()
+
+
+@router.post("/health/scheduled/repair")
+def repair_scheduled_health(board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return kanban_db.audit_scheduled_tasks(conn, repair=True)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
 
@@ -446,6 +485,10 @@ def get_board(
         # summary for the card badge (so cards don't carry the detail
         # text; the drawer fetches that via /tasks/:id or /diagnostics).
         diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+        queue_health = kanban_db.board_health(conn)
+        schedule_health = {
+            item["id"]: item for item in queue_health["scheduled"]["tasks"]
+        }
 
         latest_event_id = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
@@ -477,6 +520,7 @@ def get_board(
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            d["schedule_health"] = schedule_health.get(t.id)
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render
@@ -514,6 +558,7 @@ def get_board(
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
+            "queue_health": queue_health,
         }
     finally:
         conn.close()
@@ -840,6 +885,10 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    schedule_kind: Optional[str] = None
+    wake_at: Optional[int] = None
+    wake_job_id: Optional[str] = None
+    checkpoint_at: Optional[int] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -913,7 +962,16 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
-                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+                try:
+                    ok = kanban_db.schedule_task(
+                        conn, task_id, reason=payload.block_reason,
+                        schedule_kind=payload.schedule_kind,
+                        wake_at=payload.wake_at,
+                        wake_job_id=payload.wake_job_id,
+                        checkpoint_at=payload.checkpoint_at,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
             elif s == "review":
                 # Manual "request review" from the board. Routes through
                 # request_review so it is NOT a
@@ -1310,6 +1368,10 @@ class BulkTaskBody(BaseModel):
     result: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    schedule_kind: Optional[str] = None
+    wake_at: Optional[int] = None
+    wake_job_id: Optional[str] = None
+    checkpoint_at: Optional[int] = None
     reclaim_first: bool = False
     # Bulk model/provider override — same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
@@ -1383,7 +1445,11 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         results.append(entry)
                         continue
                     elif s == "scheduled":
-                        ok = kanban_db.schedule_task(conn, tid)
+                        ok = kanban_db.schedule_task(
+                            conn, tid, schedule_kind=payload.schedule_kind,
+                            wake_at=payload.wake_at, wake_job_id=payload.wake_job_id,
+                            checkpoint_at=payload.checkpoint_at,
+                        )
                     elif s in {"todo", "triage"}:
                         # Fetch lazily: only review->todo needs reopen.
                         cur = kanban_db.get_task(conn, tid) if s == "todo" else None
