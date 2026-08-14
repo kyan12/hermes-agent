@@ -67,6 +67,40 @@ def _add_legacy_comment(conn, task_id: str, *, author: str, body: str) -> None:
         )
 
 
+def _fulfilled_source_topology(conn) -> tuple[str, str, kb.Task, int]:
+    """Build the live regression shape: an unroutable wrapper already fulfilled by a direct parent."""
+    source_id = _running(
+        conn,
+        title="unroutable source wrapper",
+        workspace_kind="worktree",
+        workspace_path=None,
+    )
+    continuation_id = kb.create_task(
+        conn, title="valid continuation", assignee="code-crab",
+    )
+    kb.link_tasks(conn, continuation_id, source_id)
+    claimed_continuation = kb.claim_task(conn, continuation_id, claimer="continuation")
+    assert claimed_continuation is not None
+    assert kb.complete_task(
+        conn,
+        continuation_id,
+        summary="Continuation shipped and independently reviewed.",
+        metadata={"commit": "abc123", "review": {"approved": True}},
+        expected_run_id=claimed_continuation.current_run_id,
+    )
+    assert kb.block_task(
+        conn,
+        source_id,
+        reason="worktree route missing",
+        kind="transient",
+    )
+    recovery = _reconciliation_tasks(conn)[0]
+    source_event = [
+        event for event in kb.list_events(conn, source_id) if event.kind == "blocked"
+    ][-1]
+    return source_id, continuation_id, recovery, source_event.id
+
+
 def test_terminal_source_with_active_replacement_coalesces_stale_wrapper(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -93,6 +127,273 @@ def test_terminal_source_with_active_replacement_coalesces_stale_wrapper(
         assert outcome.payload["stale"] is True
         assert outcome.payload["replacement_task_id"] == replacement_id
         assert outcome.payload.get("human_action") is None
+
+
+def test_cleared_completed_closes_fulfilled_unroutable_source_and_promotes_child(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id, continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        child_id = kb.create_task(
+            conn, title="downstream rollout", assignee="code-crab", parents=[source_id],
+        )
+        assert kb.get_task(conn, child_id).status == "todo"
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="Accepted the fulfilled continuation handoff.",
+            metadata={"reconciliation": {
+                "outcome": "cleared/completed",
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "continuation_task_id": continuation_id,
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "done"
+        assert source.completed_at is not None
+        assert source.current_run_id is None
+        assert kb.get_task(conn, child_id).status == "ready"
+        assert kb.recompute_ready(conn) == 0
+        assert len([
+            event for event in kb.list_events(conn, child_id) if event.kind == "promoted"
+        ]) == 1
+        source_run = kb.list_runs(conn, source_id)[-1]
+        assert source_run.summary == "Continuation shipped and independently reviewed."
+        assert source_run.metadata == {
+            "accepted_continuation": {
+                "task_id": continuation_id,
+                "run_id": claimed_continuation_run_id(conn, continuation_id),
+                "summary": "Continuation shipped and independently reviewed.",
+                "metadata": {"commit": "abc123", "review": {"approved": True}},
+            },
+            "accepted_by_reconciliation": {
+                "task_id": recovery.id,
+                "source_event_id": source_event_id,
+            },
+        }
+        events = kb.list_events(conn, source_id)
+        completed = [event for event in events if event.kind == "completed"]
+        outcomes = [event for event in events if event.kind == "reconciliation_outcome"]
+        assert len(completed) == 1
+        assert outcomes[-1].payload["outcome"] == "cleared/completed"
+        assert outcomes[-1].payload["continuation_task_id"] == continuation_id
+
+
+def claimed_continuation_run_id(conn, continuation_id: str) -> int:
+    row = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id=? AND outcome='completed' ORDER BY id DESC LIMIT 1",
+        (continuation_id,),
+    ).fetchone()
+    assert row is not None
+    return int(row["id"])
+
+
+def test_cleared_completed_rejects_stale_lineage(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        with kb.write_txn(conn):
+            newer_event_id = kb._append_event(
+                conn, source_id, "gave_up", {"error": "new occurrence"},
+            )
+            kb._append_event(conn, source_id, "reconciliation_coalesced", {
+                "source_event_id": newer_event_id,
+                "source_status": "automation_recovery",
+                "reconciliation_task_id": recovery.id,
+            })
+        with pytest.raises(ValueError, match="stale"):
+            kb.complete_task(conn, recovery.id, metadata={"reconciliation": {
+                "outcome": "cleared/completed", "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "continuation_task_id": continuation_id,
+            }}, expected_run_id=claimed.current_run_id)
+        assert kb.get_task(conn, source_id).status == "automation_recovery"
+
+
+def test_cleared_completed_rejects_wrong_source(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        _source_id, continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        wrong_source_id = kb.create_task(conn, title="wrong source", assignee="code-crab")
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        with pytest.raises(ValueError, match="does not match recovery lineage"):
+            kb.complete_task(conn, recovery.id, metadata={"reconciliation": {
+                "outcome": "cleared/completed", "source_task_id": wrong_source_id,
+                "source_event_id": source_event_id,
+                "continuation_task_id": continuation_id,
+            }}, expected_run_id=claimed.current_run_id)
+
+
+@pytest.mark.parametrize("tamper", ["creator", "profile"])
+def test_cleared_completed_rejects_unauthorized_reconciler(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch, tamper: str,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id, continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        with kb.write_txn(conn):
+            column = "created_by" if tamper == "creator" else "assignee"
+            conn.execute(f"UPDATE tasks SET {column}='ordinary-worker' WHERE id=?", (recovery.id,))
+        with pytest.raises(ValueError, match="authorized blocker reconciler"):
+            kb.complete_task(conn, recovery.id, metadata={"reconciliation": {
+                "outcome": "cleared/completed", "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "continuation_task_id": continuation_id,
+            }}, expected_run_id=claimed.current_run_id)
+        assert kb.get_task(conn, source_id).status == "automation_recovery"
+
+
+def test_cleared_completed_rejects_active_source_writer(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        now = int(kb.time.time())
+        with kb.write_txn(conn):
+            cur = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                "VALUES (?, 'code-crab', 'running', ?)", (source_id, now),
+            )
+            conn.execute(
+                "UPDATE tasks SET current_run_id=?, claim_lock='writer', "
+                "claim_expires=?, worker_pid=123 WHERE id=?",
+                (cur.lastrowid, now + 900, source_id),
+            )
+        with pytest.raises(ValueError, match="active source writer"):
+            kb.complete_task(conn, recovery.id, metadata={"reconciliation": {
+                "outcome": "cleared/completed", "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "continuation_task_id": continuation_id,
+            }}, expected_run_id=claimed.current_run_id)
+
+
+def test_cleared_completed_requires_completed_direct_parent(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        continuation_id = kb.create_task(conn, title="unfinished continuation", assignee="code-crab")
+        kb.link_tasks(conn, continuation_id, source_id)
+        assert kb.block_task(conn, source_id, reason="route missing", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        with pytest.raises(ValueError, match="completed direct continuation"):
+            kb.complete_task(conn, recovery.id, metadata={"reconciliation": {
+                "outcome": "cleared/completed", "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "continuation_task_id": continuation_id,
+            }}, expected_run_id=claimed.current_run_id)
+
+
+def test_redrive_creates_one_new_live_wrapper_for_unfinished_fulfilled_source(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        repair_id = kb.create_task(conn, title="kernel repair", assignee="code-crab")
+        kb.link_tasks(conn, repair_id, source_id)
+        kb.add_comment(conn, source_id, author="default", body="Prior recovery evidence.")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (recovery.id,))
+        redriven_id = kb.redrive_blocker_reconciliation(conn, source_id, source_event_id)
+        assert redriven_id is not None and redriven_id != recovery.id
+        redriven = kb.get_task(conn, redriven_id)
+        assert redriven is not None and redriven.status == "ready"
+        assert redriven.created_by == "blocker-reconciler"
+        assert kb.redrive_blocker_reconciliation(conn, source_id, source_event_id) == redriven_id
+        claimed = kb.claim_task(conn, redriven_id, claimer="reconciler")
+        assert claimed is not None
+        assert kb.complete_task(
+            conn, redriven_id,
+            metadata={"reconciliation": {
+                "outcome": "cleared/completed", "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "continuation_task_id": continuation_id,
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, source_id).status == "done"
+
+
+def test_redrive_still_rejects_source_change_after_assignment(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (recovery.id,))
+        redriven_id = kb.redrive_blocker_reconciliation(conn, source_id, source_event_id)
+        assert redriven_id is not None
+        claimed = kb.claim_task(conn, redriven_id, claimer="reconciler")
+        assert claimed is not None
+        kb.add_comment(conn, source_id, author="operator", body="New source truth.")
+        with pytest.raises(ValueError, match="source advanced"):
+            kb.complete_task(
+                conn, redriven_id,
+                metadata={"reconciliation": {
+                    "outcome": "cleared/completed", "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "continuation_task_id": continuation_id,
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert kb.get_task(conn, source_id).status == "automation_recovery"
+
+
+def test_cleared_completed_replay_is_idempotent_and_source_never_redrives(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        verdict = {"reconciliation": {
+            "outcome": "cleared/completed", "source_task_id": source_id,
+            "source_event_id": source_event_id,
+            "continuation_task_id": continuation_id,
+        }}
+        assert kb.complete_task(
+            conn, recovery.id, metadata=verdict,
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.complete_task(
+            conn, recovery.id, metadata=verdict,
+            expected_run_id=claimed.current_run_id,
+        ) is False
+        assert kb.enqueue_blocker_reconciliation(conn, source_event_id) is None
+        assert kb.redrive_blocker_reconciliation(conn, source_id, source_event_id) is None
+        assert kb.claim_task(conn, source_id, claimer="dispatcher") is None
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, source_id).status == "done"
+        assert len([e for e in kb.list_events(conn, source_id) if e.kind == "completed"]) == 1
+        assert len([
+            run for run in kb.list_runs(conn, source_id) if run.outcome == "completed"
+        ]) == 1
 
 
 def test_iteration_budget_block_enqueues_one_reconciliation_without_human_gate(

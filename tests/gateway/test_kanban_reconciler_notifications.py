@@ -41,6 +41,7 @@ def test_reconciler_suppresses_raw_recovery_events() -> None:
 def test_only_affirmed_human_gate_outcome_notifies() -> None:
     for outcome in (
         "cleared/resumed",
+        "cleared/completed",
         "continuation_created",
         "dependency_wait",
         "backoff_scheduled",

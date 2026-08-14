@@ -153,6 +153,7 @@ RECONCILIATION_EVENT_KINDS = frozenset({
 })
 RECONCILIATION_OUTCOMES = frozenset({
     "cleared/resumed",
+    "cleared/completed",
     "continuation_created",
     "dependency_wait",
     "backoff_scheduled",
@@ -3855,6 +3856,9 @@ def _reconciliation_prompt(envelope: Mapping[str, Any]) -> str:
         '{"reconciliation":{"outcome":"cleared/resumed",'
         f'"source_task_id":"{lineage["source_task_id"]}",'
         f'"source_event_id":{lineage["source_event_id"]}}}\n'
+        '{"reconciliation":{"outcome":"cleared/completed",'
+        f'"source_task_id":"{lineage["source_task_id"]}",'
+        '"source_event_id":<latest>,"continuation_task_id":"t_..."}}\n'
         '{"reconciliation":{"outcome":"continuation_created",'
         f'"source_task_id":"{lineage["source_task_id"]}",'
         '"source_event_id":<latest>,"continuation_task_id":"t_..."}}\n'
@@ -4025,6 +4029,10 @@ def enqueue_blocker_reconciliation(
     source = get_task(conn, event.task_id)
     if source is None:
         return None
+    if source.status in {"done", "archived"}:
+        # Terminal source truth is final. Replaying an old trigger must never
+        # manufacture another wrapper or make the dispatcher see executable work.
+        return None
     if (source.idempotency_key or "").startswith(RECONCILIATION_IDEMPOTENCY_PREFIX):
         return _handle_terminal_reconciliation_failure(conn, source, event)
     if event.kind in {
@@ -4117,6 +4125,96 @@ def enqueue_blocker_reconciliation(
     return recovery_id
 
 
+def redrive_blocker_reconciliation(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    source_event_id: int,
+) -> Optional[str]:
+    """Create one fresh audited wrapper for a stranded, fulfilled source.
+
+    The redrive is restricted to the newest recovery occurrence for an idle
+    automation-recovery source with a completed direct continuation. It grants
+    no cross-task completion authority: the fresh live reconciler must still
+    return a fully fenced ``cleared/completed`` verdict.
+    """
+    config = _blocker_reconciler_config()
+    if not config["enabled"]:
+        return None
+    source = get_task(conn, source_task_id)
+    if source is None or source.status in {"done", "archived"}:
+        return None
+    if source.status != "automation_recovery":
+        raise ValueError("reconciliation redrive requires an automation_recovery source")
+    if source.current_run_id or source.claim_lock or source.worker_pid:
+        raise ValueError("reconciliation redrive rejects an active source writer")
+    row = conn.execute(
+        "SELECT * FROM task_events WHERE id=? AND task_id=?",
+        (int(source_event_id), source_task_id),
+    ).fetchone()
+    if row is None or row["kind"] not in RECONCILIATION_EVENT_KINDS:
+        raise ValueError("reconciliation redrive source_event_id is not a recovery occurrence")
+    placeholders = ",".join("?" for _ in RECONCILIATION_EVENT_KINDS)
+    newest = conn.execute(
+        f"SELECT MAX(id) AS id FROM task_events WHERE task_id=? AND kind IN ({placeholders})",
+        (source_task_id, *sorted(RECONCILIATION_EVENT_KINDS)),
+    ).fetchone()
+    if newest is None or int(newest["id"] or 0) != int(source_event_id):
+        raise ValueError("reconciliation redrive source_event_id is stale")
+    completed_parent = conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+        "WHERE l.child_id=? AND p.status='done' AND p.completed_at IS NOT NULL LIMIT 1",
+        (source_task_id,),
+    ).fetchone()
+    if completed_parent is None:
+        raise ValueError("reconciliation redrive requires a completed direct continuation")
+    suffix = f":{source_task_id}:{int(source_event_id)}"
+    active = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key LIKE ? "
+        "AND status IN ('todo','ready','running','review','scheduled') "
+        "ORDER BY created_at DESC LIMIT 1",
+        (RECONCILIATION_IDEMPOTENCY_PREFIX + "%" + suffix,),
+    ).fetchone()
+    if active:
+        return str(active["id"])
+
+    event = Event(
+        id=int(row["id"]), task_id=row["task_id"], run_id=row["run_id"],
+        kind=row["kind"],
+        payload=json.loads(row["payload"]) if row["payload"] else None,
+        created_at=int(row["created_at"]),
+    )
+    board = _board_slug_for_connection(conn)
+    generation = conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE idempotency_key LIKE ?",
+        (RECONCILIATION_IDEMPOTENCY_PREFIX + "%" + suffix,),
+    ).fetchone()
+    key_board = f"{board}#redrive-{int(generation['n'] or 0) + 1}"
+    recovery_id = create_task(
+        conn,
+        title=f"[reconciliation] {source.title}"[:240],
+        body=_reconciliation_prompt(_reconciliation_envelope(conn, source, event, board)),
+        assignee=config["profile"], created_by="blocker-reconciler",
+        workspace_kind="scratch", tenant=source.tenant,
+        priority=max(100, int(source.priority) + 10),
+        idempotency_key=(
+            f"{RECONCILIATION_IDEMPOTENCY_PREFIX}{key_board}{suffix}"
+        ),
+        max_runtime_seconds=1800, max_retries=2, goal_mode=True,
+        goal_max_turns=8, board=board, session_id=source.session_id,
+    )
+    with write_txn(conn, allow_nested=True):
+        payload = {
+            "source_event_id": int(source_event_id),
+            "source_status": source.status,
+            "reconciliation_task_id": recovery_id,
+            "classification": "automation_recovery",
+            "redrive": True,
+        }
+        _append_event(conn, source_task_id, "reconciliation_enqueued", payload)
+        _append_event(conn, source_task_id, "reconciliation_redriven", payload)
+    return recovery_id
+
+
 def _latest_reconciliation_source_event_id(
     conn: sqlite3.Connection,
     source_task_id: str,
@@ -4144,6 +4242,39 @@ def _latest_reconciliation_source_event_id(
     return latest, source_status
 
 
+def _reconciliation_assignment_floor(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    recovery_task_id: str,
+    source_event_id: int,
+) -> int:
+    """Return the evidence floor for a deliberate redrive assignment.
+
+    A redrive envelope is built from current source truth, so events predating
+    its audited ``reconciliation_enqueued`` record are reviewed input rather
+    than post-assignment races. Ordinary and coalesced wrappers retain the
+    original occurrence as their floor.
+    """
+    rows = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? "
+        "AND kind='reconciliation_enqueued' AND id>? ORDER BY id",
+        (source_task_id, source_event_id),
+    ).fetchall()
+    floor = source_event_id
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("reconciliation_task_id") == recovery_task_id
+            and payload.get("redrive") is True
+        ):
+            floor = max(floor, int(row["id"]))
+    return floor
+
+
 def _newer_reconciliation_source_event(
     conn: sqlite3.Connection,
     source_task_id: str,
@@ -4159,11 +4290,15 @@ def _newer_reconciliation_source_event(
     exact edge is evidence for the verdict, not an independent source advance;
     every other link or material event still invalidates the generation.
     """
+    floor_event_id = _reconciliation_assignment_floor(
+        conn, source_task_id, recovery_task_id, source_event_id,
+    )
     rows = conn.execute(
         "SELECT id, kind, payload, created_at, run_id FROM task_events WHERE task_id = ? AND id > ? "
-        "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', 'recovery_occurrence', "
+        "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', "
+        "'reconciliation_redriven', 'recovery_occurrence', "
         "'heartbeat', 'claim_extended') ORDER BY id ASC",
-        (source_task_id, source_event_id),
+        (source_task_id, floor_event_id),
     ).fetchall()
     for row in rows:
         if row["kind"] == "linked":
@@ -4341,6 +4476,7 @@ def _validate_reconciliation_verdict(
         )
     outcome_field = {
         "cleared/resumed": None,
+        "cleared/completed": "continuation_task_id",
         "continuation_created": "continuation_task_id",
         "dependency_wait": "dependency_task_id",
         "backoff_scheduled": "resume_at",
@@ -4386,15 +4522,38 @@ def _validate_reconciliation_verdict(
     if source_event is None or source_event["kind"] not in RECONCILIATION_EVENT_KINDS:
         raise ValueError("reconciliation.source_event_id is not a reconciliation occurrence")
 
+    if outcome == "cleared/completed":
+        continuation_id = _required_reconciliation_text(reconciliation, "continuation_task_id")
+        prior = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='reconciliation_outcome' "
+            "AND json_extract(payload, '$.outcome')='cleared/completed' "
+            "AND json_extract(payload, '$.reconciliation_task_id')=? "
+            "AND json_extract(payload, '$.source_event_id')=? "
+            "AND json_extract(payload, '$.continuation_task_id')=? LIMIT 1",
+            (source_id, recovery_task_id, source_event_id, continuation_id),
+        ).fetchone()
+        source_now = get_task(conn, source_id)
+        if recovery.status == "done" and source_now and source_now.status == "done" and prior:
+            return None
+        config = _blocker_reconciler_config()
+        if (
+            recovery.created_by != "blocker-reconciler"
+            or recovery.assignee != config["profile"]
+            or recovery.status != "running"
+            or recovery.current_run_id is None
+        ):
+            raise ValueError("cleared/completed requires an authorized blocker reconciler")
+
     verdict: dict[str, Any] = {
         "outcome": outcome,
         "source_task_id": source_id,
         "source_event_id": source_event_id,
         "expected_source_status": expected_source_status,
     }
-    if outcome == "continuation_created":
+    if outcome in {"continuation_created", "cleared/completed"}:
         continuation_id = _required_reconciliation_text(reconciliation, "continuation_task_id")
-        if get_task(conn, continuation_id) is None:
+        continuation = get_task(conn, continuation_id)
+        if continuation is None:
             raise ValueError("reconciliation.continuation_task_id does not exist")
         linked = conn.execute(
             "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -4404,6 +4563,20 @@ def _validate_reconciliation_verdict(
             raise ValueError(
                 "reconciliation.continuation_task_id must be a linked parent of the source task"
             )
+        if outcome == "cleared/completed":
+            source = get_task(conn, source_id)
+            if source is None or source.status != "automation_recovery":
+                raise ValueError("cleared/completed requires an automation_recovery source")
+            if source.current_run_id or source.claim_lock or source.worker_pid:
+                raise ValueError("cleared/completed rejects an active source writer")
+            completed_run = conn.execute(
+                "SELECT id FROM task_runs WHERE task_id=? AND outcome='completed' "
+                "AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+                (continuation_id,),
+            ).fetchone()
+            if continuation.status != "done" or continuation.completed_at is None or completed_run is None:
+                raise ValueError("cleared/completed requires a completed direct continuation")
+            verdict["continuation_run_id"] = int(completed_run["id"])
         verdict["continuation_task_id"] = continuation_id
     elif outcome == "dependency_wait":
         dependency_id = _required_reconciliation_text(reconciliation, "dependency_task_id")
@@ -4544,10 +4717,12 @@ def _apply_reconciliation_completion(
         stale_reason = f"source materially advanced to {source.status}"
     elif stale_reason is None and outcome == "genuine_human_gate" and source.status not in {"automation_recovery", "blocked", "triage"}:
         stale_reason = f"source is no longer awaiting human input ({source.status})"
-    elif stale_reason is None and outcome in {"continuation_created", "dependency_wait"}:
+    elif stale_reason is None and outcome in {
+        "continuation_created", "cleared/completed", "dependency_wait",
+    }:
         parent_field = (
             "continuation_task_id"
-            if outcome == "continuation_created"
+            if outcome in {"continuation_created", "cleared/completed"}
             else "dependency_task_id"
         )
         parent_id = str(verdict[parent_field])
@@ -4580,6 +4755,63 @@ def _apply_reconciliation_completion(
                 "discarded_outcome": outcome,
                 "stale": True,
             }
+        )
+        _append_event(conn, source_id, "reconciliation_outcome", payload)
+        return
+
+    if outcome == "cleared/completed":
+        continuation_id = str(verdict["continuation_task_id"])
+        continuation = get_task(conn, continuation_id)
+        handoff = conn.execute(
+            "SELECT id, summary, metadata FROM task_runs WHERE id=? AND task_id=? "
+            "AND outcome='completed' AND ended_at IS NOT NULL",
+            (int(verdict["continuation_run_id"]), continuation_id),
+        ).fetchone()
+        if continuation is None or continuation.status != "done" or handoff is None:
+            raise ValueError("cleared/completed continuation advanced before completion")
+        if source.current_run_id or source.claim_lock or source.worker_pid:
+            raise ValueError("cleared/completed rejects an active source writer")
+        try:
+            handoff_metadata = json.loads(handoff["metadata"]) if handoff["metadata"] else None
+        except (TypeError, json.JSONDecodeError):
+            handoff_metadata = None
+        source_metadata = {
+            "accepted_continuation": {
+                "task_id": continuation_id,
+                "run_id": int(handoff["id"]),
+                "summary": handoff["summary"],
+                "metadata": handoff_metadata,
+            },
+            "accepted_by_reconciliation": {
+                "task_id": recovery_task_id,
+                "source_event_id": source_event_id,
+            },
+        }
+        now = int(time.time())
+        cur = conn.execute(
+            "UPDATE tasks SET status='done', result=?, completed_at=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL, block_kind=NULL, "
+            "block_recurrences=0, consecutive_failures=0, last_failure_error=NULL "
+            "WHERE id=? AND status='automation_recovery' AND current_run_id IS NULL "
+            "AND claim_lock IS NULL AND worker_pid IS NULL",
+            (continuation.result, now, source_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("cleared/completed source advanced before atomic close")
+        source_run_id = _synthesize_ended_run(
+            conn, source_id, outcome="completed",
+            summary=handoff["summary"], metadata=source_metadata,
+        )
+        _append_event(
+            conn, source_id, "completed",
+            {
+                "result_len": len(continuation.result) if continuation.result else 0,
+                "summary": (handoff["summary"] or "").splitlines()[0][:400] or None,
+                "accepted_continuation_task_id": continuation_id,
+                "reconciliation_task_id": recovery_task_id,
+                "source_event_id": source_event_id,
+            },
+            run_id=source_run_id,
         )
         _append_event(conn, source_id, "reconciliation_outcome", payload)
         return
