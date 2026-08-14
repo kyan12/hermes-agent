@@ -338,6 +338,66 @@ def test_redrive_creates_one_new_live_wrapper_for_unfinished_fulfilled_source(
         assert kb.get_task(conn, source_id).status == "done"
 
 
+def test_redrive_normalizes_dependency_gated_fulfilled_source(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live topology: an operator parked the recovery source in todo behind the kernel repair."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, _continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        repair_id = kb.create_task(conn, title="active kernel repair", assignee="code-crab")
+        kb.link_tasks(conn, repair_id, source_id)
+        assert kb.claim_task(conn, repair_id, claimer="repair") is not None
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (recovery.id,))
+        assert kb.unblock_task(conn, source_id)
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "todo"
+
+        redriven_id = kb.redrive_blocker_reconciliation(conn, source_id, source_event_id)
+
+        assert redriven_id is not None
+        redriven = kb.get_task(conn, redriven_id)
+        source = kb.get_task(conn, source_id)
+        assert redriven is not None and redriven.status == "ready"
+        assert source is not None and source.status == "automation_recovery"
+        envelope_marker = "```json\n"
+        assert redriven.body is not None
+        envelope = json.loads(
+            redriven.body.split(envelope_marker, 1)[1].split("\n```", 1)[0]
+        )
+        assert envelope["source"]["status"] == "automation_recovery"
+
+
+def test_redrive_rejects_ordinary_dependency_gated_todo_without_recovery_assignment(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        continuation_id = kb.create_task(conn, title="completed parent", assignee="code-crab")
+        continuation_claim = kb.claim_task(conn, continuation_id, claimer="continuation")
+        assert continuation_claim is not None
+        assert kb.complete_task(
+            conn, continuation_id, summary="done",
+            expected_run_id=continuation_claim.current_run_id,
+        )
+        repair_id = kb.create_task(conn, title="active parent", assignee="code-crab")
+        assert kb.claim_task(conn, repair_id, claimer="repair") is not None
+        source_id = kb.create_task(
+            conn, title="ordinary dependency gated task", assignee="code-crab",
+            parents=[continuation_id, repair_id],
+        )
+        with kb.write_txn(conn):
+            source_event_id = kb._append_event(
+                conn, source_id, "gave_up", {"error": "synthetic old failure"},
+            )
+
+        with pytest.raises(ValueError, match="requires an automation_recovery source"):
+            kb.redrive_blocker_reconciliation(conn, source_id, source_event_id)
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "todo"
+
+
 def test_redrive_still_rejects_source_change_after_assignment(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

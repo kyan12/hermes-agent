@@ -4145,9 +4145,12 @@ def _redrive_blocker_reconciliation_locked(
     """Create one fresh audited wrapper for a stranded, fulfilled source.
 
     The redrive is restricted to the newest recovery occurrence for an idle
-    automation-recovery source with a completed direct continuation. It grants
-    no cross-task completion authority: the fresh live reconciler must still
-    return a fully fenced ``cleared/completed`` verdict.
+    automation-recovery source with a completed direct continuation. A source
+    deliberately parked in ``todo`` behind an unfinished repair parent may be
+    normalized back to ``automation_recovery`` only when its exact occurrence
+    was already assigned from that state. It grants no cross-task completion
+    authority: the fresh live reconciler must still return a fully fenced
+    ``cleared/completed`` verdict.
     """
     config = _blocker_reconciler_config()
     if not config["enabled"]:
@@ -4155,8 +4158,6 @@ def _redrive_blocker_reconciliation_locked(
     source = get_task(conn, source_task_id)
     if source is None or source.status in {"done", "archived"}:
         return None
-    if source.status != "automation_recovery":
-        raise ValueError("reconciliation redrive requires an automation_recovery source")
     if source.current_run_id or source.claim_lock or source.worker_pid:
         raise ValueError("reconciliation redrive rejects an active source writer")
     row = conn.execute(
@@ -4179,6 +4180,32 @@ def _redrive_blocker_reconciliation_locked(
     ).fetchone()
     if completed_parent is None:
         raise ValueError("reconciliation redrive requires a completed direct continuation")
+
+    normalized_from: Optional[str] = None
+    if source.status != "automation_recovery":
+        assigned_from_recovery = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='reconciliation_enqueued' "
+            "AND json_extract(payload, '$.source_event_id')=? "
+            "AND json_extract(payload, '$.source_status')='automation_recovery' LIMIT 1",
+            (source_task_id, int(source_event_id)),
+        ).fetchone()
+        dependency_gated = source.status == "todo" and not _parents_satisfied(
+            conn, source_task_id,
+        )
+        if not dependency_gated or assigned_from_recovery is None:
+            raise ValueError("reconciliation redrive requires an automation_recovery source")
+        cur = conn.execute(
+            "UPDATE tasks SET status='automation_recovery' WHERE id=? AND status='todo' "
+            "AND current_run_id IS NULL AND claim_lock IS NULL AND worker_pid IS NULL",
+            (source_task_id,),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("reconciliation redrive could not normalize the recovery source")
+        normalized_from = "todo"
+        source = get_task(conn, source_task_id)
+        if source is None:
+            raise ValueError("reconciliation redrive source disappeared after normalization")
+
     suffix = f":{source_task_id}:{int(source_event_id)}"
     active = conn.execute(
         "SELECT id FROM tasks WHERE idempotency_key LIKE ? "
@@ -4217,11 +4244,13 @@ def _redrive_blocker_reconciliation_locked(
     with write_txn(conn, allow_nested=True):
         payload = {
             "source_event_id": int(source_event_id),
-            "source_status": source.status,
+            "source_status": "automation_recovery",
             "reconciliation_task_id": recovery_id,
             "classification": "automation_recovery",
             "redrive": True,
         }
+        if normalized_from is not None:
+            payload["normalized_from"] = normalized_from
         _append_event(conn, source_task_id, "reconciliation_enqueued", payload)
         _append_event(conn, source_task_id, "reconciliation_redriven", payload)
     return recovery_id
