@@ -364,6 +364,61 @@ def test_redrive_still_rejects_source_change_after_assignment(
         assert kb.get_task(conn, source_id).status == "automation_recovery"
 
 
+def test_redrive_holds_write_transaction_through_wrapper_creation(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, _continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (recovery.id,))
+        original_create = kb.create_task
+
+        def create_while_locked(*args, **kwargs):
+            assert conn.in_transaction, "redrive eligibility and assignment must share BEGIN IMMEDIATE"
+            return original_create(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "create_task", create_while_locked)
+        assert kb.redrive_blocker_reconciliation(conn, source_id, source_event_id) is not None
+
+
+def test_cleared_completed_rejects_continuation_recompletion_race(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, continuation_id, recovery, source_event_id = _fulfilled_source_topology(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        original_validate = kb._validate_reconciliation_verdict
+
+        def validate_then_recomplete(*args, **kwargs):
+            verdict = original_validate(*args, **kwargs)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET result='newer result', completed_at=? WHERE id=?",
+                    (int(kb.time.time()) + 1, continuation_id),
+                )
+                kb._synthesize_ended_run(
+                    conn, continuation_id, outcome="completed",
+                    summary="Newer completion handoff.", metadata={"generation": 2},
+                )
+            return verdict
+
+        monkeypatch.setattr(kb, "_validate_reconciliation_verdict", validate_then_recomplete)
+        with pytest.raises(ValueError, match="completion generation changed"):
+            kb.complete_task(
+                conn, recovery.id,
+                metadata={"reconciliation": {
+                    "outcome": "cleared/completed", "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "continuation_task_id": continuation_id,
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert kb.get_task(conn, source_id).status == "automation_recovery"
+
+
 def test_cleared_completed_replay_is_idempotent_and_source_never_redrives(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -4130,6 +4130,18 @@ def redrive_blocker_reconciliation(
     source_task_id: str,
     source_event_id: int,
 ) -> Optional[str]:
+    """Atomically assign one fresh audited wrapper to a fulfilled source."""
+    with write_txn(conn):
+        return _redrive_blocker_reconciliation_locked(
+            conn, source_task_id, source_event_id,
+        )
+
+
+def _redrive_blocker_reconciliation_locked(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    source_event_id: int,
+) -> Optional[str]:
     """Create one fresh audited wrapper for a stranded, fulfilled source.
 
     The redrive is restricted to the newest recovery occurrence for an idle
@@ -4762,10 +4774,20 @@ def _apply_reconciliation_completion(
     if outcome == "cleared/completed":
         continuation_id = str(verdict["continuation_task_id"])
         continuation = get_task(conn, continuation_id)
+        latest_handoff = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id=? AND outcome='completed' "
+            "AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (continuation_id,),
+        ).fetchone()
+        if (
+            latest_handoff is None
+            or int(latest_handoff["id"]) != int(verdict["continuation_run_id"])
+        ):
+            raise ValueError("cleared/completed continuation completion generation changed")
         handoff = conn.execute(
             "SELECT id, summary, metadata FROM task_runs WHERE id=? AND task_id=? "
             "AND outcome='completed' AND ended_at IS NOT NULL",
-            (int(verdict["continuation_run_id"]), continuation_id),
+            (int(latest_handoff["id"]), continuation_id),
         ).fetchone()
         if continuation is None or continuation.status != "done" or handoff is None:
             raise ValueError("cleared/completed continuation advanced before completion")
