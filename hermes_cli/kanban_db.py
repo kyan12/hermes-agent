@@ -2822,6 +2822,203 @@ def _claimer_id() -> str:
 # Task creation / mutation
 # ---------------------------------------------------------------------------
 
+def _read_profile_skills_config(profile_dir: Path) -> dict:
+    """Best-effort read of the ``skills:`` section of a profile's config.yaml.
+
+    Returns {} on any failure (missing file, unparsable YAML, non-mapping
+    payload) — callers treat that as "no external dirs, nothing disabled".
+    """
+    cfg_path = profile_dir / "config.yaml"
+    try:
+        if not cfg_path.is_file():
+            return {}
+        import yaml
+        parsed = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    skills_cfg = parsed.get("skills")
+    return skills_cfg if isinstance(skills_cfg, dict) else {}
+
+
+def find_unavailable_forced_skills(
+    assignee: Optional[str],
+    skills: Iterable[str],
+) -> list[str]:
+    """Return the forced skill names *assignee*'s profile cannot resolve.
+
+    Mirrors the worker's startup resolution (``cli.py`` →
+    ``build_preloaded_skills_prompt`` → ``skill_view``): a forced skill name
+    must exist in the assignee profile's skills tree — the profile's own
+    ``skills/`` dir plus any ``skills.external_dirs`` from its config.yaml —
+    and must not be disabled via ``skills.disabled``.
+
+    Deliberately fail-open on the classes this static check cannot see:
+
+    * unknown/unresolvable profiles → ``[]`` (the dispatcher already owns
+      the "assignee is not a profile" error class via ``profile_exists``);
+    * ``namespace:skill`` names → skipped (plugin skills live in a runtime
+      registry built by importing the profile's plugins, which cannot be
+      reproduced for another profile without loading its code).
+
+    Callers wrap this in try/except so an internal error never blocks
+    legitimate work. Only invoked at task-create and dispatch time, so the
+    scan cost (one walk per skills dir) stays off hot paths.
+    """
+    requested = [str(s).strip() for s in skills if str(s).strip()]
+    if not requested or not assignee:
+        return []
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+    except Exception:
+        return []
+    try:
+        if not profile_exists(assignee):
+            return []
+        profile_dir = get_profile_dir(assignee)
+    except Exception:
+        return []
+
+    try:
+        from agent.skill_utils import (
+            EXCLUDED_SKILL_DIRS,
+            iter_skill_index_files,
+            is_skill_support_path,
+            parse_frontmatter,
+        )
+    except Exception:
+        # Can't scan faithfully — fail open rather than guess.
+        return []
+
+    skills_cfg = _read_profile_skills_config(profile_dir)
+
+    # Same resolution order as agent.skill_utils.get_external_skills_dirs:
+    # expand ~ / ${VARS}, resolve relative entries against the profile home,
+    # keep only directories that exist, skip the local skills dir.
+    search_dirs: list[Path] = []
+    local_skills = profile_dir / "skills"
+    if local_skills.is_dir():
+        search_dirs.append(local_skills)
+    try:
+        local_resolved = local_skills.resolve()
+    except OSError:
+        local_resolved = local_skills
+    raw_dirs = skills_cfg.get("external_dirs")
+    if isinstance(raw_dirs, str):
+        raw_dirs = [raw_dirs]
+    if isinstance(raw_dirs, list):
+        seen_dirs = {str(d) for d in search_dirs}
+        for entry in raw_dirs:
+            entry = str(entry).strip()
+            if not entry:
+                continue
+            expanded = os.path.expanduser(os.path.expandvars(entry))
+            p = Path(expanded)
+            if not p.is_absolute():
+                p = (profile_dir / p).resolve()
+            try:
+                if p.resolve() == local_resolved:
+                    continue
+            except OSError:
+                pass
+            if p.is_dir() and str(p) not in seen_dirs:
+                seen_dirs.add(str(p))
+                search_dirs.append(p)
+
+    # Disabled skills are treated as missing by the worker's preload path
+    # (build_preloaded_skills_prompt), so they must fail validation too.
+    raw_disabled = skills_cfg.get("disabled")
+    if isinstance(raw_disabled, str):
+        raw_disabled = [raw_disabled]
+    disabled = {
+        str(v).strip() for v in (raw_disabled or []) if str(v).strip()
+    }
+
+    # Map every loadable identifier to the distinct skill files it resolves
+    # to, mirroring skill_view's three lookup strategies: direct relative
+    # path ("category/skill"), bare directory name, frontmatter ``name:``,
+    # and legacy flat ``<name>.md`` files (support dirs excluded). Keep
+    # candidate cardinality: skill_view REFUSES a name that matches more
+    # than one skill file (ambiguous), so those names must fail validation
+    # too — the worker errors out on them at startup just like a missing
+    # skill.
+    candidates: dict[str, set[str]] = {}
+
+    def _record(identifier: str, md_path: Path) -> None:
+        if not identifier or identifier in disabled:
+            return
+        try:
+            key = str(md_path.resolve())
+        except OSError:
+            key = str(md_path)
+        candidates.setdefault(identifier, set()).add(key)
+
+    for root in search_dirs:
+        for skill_md in iter_skill_index_files(root, "SKILL.md"):
+            skill_dir = skill_md.parent
+            try:
+                fm, _ = parse_frontmatter(
+                    skill_md.read_text(encoding="utf-8")[:4000]
+                )
+            except Exception:
+                fm = {}
+            fm_name = str(fm.get("name") or "").strip()
+            # A skill disabled by either its frontmatter name or its
+            # directory name contributes no identifiers at all.
+            if fm_name in disabled or skill_dir.name in disabled:
+                continue
+            _record(skill_dir.name, skill_md)
+            if fm_name:
+                _record(fm_name, skill_md)
+            try:
+                rel = skill_dir.relative_to(root).as_posix()
+                if rel and rel != ".":
+                    _record(rel, skill_md)
+            except ValueError:
+                pass
+        for md in root.rglob("*.md"):
+            if md.name == "SKILL.md":
+                continue
+            if any(part in EXCLUDED_SKILL_DIRS for part in md.parts):
+                continue
+            if is_skill_support_path(md):
+                continue
+            _record(md.stem, md)
+            try:
+                _record(md.relative_to(root).with_suffix("").as_posix(), md)
+            except ValueError:
+                pass
+
+    # Only unambiguous identifiers are loadable by the worker.
+    available = {name for name, paths in candidates.items() if len(paths) == 1}
+
+    missing: list[str] = []
+    for name in requested:
+        if ":" in name:
+            # Plugin-namespaced skill — runtime registry, not statically
+            # verifiable for another profile. The worker resolves it (or
+            # reports it missing) at startup.
+            continue
+        # Mirror normalize_skill_lookup_name for non-absolute identifiers.
+        lookup = name.lstrip("/")
+        if lookup in disabled or lookup not in available:
+            missing.append(name)
+    return sorted(set(missing))
+
+
+def _forced_skills_error(assignee: str, missing: Iterable[str]) -> str:
+    """Shared eligibility-error text for the create- and dispatch-time gates."""
+    names = ", ".join(sorted(missing))
+    return (
+        f"forced skill(s) not available to assignee profile {assignee!r}: "
+        f"{names}. The worker would crash at startup with 'Unknown skill(s)'. "
+        "Install the skill(s) into that profile's skills tree "
+        "(<profile>/skills or its skills.external_dirs), pick a different "
+        "assignee, or drop the forced skill(s)."
+    )
+
+
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
     if assignee is None:
@@ -3061,6 +3258,27 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+
+    # Eligibility gate: forced skills must actually resolve for the assignee
+    # profile. Without this, a misconfigured card reaches the dispatcher and
+    # the worker subprocess crashes at startup with `Unknown skill(s): ...`,
+    # leaving crash-recovery to clean up a deterministic error (live
+    # regression 2026-08-14, t_6b7f8d42). Fail-open by design: unknown
+    # profiles and uninspectable environments skip the check here, and the
+    # dispatcher re-validates before every spawn regardless.
+    if skills_list and assignee:
+        try:
+            unavailable = find_unavailable_forced_skills(assignee, skills_list)
+        except Exception:
+            unavailable = []
+            _log.debug(
+                "create_task: forced-skill availability check failed for "
+                "assignee=%r — skipping gate",
+                assignee,
+                exc_info=True,
+            )
+        if unavailable:
+            raise ValueError(_forced_skills_error(assignee, unavailable))
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -8437,6 +8655,44 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Eligibility re-check before spawning: create_task validates forced
+        # skills at creation, but cards created before that gate existed,
+        # inserted directly, or whose assignee later lost a skill would
+        # otherwise crash-loop the worker subprocess (`Unknown skill(s)` at
+        # startup) and rely on crash-recovery. The failure is deterministic —
+        # no retry will make the profile grow the skill — so trip the breaker
+        # immediately with a clear reason instead of burning failure budget.
+        if claimed.skills:
+            try:
+                unavailable = find_unavailable_forced_skills(
+                    claimed.assignee or "", claimed.skills
+                )
+            except Exception:
+                unavailable = []
+                _log.debug(
+                    "kanban dispatch: forced-skill availability check failed "
+                    "for task %s — skipping gate",
+                    claimed.id,
+                    exc_info=True,
+                )
+            if unavailable:
+                auto = _record_task_failure(
+                    conn,
+                    claimed.id,
+                    _forced_skills_error(claimed.assignee or "", unavailable),
+                    outcome="spawn_failed",
+                    failure_limit=failure_limit,
+                    force_trip=True,
+                    release_claim=True,
+                    end_run=True,
+                    event_payload_extra={
+                        "trigger": "forced_skill_unavailable",
+                        "missing_skills": sorted(unavailable),
+                    },
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
