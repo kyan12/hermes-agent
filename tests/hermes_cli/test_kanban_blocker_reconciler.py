@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
 
 import pytest
 
@@ -636,6 +639,558 @@ def test_duplicate_event_replay_and_concurrent_idempotency_do_not_duplicate(
         second = kb.enqueue_blocker_reconciliation(conn, source_event.id)
         assert first == second
         assert len(_reconciliation_tasks(conn)) == 1
+
+
+def test_dispatch_tick_backfills_recovery_event_missed_by_stale_daemon(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon loaded before the recovery hook must not strand the source forever."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn, title="missed recovery hook", max_retries=1)
+        real_enqueue = kb.enqueue_blocker_reconciliation
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", lambda *_args: None)
+        assert kb._record_task_failure(
+            conn,
+            source_id,
+            "Iteration budget exhausted (140/140)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "automation_recovery"
+        assert _reconciliation_tasks(conn) == []
+
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", real_enqueue)
+        kb._dispatch_once_locked(conn, dry_run=True, max_spawn=0)
+
+        recoveries = _reconciliation_tasks(conn)
+        assert len(recoveries) == 1
+        assert recoveries[0].status == "ready"
+        assert recoveries[0].created_by == "blocker-reconciler"
+        assert recoveries[0].idempotency_key and source_id in recoveries[0].idempotency_key
+        assert any(
+            event.kind == "reconciliation_enqueued"
+            for event in kb.list_events(conn, source_id)
+        )
+
+        kb._dispatch_once_locked(conn, dry_run=True, max_spawn=0)
+        assert len(_reconciliation_tasks(conn)) == 1
+
+
+def test_recovery_backfill_is_bounded_and_drains_across_ticks(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        real_enqueue = kb.enqueue_blocker_reconciliation
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", lambda *_args: None)
+        total = kb.RECONCILIATION_BACKFILL_BATCH_LIMIT + 2
+        source_ids: list[str] = []
+        for index in range(total):
+            source_id = _running(
+                conn,
+                title=f"missed recovery hook {index}",
+                max_retries=1,
+            )
+            source_ids.append(source_id)
+            assert kb._record_task_failure(
+                conn,
+                source_id,
+                "Iteration budget exhausted (140/140)",
+                outcome="timed_out",
+                release_claim=True,
+                end_run=True,
+            )
+        assert _reconciliation_tasks(conn) == []
+
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", real_enqueue)
+        first = kb.reconcile_orphaned_automation_recovery(conn)
+        second = kb.reconcile_orphaned_automation_recovery(conn)
+        events_before_third = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events"
+        ).fetchone()["n"]
+        third = kb.reconcile_orphaned_automation_recovery(conn)
+        events_after_third = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events"
+        ).fetchone()["n"]
+
+        assert len(first) == kb.RECONCILIATION_BACKFILL_BATCH_LIMIT
+        assert len(second) == 2
+        assert third == []
+        assert events_after_third == events_before_third
+        assert len(_reconciliation_tasks(conn)) == total
+
+        for source_id in source_ids:
+            cursor = conn.execute(
+                "SELECT recovery_backfill_after FROM tasks WHERE id=?",
+                (source_id,),
+            ).fetchone()["recovery_backfill_after"]
+            scan = conn.execute(
+                "SELECT MAX(id) AS id FROM task_events WHERE task_id=? "
+                "AND kind='reconciliation_backfill_repaired'",
+                (source_id,),
+            ).fetchone()["id"]
+            assert cursor == scan
+
+
+def test_database_trigger_marks_event_written_by_pre_hook_process(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn, title="event from stale daemon", max_retries=1)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='automation_recovery' WHERE id=?",
+                (source_id,),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'gave_up', '{}', 1)",
+                (source_id,),
+            )
+
+        pending = conn.execute(
+            "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+            (source_id,),
+        ).fetchone()["recovery_backfill_pending"]
+        repaired = kb.reconcile_orphaned_automation_recovery(conn)
+
+        assert pending == 1
+        assert len(repaired) == 1
+
+
+def test_database_trigger_does_not_recurse_on_reconciliation_wrapper(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        wrapper_id = kb.create_task(
+            conn,
+            title="reconciliation wrapper",
+            idempotency_key=f"{kb.RECONCILIATION_IDEMPOTENCY_PREFIX}board:source:1",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='automation_recovery' WHERE id=?",
+                (wrapper_id,),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'gave_up', '{}', 1)",
+                (wrapper_id,),
+            )
+
+        pending = conn.execute(
+            "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+            (wrapper_id,),
+        ).fetchone()["recovery_backfill_pending"]
+
+        assert pending == 0
+        assert kb.reconcile_orphaned_automation_recovery(conn) == []
+
+
+def test_recovery_backfill_selection_uses_partial_bounded_index(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM tasks "
+            "INDEXED BY idx_tasks_recovery_source_scan "
+            "WHERE status='automation_recovery' AND recovery_backfill_pending=1 "
+            "AND (idempotency_key IS NULL "
+            "OR idempotency_key NOT LIKE 'kanban-reconcile:%') "
+            "ORDER BY recovery_backfill_after, created_at, id LIMIT ?",
+            (kb.RECONCILIATION_BACKFILL_BATCH_LIMIT,),
+        ).fetchall()
+        event_kinds = sorted(kb.RECONCILIATION_EVENT_KINDS)
+        placeholders = ",".join("?" for _ in event_kinds)
+        event_plan = conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT MAX(id) AS id FROM task_events "
+            f"INDEXED BY idx_events_task_kind_id WHERE task_id=? "
+            f"AND kind IN ({placeholders})",
+            ("t_source", *event_kinds),
+        ).fetchall()
+
+        assert any(
+            "idx_tasks_recovery_source_scan" in row["detail"] for row in plan
+        )
+        assert any(
+            "idx_events_task_kind_id" in row["detail"] for row in event_plan
+        )
+
+
+def test_recovery_backfill_settles_coalesced_candidate_without_starvation(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        real_enqueue = kb.enqueue_blocker_reconciliation
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", lambda *_args: None)
+        total = kb.RECONCILIATION_BACKFILL_BATCH_LIMIT + 2
+        source_ids: list[str] = []
+        for index in range(total):
+            source_id = _running(
+                conn,
+                title=f"missed recovery hook {index}",
+                max_retries=1,
+            )
+            source_ids.append(source_id)
+            assert kb._record_task_failure(
+                conn,
+                source_id,
+                "Iteration budget exhausted (140/140)",
+                outcome="timed_out",
+                release_claim=True,
+                end_run=True,
+            )
+
+        with kb.write_txn(conn):
+            for position, source_id in enumerate(source_ids, start=1):
+                conn.execute(
+                    "UPDATE tasks SET created_at=? WHERE id=?",
+                    (position, source_id),
+                )
+
+        stubborn_id = source_ids[0]
+        stubborn_event_ids = {
+            event.id for event in kb.list_events(conn, stubborn_id)
+            if event.kind in kb.RECONCILIATION_EVENT_KINDS
+        }
+
+        def coalesce_one(db: sqlite3.Connection, event_id: int) -> str | None:
+            if event_id in stubborn_event_ids:
+                return "t_existing_active_reconciliation"
+            return real_enqueue(db, event_id)
+
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", coalesce_one)
+        first = kb.reconcile_orphaned_automation_recovery(conn)
+        second = kb.reconcile_orphaned_automation_recovery(conn)
+        events_before_third = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events"
+        ).fetchone()["n"]
+        third = kb.reconcile_orphaned_automation_recovery(conn)
+        events_after_third = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events"
+        ).fetchone()["n"]
+
+        assert len(first) == kb.RECONCILIATION_BACKFILL_BATCH_LIMIT - 1
+        assert len(second) == 2
+        assert third == []
+        assert events_after_third == events_before_third
+        assert len(_reconciliation_tasks(conn)) == total - 1
+        deferred = [
+            event for event in kb.list_events(conn, stubborn_id)
+            if event.kind == "reconciliation_backfill_deferred"
+        ]
+        assert deferred
+        assert all(
+            event.payload
+            and event.payload.get("reason") == "coalesced_without_exact_occurrence"
+            for event in deferred
+        )
+        assert conn.execute(
+            "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+            (stubborn_id,),
+        ).fetchone()["recovery_backfill_pending"] == 0
+
+
+def test_newer_trigger_arriving_during_backfill_remains_pending(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        real_enqueue = kb.enqueue_blocker_reconciliation
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", lambda *_args: None)
+        source_id = _running(conn, title="concurrent recovery event", max_retries=1)
+        assert kb._record_task_failure(
+            conn,
+            source_id,
+            "Iteration budget exhausted (140/140)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+        )
+
+        def append_newer_event(db: sqlite3.Connection, _event_id: int) -> str:
+            with kb.write_txn(db, allow_nested=True):
+                db.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                    "VALUES (?, 'gave_up', '{\"reason\":\"newer\"}', 2)",
+                    (source_id,),
+                )
+            return "t_existing_active_reconciliation"
+
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", append_newer_event)
+        assert kb.reconcile_orphaned_automation_recovery(conn) == []
+        assert conn.execute(
+            "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+            (source_id,),
+        ).fetchone()["recovery_backfill_pending"] == 1
+        latest_event_id = conn.execute(
+            "SELECT MAX(id) AS id FROM task_events WHERE task_id=? "
+            "AND kind IN ('gave_up', 'timed_out')",
+            (source_id,),
+        ).fetchone()["id"]
+        assert conn.execute(
+            "SELECT recovery_backfill_after FROM tasks WHERE id=?",
+            (source_id,),
+        ).fetchone()["recovery_backfill_after"] == latest_event_id
+        assert not any(
+            event.kind.startswith("reconciliation_backfill_")
+            for event in kb.list_events(conn, source_id)
+        )
+
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", real_enqueue)
+        repaired = kb.reconcile_orphaned_automation_recovery(conn)
+
+        assert len(repaired) == 1
+        assert conn.execute(
+            "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+            (source_id,),
+        ).fetchone()["recovery_backfill_pending"] == 0
+
+
+def test_concurrent_backfills_settle_pending_source_once(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    real_enqueue = kb.enqueue_blocker_reconciliation
+    monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", lambda *_args: None)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn, title="concurrent backfill source", max_retries=1)
+        assert kb._record_task_failure(
+            conn,
+            source_id,
+            "Iteration budget exhausted (140/140)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+        )
+
+    barrier = threading.Barrier(2)
+    monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", real_enqueue)
+    results: list[list[str]] = []
+    errors: list[BaseException] = []
+
+    def run_backfill() -> None:
+        try:
+            barrier.wait(timeout=10)
+            with kb.connect_closing() as db:
+                results.append(kb.reconcile_orphaned_automation_recovery(db))
+        except BaseException as exc:  # surfaced below with both thread outcomes
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run_backfill) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    with kb.connect_closing() as conn:
+        settlement_events = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind in {
+                "reconciliation_backfill_repaired",
+                "reconciliation_backfill_deferred",
+            }
+        ]
+        assert len(settlement_events) == 1
+        assert sum(len(result) for result in results) == 1
+        assert conn.execute(
+            "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+            (source_id,),
+        ).fetchone()["recovery_backfill_pending"] == 0
+
+
+def test_backfill_does_not_enqueue_before_acquiring_write_lock(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    real_enqueue = kb.enqueue_blocker_reconciliation
+    monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", lambda *_args: None)
+    with kb.connect_closing() as holder, kb.connect_closing() as contender:
+        source_id = _running(holder, title="write-lock backfill source", max_retries=1)
+        assert kb._record_task_failure(
+            holder,
+            source_id,
+            "Iteration budget exhausted (140/140)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+        )
+        enqueue_calls = 0
+
+        def counted_enqueue(db: sqlite3.Connection, event_id: int) -> str | None:
+            nonlocal enqueue_calls
+            enqueue_calls += 1
+            return real_enqueue(db, event_id)
+
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", counted_enqueue)
+        monkeypatch.setattr(kb, "_BUSY_MAX_RETRIES", 0)
+        contender.execute("PRAGMA busy_timeout=0")
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                kb.reconcile_orphaned_automation_recovery(contender)
+            assert enqueue_calls == 0
+            assert holder.execute(
+                "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+                (source_id,),
+            ).fetchone()["recovery_backfill_pending"] == 1
+            assert not any(
+                event.kind.startswith("reconciliation_backfill_")
+                for event in kb.list_events(holder, source_id)
+            )
+        finally:
+            holder.rollback()
+
+        settlement_updates: list[str] = []
+        contender.set_trace_callback(
+            lambda statement: settlement_updates.append(statement)
+            if (
+                "UPDATE tasks SET recovery_backfill_after=" in statement
+                and "recovery_backfill_pending=" in statement
+            ) else None
+        )
+        recovered = kb.reconcile_orphaned_automation_recovery(contender)
+        assert len(recovered) == 1
+        assert enqueue_calls == 1
+        assert len(settlement_updates) == 1
+        settlement_events = [
+            event for event in kb.list_events(contender, source_id)
+            if event.kind in {
+                "reconciliation_backfill_repaired",
+                "reconciliation_backfill_deferred",
+            }
+        ]
+        assert len(settlement_events) == 1
+        assert contender.execute(
+            "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+            (source_id,),
+        ).fetchone()["recovery_backfill_pending"] == 0
+
+
+def test_full_hot_batch_rotates_before_stable_pending_source(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        real_enqueue = kb.enqueue_blocker_reconciliation
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", lambda *_args: None)
+        source_ids: list[str] = []
+        for index in range(kb.RECONCILIATION_BACKFILL_BATCH_LIMIT + 1):
+            source_id = _running(
+                conn,
+                title=f"hot recovery source {index}",
+                max_retries=1,
+            )
+            source_ids.append(source_id)
+            assert kb._record_task_failure(
+                conn,
+                source_id,
+                "Iteration budget exhausted (140/140)",
+                outcome="timed_out",
+                release_claim=True,
+                end_run=True,
+            )
+
+        hot_ids = set(source_ids[:kb.RECONCILIATION_BACKFILL_BATCH_LIMIT])
+        stable_id = source_ids[-1]
+        with kb.write_txn(conn):
+            for position, source_id in enumerate(source_ids, start=1):
+                conn.execute(
+                    "UPDATE tasks SET created_at=? WHERE id=?",
+                    (position, source_id),
+                )
+
+        def retrigger_hot(db: sqlite3.Connection, event_id: int) -> str | None:
+            source_id = db.execute(
+                "SELECT task_id FROM task_events WHERE id=?", (event_id,),
+            ).fetchone()["task_id"]
+            if source_id in hot_ids:
+                with kb.write_txn(db, allow_nested=True):
+                    db.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                        "VALUES (?, 'gave_up', '{\"reason\":\"hot\"}', 2)",
+                        (source_id,),
+                    )
+                return "t_existing_active_reconciliation"
+            return real_enqueue(db, event_id)
+
+        monkeypatch.setattr(kb, "enqueue_blocker_reconciliation", retrigger_hot)
+        assert kb.reconcile_orphaned_automation_recovery(conn) == []
+        repaired = kb.reconcile_orphaned_automation_recovery(conn)
+
+        assert len(repaired) == 1
+        wrapper = kb.get_task(conn, repaired[0])
+        assert wrapper is not None
+        assert wrapper.idempotency_key and stable_id in wrapper.idempotency_key
+        assert conn.execute(
+            "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+            (stable_id,),
+        ).fetchone()["recovery_backfill_pending"] == 0
+
+
+def test_recovery_pending_trigger_is_refreshed_on_connect(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(conn, title="partially migrated recovery source")
+        with kb.write_txn(conn):
+            conn.execute(
+                f"DROP TRIGGER {kb.RECONCILIATION_BACKFILL_TRIGGER_NAME}"
+            )
+            conn.execute(
+                f"CREATE TRIGGER {kb.RECONCILIATION_BACKFILL_TRIGGER_NAME} "
+                "AFTER INSERT ON task_events BEGIN SELECT 1; END"
+            )
+            conn.execute(
+                "CREATE TRIGGER trg_recovery_backfill_pending "
+                "AFTER INSERT ON task_events BEGIN SELECT 1; END"
+            )
+            conn.execute(
+                "UPDATE tasks SET status='automation_recovery', "
+                "recovery_backfill_pending=0 WHERE id=?",
+                (source_id,),
+            )
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        trigger_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name=?",
+            (kb.RECONCILIATION_BACKFILL_TRIGGER_NAME,),
+        ).fetchone()["sql"]
+
+        assert "recovery_backfill_pending=1" in trigger_sql
+        assert "NEW.kind IN" in trigger_sql
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+            "AND name='trg_recovery_backfill_pending'"
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+            (source_id,),
+        ).fetchone()["recovery_backfill_pending"] == 1
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET recovery_backfill_pending=0 WHERE id=?",
+                (source_id,),
+            )
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT recovery_backfill_pending FROM tasks WHERE id=?",
+            (source_id,),
+        ).fetchone()["recovery_backfill_pending"] == 0
 
 
 def test_repeated_occurrence_coalesces_into_active_reconciliation(
@@ -2042,3 +2597,175 @@ def test_coalesced_generation_rejects_stale_verdict(
         current = kb.get_task(conn, recovery.id)
         assert current is not None
         assert current.status == "running"
+
+
+def _settle_source_via_backfill(conn, source_id: str, recovery_id: str) -> int:
+    """Run the real dispatcher backfill over a pending recovery source.
+
+    Returns the id of the benign ``reconciliation_backfill_repaired``
+    bookkeeping event the pass records on the source when the exact
+    occurrence already has its wrapper (the live t_b98c600a shape).
+    """
+    recovered = kb.reconcile_orphaned_automation_recovery(conn)
+    assert recovered == [recovery_id]
+    repairs = [
+        event
+        for event in kb.list_events(conn, source_id)
+        if event.kind == "reconciliation_backfill_repaired"
+    ]
+    assert len(repairs) == 1
+    payload = repairs[0].payload or {}
+    assert payload.get("reason") == "exact_occurrence_present"
+    return int(repairs[0].id)
+
+
+def test_backfill_repair_after_enqueue_accepts_human_gate_verdict(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A benign exact_occurrence_present repair must not invalidate the verdict."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="operator decision", kind="needs_input")
+        recovery = _reconciliation_tasks(conn)[0]
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        repair_event_id = _settle_source_via_backfill(conn, source_id, recovery.id)
+        assert repair_event_id > source_event_id
+
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body="Mandatory recovery evidence recorded from current source truth.",
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="human gate affirmed",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "genuine_human_gate",
+                "human_action": "Choose the region strategy.",
+                "attention_owner": "Kevin Yan",
+                "why_automation_cannot_perform": "Only Kevin can make the compliance call.",
+                "current_evidence": "The provider constraint is still present on current main.",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "blocked"
+        outcomes = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert len(outcomes) == 1
+        outcome_payload = outcomes[0].payload or {}
+        assert outcome_payload.get("outcome") == "genuine_human_gate"
+        assert outcome_payload.get("stale") is not True
+
+
+def test_backfill_repair_after_enqueue_accepts_reconciliation_failed_verdict(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconciliation_failed outcome path must survive the same repair."""
+    _enable(monkeypatch)
+    with kb.connect_closing(conn) if False else kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        repair_event_id = _settle_source_via_backfill(conn, source_id, recovery.id)
+        assert repair_event_id > source_event_id
+
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="automation could not clear it",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "reconciliation_failed",
+                "error": "sanitized automation failure",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        outcomes = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert len(outcomes) == 1
+        outcome_payload = outcomes[0].payload or {}
+        assert outcome_payload.get("outcome") == "reconciliation_failed"
+        assert outcome_payload.get("error") == "sanitized automation failure"
+        assert outcome_payload.get("stale") is not True
+
+
+def test_backfill_repair_event_is_not_a_citable_occurrence(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Citing the repair bookkeeping id itself stays rejected as stale."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        repair_event_id = _settle_source_via_backfill(conn, source_id, recovery.id)
+
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        with pytest.raises(ValueError, match="stale"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="wrong occurrence cited",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": repair_event_id,
+                    "outcome": "reconciliation_failed",
+                    "error": "must stay rejected",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        current = kb.get_task(conn, recovery.id)
+        assert current is not None and current.status == "running"
+
+
+def test_backfill_repair_does_not_mask_genuine_later_occurrence(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real later blocker after the repair still rejects the stale verdict."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="first failure", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        original_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        _settle_source_via_backfill(conn, source_id, recovery.id)
+
+        with kb.write_txn(conn):
+            newest_event_id = kb._append_event(
+                conn, source_id, "gave_up", {"error": "new terminal failure"},
+            )
+        assert newest_event_id != original_event_id
+        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is not None
+        with pytest.raises(ValueError, match="stale"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="obsolete result",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": original_event_id,
+                    "outcome": "reconciliation_failed",
+                    "error": "superseded by a genuine later occurrence",
+                }},
+            )
+        current = kb.get_task(conn, recovery.id)
+        assert current is not None and current.status == "running"

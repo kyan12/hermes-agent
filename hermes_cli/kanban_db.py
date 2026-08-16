@@ -164,6 +164,14 @@ RECONCILIATION_OUTCOMES = frozenset({
 # complete. The terminal attempt escalates one precise operator action instead
 # of spawning a fourth recovery generation.
 RECONCILIATION_SOURCE_FAILURE_LIMIT = 3
+# Keep the dispatcher tick bounded even after a long-lived pre-hook process
+# leaves a large recovery backlog. Later ticks continue from the remaining
+# rows because each repaired occurrence is idempotently excluded.
+RECONCILIATION_BACKFILL_BATCH_LIMIT = 16
+# Bump the suffix whenever the trigger event set or body changes. The versioned
+# name makes installation/seed a one-time migration instead of rearming every
+# settled recovery source on each process restart.
+RECONCILIATION_BACKFILL_TRIGGER_NAME = "trg_recovery_backfill_pending_v1"
 
 # _append_event runs inside write transactions. Queue trigger ids in a
 # transaction-local ContextVar, then drain before the outer COMMIT so the
@@ -1479,7 +1487,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     wake_at              INTEGER,
     schedule_kind        TEXT,
     wake_job_id          TEXT,
-    checkpoint_at        INTEGER
+    checkpoint_at        INTEGER,
+    -- Durable round-robin cursor for bounded recovery backfill. Zero means the
+    -- source has not been inspected by a post-hook dispatcher yet.
+    recovery_backfill_after INTEGER NOT NULL DEFAULT 0,
+    -- Set by a database trigger whenever a recovery-trigger event is inserted,
+    -- including by an older process that predates the Python enqueue hook.
+    recovery_backfill_pending INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2705,6 +2719,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         ("schedule_kind", "schedule_kind TEXT"),
         ("wake_job_id", "wake_job_id TEXT"),
         ("checkpoint_at", "checkpoint_at INTEGER"),
+        (
+            "recovery_backfill_after",
+            "recovery_backfill_after INTEGER NOT NULL DEFAULT 0",
+        ),
     ):
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
@@ -2745,6 +2763,86 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_task_kind_id "
+        "ON task_events(task_id, kind, id DESC)"
+    )
+    event_kinds_sql = ",".join(
+        "'" + kind.replace("'", "''") + "'"
+        for kind in sorted(RECONCILIATION_EVENT_KINDS)
+    )
+    desired_trigger_sql = (
+        f"CREATE TRIGGER {RECONCILIATION_BACKFILL_TRIGGER_NAME} "
+        "AFTER INSERT ON task_events "
+        f"WHEN NEW.kind IN ({event_kinds_sql}) BEGIN "
+        "UPDATE tasks SET recovery_backfill_pending=1 "
+        "WHERE id=NEW.task_id AND (idempotency_key IS NULL "
+        "OR idempotency_key NOT LIKE 'kanban-reconcile:%'); END"
+    )
+    # Eligibility must be read under the same write lock as installation and
+    # seeding. Otherwise two concurrent initializers can both decide the
+    # version is absent and the later one can rearm sources settled by the
+    # first process.
+    with write_txn(conn, allow_nested=True):
+        pending_column_exists = "recovery_backfill_pending" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        trigger_rows = {
+            row["name"]: row["sql"] or ""
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        current_sql = trigger_rows.get(RECONCILIATION_BACKFILL_TRIGGER_NAME, "")
+        trigger_current = (
+            " ".join(current_sql.split()) == " ".join(desired_trigger_sql.split())
+        )
+        install_trigger = not pending_column_exists or not trigger_current
+        legacy_trigger_exists = "trg_recovery_backfill_pending" in trigger_rows
+        if install_trigger or legacy_trigger_exists:
+            _add_column_if_missing(
+                conn,
+                "tasks",
+                "recovery_backfill_pending",
+                "recovery_backfill_pending INTEGER NOT NULL DEFAULT 0",
+            )
+            conn.execute(
+                "DROP TRIGGER IF EXISTS trg_recovery_backfill_pending"
+            )
+            if install_trigger:
+                conn.execute(
+                    f"DROP TRIGGER IF EXISTS {RECONCILIATION_BACKFILL_TRIGGER_NAME}"
+                )
+                conn.execute(desired_trigger_sql)
+                # Seed only when installing a new trigger version. If a prior
+                # process crashed after adding the column but before completing
+                # this transaction, the versioned trigger is absent on retry.
+                # Synthetic/minimal migration fixtures may omit core columns;
+                # a tasks table without status cannot hold recovery sources.
+                seed_cols = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(tasks)")
+                }
+                if {"status", "idempotency_key"} <= seed_cols:
+                    conn.execute(
+                        "UPDATE tasks SET recovery_backfill_pending=1 "
+                        "WHERE status='automation_recovery' "
+                        "AND (idempotency_key IS NULL "
+                        "OR idempotency_key NOT LIKE 'kanban-reconcile:%')"
+                    )
+
+    final_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if {
+        "status", "recovery_backfill_after", "recovery_backfill_pending",
+        "created_at", "idempotency_key", "id",
+    } <= final_cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_recovery_source_scan "
+            "ON tasks(recovery_backfill_after, created_at, id) "
+            "WHERE status='automation_recovery' AND recovery_backfill_pending=1 "
+            "AND (idempotency_key IS NULL "
+            "OR idempotency_key NOT LIKE 'kanban-reconcile:%')"
+        )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -4125,6 +4223,124 @@ def enqueue_blocker_reconciliation(
     return recovery_id
 
 
+def reconcile_orphaned_automation_recovery(conn: sqlite3.Connection) -> list[str]:
+    """Backfill recovery wrappers missed by an older long-lived dispatcher.
+
+    Reconciliation is normally created atomically with the triggering event.
+    A dispatcher process that imported Hermes before that hook was deployed can
+    still write a durable ``gave_up`` event and park the source in
+    ``automation_recovery`` without creating its wrapper. Scan only that
+    terminal machine-owned state, replay the newest trigger idempotently, and
+    let the normal enqueue path enforce coalescing and generation fences.
+    """
+    if not _blocker_reconciler_config()["enabled"]:
+        return []
+
+    event_kinds = sorted(RECONCILIATION_EVENT_KINDS)
+    placeholders = ",".join("?" for _ in event_kinds)
+    board = _board_slug_for_connection(conn)
+
+    def latest_trigger_event_id(source_id: str) -> Optional[int]:
+        row = conn.execute(
+            f"SELECT MAX(id) AS id FROM task_events "
+            f"INDEXED BY idx_events_task_kind_id "
+            f"WHERE task_id=? AND kind IN ({placeholders})",
+            (source_id, *event_kinds),
+        ).fetchone()
+        return int(row["id"]) if row is not None and row["id"] is not None else None
+
+    recovered: list[str] = []
+    sources = conn.execute(
+        "SELECT id FROM tasks INDEXED BY idx_tasks_recovery_source_scan "
+        "WHERE status='automation_recovery' AND recovery_backfill_pending=1 "
+        "AND (idempotency_key IS NULL "
+        "OR idempotency_key NOT LIKE 'kanban-reconcile:%') "
+        "ORDER BY recovery_backfill_after, created_at, id LIMIT ?",
+        (RECONCILIATION_BACKFILL_BATCH_LIMIT,),
+    ).fetchall()
+    for source in sources:
+        source_id = source["id"]
+        with write_txn(conn):
+            current = conn.execute(
+                "SELECT status, recovery_backfill_pending FROM tasks WHERE id=?",
+                (source_id,),
+            ).fetchone()
+            if (
+                current is None
+                or current["status"] != "automation_recovery"
+                or current["recovery_backfill_pending"] != 1
+            ):
+                continue
+            event_id = latest_trigger_event_id(source_id)
+            exact_key = (
+                f"{RECONCILIATION_IDEMPOTENCY_PREFIX}{board}:{source_id}:{event_id}"
+                if event_id is not None else None
+            )
+            exact = (
+                conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key=? LIMIT 1",
+                    (exact_key,),
+                ).fetchone()
+                if exact_key is not None else None
+            )
+            recovery_id = (
+                enqueue_blocker_reconciliation(conn, event_id)
+                if event_id is not None and exact is None else None
+            )
+            exact = (
+                conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key=? LIMIT 1",
+                    (exact_key,),
+                ).fetchone()
+                if exact_key is not None else None
+            )
+            settlement_recovery_id = exact["id"] if exact is not None else None
+            deferred_reason = None
+            if event_id is None:
+                deferred_reason = "missing_trigger_event"
+            elif exact is None:
+                deferred_reason = (
+                    "coalesced_without_exact_occurrence"
+                    if recovery_id is not None else "enqueue_rejected"
+                )
+            latest_event_id = latest_trigger_event_id(source_id)
+            if latest_event_id != event_id:
+                # A hot source must move to the back of the durable pending
+                # queue. Keep pending=1 but advance with the monotonic event id
+                # so it cannot monopolize every bounded dispatcher batch.
+                if latest_event_id is not None:
+                    conn.execute(
+                        "UPDATE tasks SET recovery_backfill_after=? WHERE id=? "
+                        "AND status='automation_recovery' "
+                        "AND recovery_backfill_pending=1",
+                        (latest_event_id, source_id),
+                    )
+                continue
+            if latest_event_id == event_id:
+                scan_event_id = _append_event(
+                    conn,
+                    source_id,
+                    (
+                        "reconciliation_backfill_deferred"
+                        if deferred_reason is not None
+                        else "reconciliation_backfill_repaired"
+                    ),
+                    {
+                        "source_event_id": event_id,
+                        "reason": deferred_reason or "exact_occurrence_present",
+                    },
+                )
+                conn.execute(
+                    "UPDATE tasks SET recovery_backfill_after=?, "
+                    "recovery_backfill_pending=? WHERE id=? "
+                    "AND status='automation_recovery'",
+                    (scan_event_id, 0, source_id),
+                )
+                if settlement_recovery_id is not None:
+                    recovered.append(settlement_recovery_id)
+    return recovered
+
+
 def redrive_blocker_reconciliation(
     conn: sqlite3.Connection,
     source_task_id: str,
@@ -4334,10 +4550,17 @@ def _newer_reconciliation_source_event(
     floor_event_id = _reconciliation_assignment_floor(
         conn, source_task_id, recovery_task_id, source_event_id,
     )
+    # The backfill bookkeeping kinds are written by the kernel's own bounded
+    # repair pass (run_id NULL) to settle the durable pending cursor. They
+    # record that the assigned occurrence was found intact; they are not a
+    # material source change and must not invalidate a verdict for the newest
+    # coalesced blocker. A genuine later blocked/gave_up/etc. occurrence is
+    # never excluded here and still rejects the stale verdict.
     rows = conn.execute(
         "SELECT id, kind, payload, created_at, run_id FROM task_events WHERE task_id = ? AND id > ? "
         "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', "
         "'reconciliation_redriven', 'recovery_occurrence', "
+        "'reconciliation_backfill_repaired', 'reconciliation_backfill_deferred', "
         "'heartbeat', 'claim_extended') ORDER BY id ASC",
         (source_task_id, floor_event_id),
     ).fetchall()
@@ -11551,6 +11774,7 @@ def _dispatch_once_locked(
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     reconcile_stale_reconciliation_wrappers(conn)
+    reconcile_orphaned_automation_recovery(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
