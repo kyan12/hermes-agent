@@ -2597,3 +2597,175 @@ def test_coalesced_generation_rejects_stale_verdict(
         current = kb.get_task(conn, recovery.id)
         assert current is not None
         assert current.status == "running"
+
+
+def _settle_source_via_backfill(conn, source_id: str, recovery_id: str) -> int:
+    """Run the real dispatcher backfill over a pending recovery source.
+
+    Returns the id of the benign ``reconciliation_backfill_repaired``
+    bookkeeping event the pass records on the source when the exact
+    occurrence already has its wrapper (the live t_b98c600a shape).
+    """
+    recovered = kb.reconcile_orphaned_automation_recovery(conn)
+    assert recovered == [recovery_id]
+    repairs = [
+        event
+        for event in kb.list_events(conn, source_id)
+        if event.kind == "reconciliation_backfill_repaired"
+    ]
+    assert len(repairs) == 1
+    payload = repairs[0].payload or {}
+    assert payload.get("reason") == "exact_occurrence_present"
+    return int(repairs[0].id)
+
+
+def test_backfill_repair_after_enqueue_accepts_human_gate_verdict(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A benign exact_occurrence_present repair must not invalidate the verdict."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="operator decision", kind="needs_input")
+        recovery = _reconciliation_tasks(conn)[0]
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        repair_event_id = _settle_source_via_backfill(conn, source_id, recovery.id)
+        assert repair_event_id > source_event_id
+
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body="Mandatory recovery evidence recorded from current source truth.",
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="human gate affirmed",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "genuine_human_gate",
+                "human_action": "Choose the region strategy.",
+                "attention_owner": "Kevin Yan",
+                "why_automation_cannot_perform": "Only Kevin can make the compliance call.",
+                "current_evidence": "The provider constraint is still present on current main.",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "blocked"
+        outcomes = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert len(outcomes) == 1
+        outcome_payload = outcomes[0].payload or {}
+        assert outcome_payload.get("outcome") == "genuine_human_gate"
+        assert outcome_payload.get("stale") is not True
+
+
+def test_backfill_repair_after_enqueue_accepts_reconciliation_failed_verdict(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconciliation_failed outcome path must survive the same repair."""
+    _enable(monkeypatch)
+    with kb.connect_closing(conn) if False else kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        repair_event_id = _settle_source_via_backfill(conn, source_id, recovery.id)
+        assert repair_event_id > source_event_id
+
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="automation could not clear it",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "reconciliation_failed",
+                "error": "sanitized automation failure",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        outcomes = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert len(outcomes) == 1
+        outcome_payload = outcomes[0].payload or {}
+        assert outcome_payload.get("outcome") == "reconciliation_failed"
+        assert outcome_payload.get("error") == "sanitized automation failure"
+        assert outcome_payload.get("stale") is not True
+
+
+def test_backfill_repair_event_is_not_a_citable_occurrence(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Citing the repair bookkeeping id itself stays rejected as stale."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        repair_event_id = _settle_source_via_backfill(conn, source_id, recovery.id)
+
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        with pytest.raises(ValueError, match="stale"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="wrong occurrence cited",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": repair_event_id,
+                    "outcome": "reconciliation_failed",
+                    "error": "must stay rejected",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        current = kb.get_task(conn, recovery.id)
+        assert current is not None and current.status == "running"
+
+
+def test_backfill_repair_does_not_mask_genuine_later_occurrence(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real later blocker after the repair still rejects the stale verdict."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="first failure", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        original_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        _settle_source_via_backfill(conn, source_id, recovery.id)
+
+        with kb.write_txn(conn):
+            newest_event_id = kb._append_event(
+                conn, source_id, "gave_up", {"error": "new terminal failure"},
+            )
+        assert newest_event_id != original_event_id
+        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is not None
+        with pytest.raises(ValueError, match="stale"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="obsolete result",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": original_event_id,
+                    "outcome": "reconciliation_failed",
+                    "error": "superseded by a genuine later occurrence",
+                }},
+            )
+        current = kb.get_task(conn, recovery.id)
+        assert current is not None and current.status == "running"

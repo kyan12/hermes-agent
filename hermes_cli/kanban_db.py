@@ -4543,10 +4543,17 @@ def _newer_reconciliation_source_event(
     floor_event_id = _reconciliation_assignment_floor(
         conn, source_task_id, recovery_task_id, source_event_id,
     )
+    # The backfill bookkeeping kinds are written by the kernel's own bounded
+    # repair pass (run_id NULL) to settle the durable pending cursor. They
+    # record that the assigned occurrence was found intact; they are not a
+    # material source change and must not invalidate a verdict for the newest
+    # coalesced blocker. A genuine later blocked/gave_up/etc. occurrence is
+    # never excluded here and still rejects the stale verdict.
     rows = conn.execute(
         "SELECT id, kind, payload, created_at, run_id FROM task_events WHERE task_id = ? AND id > ? "
         "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', "
         "'reconciliation_redriven', 'recovery_occurrence', "
+        "'reconciliation_backfill_repaired', 'reconciliation_backfill_deferred', "
         "'heartbeat', 'claim_extended') ORDER BY id ASC",
         (source_task_id, floor_event_id),
     ).fetchall()
