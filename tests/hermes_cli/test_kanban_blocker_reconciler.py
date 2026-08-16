@@ -4304,3 +4304,49 @@ def test_multi_marker_occurrence_key_stamped_still_invalidates(
                 expected_run_id=claimed.current_run_id,
             )
         assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_stamped_link_recorded_after_run_end_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Frozen-clock run-end fence: a link stamped with run R1 but RECORDED
+    after R1's durable run-ending event (same wall-clock second) is a
+    post-mortem write, not R1's topology mutation, and stays material."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert first is not None and first.current_run_id is not None
+        first_run_id = int(first.current_run_id)
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        # Post-mortem stamped write: recorded after the run-ending event but
+        # inside the same wall-clock second, so only durable event ordering
+        # can reject it.
+        unkeyed_id = kb.create_task(
+            conn, title="unkeyed continuation", assignee="code-crab",
+        )
+        kb.link_tasks(
+            conn,
+            unkeyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=first_run_id,
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None and second.current_run_id is not None
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="retry verdict",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=second.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
