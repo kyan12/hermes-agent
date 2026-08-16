@@ -2817,12 +2817,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 # Seed only when installing a new trigger version. If a prior
                 # process crashed after adding the column but before completing
                 # this transaction, the versioned trigger is absent on retry.
-                conn.execute(
-                    "UPDATE tasks SET recovery_backfill_pending=1 "
-                    "WHERE status='automation_recovery' "
-                    "AND (idempotency_key IS NULL "
-                    "OR idempotency_key NOT LIKE 'kanban-reconcile:%')"
-                )
+                # Synthetic/minimal migration fixtures may omit core columns;
+                # a tasks table without status cannot hold recovery sources.
+                seed_cols = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(tasks)")
+                }
+                if {"status", "idempotency_key"} <= seed_cols:
+                    conn.execute(
+                        "UPDATE tasks SET recovery_backfill_pending=1 "
+                        "WHERE status='automation_recovery' "
+                        "AND (idempotency_key IS NULL "
+                        "OR idempotency_key NOT LIKE 'kanban-reconcile:%')"
+                    )
 
     final_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if {
