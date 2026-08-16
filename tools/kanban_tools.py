@@ -1671,7 +1671,20 @@ def _handle_link(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+            # Stamp the calling worker's exact task/run provenance (derived
+            # from the dispatcher-set env, never from caller args) so the
+            # reconciliation validator can recognize the worker's own
+            # protocol-required topology mutations on a source task.
+            origin_task_id = os.environ.get("HERMES_KANBAN_TASK") or None
+            kb.link_tasks(
+                conn,
+                parent_id=parent_id,
+                child_id=child_id,
+                origin_task_id=origin_task_id,
+                origin_run_id=(
+                    _worker_run_id(origin_task_id) if origin_task_id else None
+                ),
+            )
             return _ok(parent_id=parent_id, child_id=child_id)
         finally:
             conn.close()
