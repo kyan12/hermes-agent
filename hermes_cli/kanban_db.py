@@ -4717,19 +4717,22 @@ def _is_reconciliation_owned_link(
                 return False
         else:
             # Run-end fence — durable event ordering AND the recorded window
-            # must both hold.  Event ordering is exact even when the link and
-            # the run-ending event share one wall-clock second: a link
-            # recorded after the run's durable ending event is a post-mortem
-            # write, not that run's topology mutation.  The recorded window
-            # independently rejects a link whose durable timestamp lies
-            # outside the stamped run's lifetime.
+            # must both hold, and the durable ending event must EXIST.  A
+            # settled run without its ending event (deleted, lost, or a
+            # forged run row) cannot vouch on the weaker recorded-window
+            # evidence alone: fail closed.  Event ordering is exact even
+            # when the link and the run-ending event share one wall-clock
+            # second: a link recorded after the run's durable ending event
+            # is a post-mortem write, not that run's topology mutation.  The
+            # recorded window independently rejects a link whose durable
+            # timestamp lies outside the stamped run's lifetime.
             ending = conn.execute(
                 "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
                 "AND kind IN ('dependency_wait', 'blocked', 'gave_up', 'completed') "
                 "ORDER BY id LIMIT 1",
                 (recovery_task_id, origin_run_id),
             ).fetchone()
-            if ending is not None and int(event["id"]) > int(ending["id"]):
+            if ending is None or int(event["id"]) > int(ending["id"]):
                 return False
             if (
                 run["ended_at"] is None
