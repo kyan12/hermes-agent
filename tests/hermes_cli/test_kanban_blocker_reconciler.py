@@ -2023,6 +2023,73 @@ def test_reconciliation_owned_comment_does_not_invalidate_original_occurrence(
         )
 
 
+def test_prior_run_reconciler_evidence_comment_remains_non_material_on_retry(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="release closeout", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+
+        continuation_id = kb.create_task(conn, title="bounded closeout", assignee="code-crab")
+        kb.link_tasks(conn, continuation_id, source_id)
+        continuation = kb.claim_task(conn, continuation_id, claimer="code-crab")
+        assert continuation is not None
+        assert kb.complete_task(
+            conn, continuation_id, summary="closeout passed",
+            expected_run_id=continuation.current_run_id,
+        )
+
+        prior = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert prior is not None and prior.current_run_id is not None
+        rollout_id = kb.create_task(conn, title="guard rollout", assignee="code-crab")
+        kb.link_tasks(conn, rollout_id, recovery.id)
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=(
+                f"Reconciliation evidence for source event {source_event_id}: "
+                f"continuation {continuation_id} completed."
+            ),
+            origin_task_id=recovery.id,
+            origin_run_id=prior.current_run_id,
+        )
+        evidence_event = [
+            event for event in kb.list_events(conn, source_id) if event.kind == "commented"
+        ][-1]
+        assert evidence_event.run_id == prior.current_run_id
+        assert kb.block_task(
+            conn,
+            recovery.id,
+            reason="waiting for guard rollout",
+            kind="dependency",
+            expected_run_id=prior.current_run_id,
+        )
+        assert kb.complete_task(conn, rollout_id, summary="guard activated")
+        kb.recompute_ready(conn)
+
+        current = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert current is not None and current.current_run_id is not None
+        assert current.current_run_id != prior.current_run_id
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="prior-run evidence remains valid",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/completed",
+                "continuation_task_id": continuation_id,
+            }},
+            expected_run_id=current.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "done"
+
+
 def test_legacy_reconciler_evidence_comment_is_tied_to_active_recovery_run(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

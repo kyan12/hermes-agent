@@ -4658,7 +4658,6 @@ def _is_reconciliation_evidence_comment(
         recovery = get_task(conn, recovery_task_id)
         if (
             recovery is None
-            or recovery.current_run_id != origin_run_id
             or origin_task_id != recovery_task_id
             or event["run_id"] != origin_run_id
         ):
@@ -4668,12 +4667,21 @@ def _is_reconciliation_evidence_comment(
             "WHERE id = ? AND task_id = ?",
             (origin_run_id, recovery_task_id),
         ).fetchone()
-        return bool(
-            run is not None
-            and run["profile"] == comment["author"]
-            and run["status"] == "running"
-            and run["ended_at"] is None
-            and int(run["started_at"]) <= int(comment["created_at"])
+        if (
+            run is None
+            or run["profile"] != comment["author"]
+            or run["status"] not in {"running", "blocked", "completed"}
+            or int(run["started_at"]) > int(comment["created_at"])
+        ):
+            return False
+        if run["status"] == "running":
+            return (
+                recovery.current_run_id == origin_run_id
+                and run["ended_at"] is None
+            )
+        return (
+            run["ended_at"] is not None
+            and int(comment["created_at"]) <= int(run["ended_at"])
         )
 
     # Bounded compatibility for already-durable pre-provenance events.  The
