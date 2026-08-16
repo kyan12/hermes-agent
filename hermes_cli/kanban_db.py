@@ -4740,9 +4740,10 @@ def _is_reconciliation_owned_link(
             ):
                 return False
         # Run provenance alone cannot vouch for occurrence-shaped keys: a
-        # parent whose idempotency key cites THIS source with an event-N
-        # marker must name the cited occurrence, or the link carries the
-        # wrong source-event provenance and stays material.
+        # parent whose idempotency key carries ANY event-N marker must name
+        # the cited occurrence, no matter which source the key cites, or
+        # the link carries the wrong source-event provenance and stays
+        # material.
         parent = get_task(conn, parent_id)
         if parent is not None:
             if _idempotency_key_cites_other_occurrence(
@@ -4814,12 +4815,15 @@ def _idempotency_key_cites_occurrence(
 def _idempotency_key_cites_other_occurrence(
     key: str, source_task_id: str, source_event_id: int
 ) -> bool:
-    """True when the key cites THIS source with at least one occurrence
-    marker naming a DIFFERENT event id — wrong (or split) source-event
-    provenance for the cited occurrence.  Keys without a source citation or
-    without an event marker are not occurrence-shaped and impose no binding."""
-    if not re.search(rf"(?<![0-9A-Za-z_]){re.escape(source_task_id)}(?![0-9A-Za-z_])", key):
-        return False
+    """True when the key carries ANY occurrence marker naming a DIFFERENT
+    event id than the cited occurrence — wrong (or split) occurrence
+    provenance, no matter which source task the key names.  A continuation
+    keyed for another source's occurrence (``reconcile-t_other-event-99-…``)
+    must never vouch for THIS occurrence.  Keys without an event marker are
+    not occurrence-shaped and impose no binding.  ``source_task_id`` is
+    retained for call-site symmetry with the legacy branch's citation
+    check."""
+    del source_task_id  # the marker binds regardless of which source is named
     markers = re.findall(r"(?<![0-9A-Za-z_])event-(\d+)(?![0-9])", key)
     return any(int(marker) != int(source_event_id) for marker in markers)
 

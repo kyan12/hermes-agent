@@ -3518,6 +3518,147 @@ def test_stamped_link_with_recovery_run_provenance_accepted(
         assert (outcomes[0].payload or {}).get("outcome") == "cleared/resumed"
 
 
+def test_stamped_link_with_other_source_occurrence_key_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Occurrence-shaped keys bind no matter WHICH source they name: a
+    stamped link whose parent key carries an event-N marker for a different
+    occurrence (here: another source's reconciliation continuation) holds
+    wrong-occurrence provenance for the cited occurrence and stays
+    material.  Run provenance alone cannot launder it."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        other_source_id = _running(conn, title="unrelated other source")
+        foreign_keyed_id = kb.create_task(
+            conn,
+            title="other source continuation",
+            assignee="code-crab",
+            idempotency_key=(
+                f"reconcile-{other_source_id}-event-{source_event_id + 1000}-continuation"
+            ),
+        )
+        kb.link_tasks(
+            conn,
+            foreign_keyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+@pytest.mark.parametrize(
+    ("outcome", "extra"),
+    (
+        ("backoff_scheduled", {"resume_at": 1999999999}),
+        ("genuine_human_gate", {
+            "human_action": "operator must rotate the key",
+            "attention_owner": "Kevin Yan",
+            "why_automation_cannot_perform": "credential rotation needs the human's 1Password unlock",
+            "current_evidence": "provider rejects the stored key with 401",
+        }),
+    ),
+)
+def test_no_topology_outcomes_accept_same_run_required_parent_link(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    extra: dict,
+) -> None:
+    """backoff_scheduled and genuine_human_gate also name no
+    continuation/dependency in their verdict metadata; the protocol-required
+    direct-parent link must not self-invalidate them either."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(conn, continuation_id, source_id)
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body="Reconciliation evidence: source re-read from current truth.",
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        verdict = {
+            "source_task_id": source_id,
+            "source_event_id": source_event_id,
+            "outcome": outcome,
+            **extra,
+        }
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="verdict with required link",
+            metadata={"reconciliation": verdict},
+            expected_run_id=claimed.current_run_id,
+        )
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        assert (outcomes[0].payload or {}).get("outcome") == outcome
+
+
+def test_cleared_resumed_accepts_prior_run_stamped_required_parent_link(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stamped prior-run shape: the required link was recorded by an earlier
+    (now dependency-blocked) run of the same recovery task WITH exact run
+    provenance; the retry run's cleared/resumed verdict for the original
+    occurrence must pass on the stamped branch, not the legacy fallback."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert first is not None and first.current_run_id is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(
+            conn,
+            continuation_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=first.current_run_id,
+        )
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None
+        assert second.current_run_id != first.current_run_id
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="source resumed from current truth",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=second.current_run_id,
+        )
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        assert (outcomes[0].payload or {}).get("outcome") == "cleared/resumed"
+
+
 def test_stamped_link_with_foreign_provenance_still_invalidates(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
