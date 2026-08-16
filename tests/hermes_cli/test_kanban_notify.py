@@ -35,6 +35,20 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["notifier_profile"] == "default"
 
 
+def _affirm_human_gate(conn, task_id: str, action: str) -> None:
+    """Create the only blocker event the notifier may surface to a user."""
+    assert kb.block_task(conn, task_id, reason=action, kind="needs_input")
+    assert kb.affirm_human_gate(
+        conn,
+        task_id,
+        attention_owner="Kevin Yan",
+        human_action=action,
+        why_automation_cannot_perform="The operator must authorize this action.",
+        current_evidence=f"Current policy requires Kevin to {action}.",
+        affirmed_by="test-operator",
+    )
+
+
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
     """delivery_mode persists; an explicit re-subscribe is last-write-wins, a
     ``None`` re-subscribe leaves the existing mode untouched, an unknown value
@@ -219,8 +233,8 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
             conn, task_id=active_tid, platform="telegram", chat_id="chat1",
             delivery_mode="notify+wake",
         )
-        kb.block_task(conn, passive_tid, reason="passive block")
-        kb.block_task(conn, active_tid, reason="active block")
+        _affirm_human_gate(conn, passive_tid, "passive block")
+        _affirm_human_gate(conn, active_tid, "active block")
     finally:
         conn.close()
 
@@ -283,7 +297,7 @@ async def test_notifier_plain_notify_never_wakes_even_with_session_id(kanban_hom
             session_id="origin-session-id",
         )
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
-        kb.block_task(conn, tid, reason="plain notify block")
+        _affirm_human_gate(conn, tid, "plain notify block")
     finally:
         conn.close()
 
@@ -384,7 +398,7 @@ async def test_notifier_wake_forwards_persisted_chat_type_and_user_id(kanban_hom
             user_id="op-42", chat_type="group", delivery_mode="wake",
             notifier_profile="owner-profile",
         )
-        kb.block_task(conn, tid, reason="group block")
+        _affirm_human_gate(conn, tid, "group block")
     finally:
         conn.close()
 
@@ -438,7 +452,7 @@ async def test_notifier_wake_only_skips_send_and_advances_cursor(kanban_home):
             conn, task_id=tid, platform="telegram", chat_id="chat1",
             delivery_mode="wake",
         )
-        kb.block_task(conn, tid, reason="wake only block")
+        _affirm_human_gate(conn, tid, "wake only block")
     finally:
         conn.close()
 
@@ -489,15 +503,14 @@ async def test_notifier_wake_only_skips_send_and_advances_cursor(kanban_home):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ["gave_up", "crashed", "timed_out"])
-async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
+async def test_notifier_silently_claims_abnormal_events_without_unsubscribing(
+    kind, kanban_home,
+):
     """
-    Event kinds gave_up / crashed / timed_out send a notification but DO
-    NOT delete the subscription. The dispatcher may respawn the task and
-    fire the same event kind again (e.g. a worker that crashes, gets
-    reclaimed, and crashes a second time); the user must hear about the
-    second event too. Subscriptions are removed only when the task hits
-    a truly final status (done / archived) — see the comment on
-    TERMINAL_KINDS in gateway/run.py and PR #21398.
+    Raw gave_up / crashed / timed_out events are automation-recovery signals:
+    claim them without notifying the user and keep the subscription for the
+    later affirmed human gate or terminal completion. Subscriptions are removed
+    only when the task reaches the irreversible archived status.
     """
     import hermes_cli.kanban_db as kb
     from gateway.run import GatewayRunner
@@ -518,16 +531,14 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     runner._kanban_sub_fail_counts = {}
 
     fake_adapter = MagicMock()
-
-    async def _send_and_stop(chat_id, msg, metadata=None):
-        runner._running = False
-
-    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    fake_adapter.send = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
 
     _orig_sleep = asyncio.sleep
 
-    async def _fast_sleep(_):
+    async def _fast_sleep(delay):
+        if delay != 5:
+            runner._running = False
         await _orig_sleep(0)
 
     with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
@@ -536,24 +547,21 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
             timeout=10.0,
         )
 
-    # The user is notified about the abnormal event...
-    fake_adapter.send.assert_called_once()
-    assert kind.replace('_', ' ') in fake_adapter.send.call_args[0][1]
+    # Raw recovery events are intentionally silent.
+    fake_adapter.send.assert_not_awaited()
 
-    # ...but the subscription survives so a respawn-then-same-event cycle
-    # reaches the user too. The cursor (last_event_id) advanced inside
-    # the same write txn as the claim, so the same event won't re-fire.
+    # The subscription survives for a later affirmed gate or completion. The
+    # cursor advances atomically with the claim so this raw event won't re-fire.
     conn = kb.connect()
     try:
         subs = kb.list_notify_subs(conn, tid)
     finally:
         conn.close()
     assert len(subs) == 1, (
-        f"Subscription should survive {kind!r} so the next cycle of the "
-        f"same event reaches the user; got {subs!r}"
+        f"Subscription should survive silent {kind!r} recovery; got {subs!r}"
     )
     assert int(subs[0]["last_event_id"]) >= 1, (
-        "Cursor should have advanced past the delivered event "
+        "Cursor should have advanced past the silently claimed event "
         "(claim_unseen_events_for_sub advances atomically inside the "
         "same write txn as the read)."
     )
