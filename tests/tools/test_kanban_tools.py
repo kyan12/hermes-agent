@@ -435,6 +435,15 @@ def test_link_happy_path(worker_env):
     out = kt._handle_link({"parent_id": a, "child_id": b})
     d = json.loads(out)
     assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        event = [event for event in kb.list_events(conn, b) if event.kind == "linked"][-1]
+        assert event.run_id == int(os.environ["HERMES_KANBAN_RUN_ID"])
+        assert event.payload is not None
+        assert event.payload["origin_task_id"] == worker_env
+        assert event.payload["origin_run_id"] == int(os.environ["HERMES_KANBAN_RUN_ID"])
+    finally:
+        conn.close()
 
 
 def test_unblock_happy_path(monkeypatch, worker_env):

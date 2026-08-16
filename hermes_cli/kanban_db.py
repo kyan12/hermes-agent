@@ -3976,7 +3976,11 @@ def _reconciliation_prompt(envelope: Mapping[str, Any]) -> str:
         f'"source_task_id":"{lineage["source_task_id"]}",'
         '"source_event_id":<latest>,"error":"sanitized failure"}}.\n'
         "Repeated occurrences may be coalesced while you work. Re-read the live "
-        "source and use the newest coalesced source_event_id; stale verdicts are rejected.\n\n"
+        "source and use the newest coalesced source_event_id; stale verdicts are rejected. "
+        "If a post-occurrence source comment is material but has been re-read and "
+        "incorporated, acknowledge only that exact event from the current reconciliation "
+        "run with a source comment beginning: `Reconciliation acknowledgment for source "
+        "event <source_event_id>, source comment event <comment_event_id>:`.\n\n"
         "source_task_id: " + str(lineage["source_task_id"]) + "\n"
         "source_event_id: " + str(lineage["source_event_id"]) + "\n"
         "```json\n" + json.dumps(envelope, ensure_ascii=False, indent=2) + "\n```"
@@ -4594,6 +4598,14 @@ def _newer_reconciliation_source_event(
             recovery_task_id=recovery_task_id,
         ):
             continue
+        if row["kind"] == "commented" and _is_source_comment_acknowledged_by_current_recovery(
+            conn,
+            row,
+            source_task_id=source_task_id,
+            source_event_id=source_event_id,
+            recovery_task_id=recovery_task_id,
+        ):
+            continue
         return row
     return None
 
@@ -4900,6 +4912,20 @@ def _is_reconciliation_evidence_comment(
     if type(comment_id) is int:
         if type(origin_task_id) is not str or type(origin_run_id) is not int:
             return False
+        # A run claimed before the cited occurrence acted under older source
+        # context.  It can vouch only when its durable comment explicitly names
+        # the cited occurrence; a run claimed after the occurrence is already
+        # occurrence-bound by the global event ordering.
+        claim = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id LIMIT 1",
+            (recovery_task_id, origin_run_id),
+        ).fetchone()
+        if claim is None or (
+            int(claim["id"]) < int(source_event_id)
+            and not body.startswith(evidence_prefix)
+        ):
+            return False
         recovery = get_task(conn, recovery_task_id)
         if (
             recovery is None
@@ -4925,8 +4951,19 @@ def _is_reconciliation_evidence_comment(
                 recovery.current_run_id == origin_run_id
                 and run["ended_at"] is None
             )
+        # A settled run must have a durable ending event after this comment.
+        # The monotonic event id is the exact fence when both writes share one
+        # wall-clock second; timestamps independently enforce the run window.
+        ending = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind IN ('dependency_wait', 'blocked', 'gave_up', 'completed') "
+            "ORDER BY id LIMIT 1",
+            (recovery_task_id, origin_run_id),
+        ).fetchone()
         return (
-            run["ended_at"] is not None
+            ending is not None
+            and int(event["id"]) < int(ending["id"])
+            and run["ended_at"] is not None
             and int(comment["created_at"]) <= int(run["ended_at"])
         )
 
@@ -4954,6 +4991,66 @@ def _is_reconciliation_evidence_comment(
         re.search(r"\breconcil", body, re.IGNORECASE) is not None
         and any(parent_id in body for parent_id in mirrored_parent_ids)
     )
+
+
+def _is_source_comment_acknowledged_by_current_recovery(
+    conn: sqlite3.Connection,
+    event: sqlite3.Row,
+    *,
+    source_task_id: str,
+    source_event_id: int,
+    recovery_task_id: str,
+) -> bool:
+    """Accept one exact post-occurrence comment after an audited current-run re-read.
+
+    The acknowledgment is another source comment written by the *currently
+    running* reconciliation task, after the target event, with exact durable
+    task/run/comment provenance and this canonical prefix::
+
+        Reconciliation acknowledgment for source event N, source comment event M:
+
+    A previous run cannot pre-authorize future source comments, and a retry must
+    re-read and acknowledge again.  Non-comment mutations remain unacknowledgeable.
+    """
+    target_event_id = int(event["id"])
+    prefix = (
+        f"Reconciliation acknowledgment for source event {source_event_id}, "
+        f"source comment event {target_event_id}:"
+    )
+    recovery = get_task(conn, recovery_task_id)
+    if recovery is None or recovery.current_run_id is None:
+        return False
+    current_run_id = int(recovery.current_run_id)
+    candidates = conn.execute(
+        "SELECT id, kind, payload, created_at, run_id FROM task_events "
+        "WHERE task_id = ? AND kind = 'commented' AND id > ? ORDER BY id ASC",
+        (source_task_id, target_event_id),
+    ).fetchall()
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("origin_run_id") != current_run_id:
+            continue
+        comment_id = payload.get("comment_id")
+        if type(comment_id) is not int:
+            continue
+        comment = conn.execute(
+            "SELECT body FROM task_comments WHERE id = ? AND task_id = ?",
+            (comment_id, source_task_id),
+        ).fetchone()
+        if comment is None or not str(comment["body"] or "").startswith(prefix):
+            continue
+        if _is_reconciliation_evidence_comment(
+            conn,
+            candidate,
+            source_task_id=source_task_id,
+            source_event_id=source_event_id,
+            recovery_task_id=recovery_task_id,
+        ):
+            return True
+    return False
 
 
 def _required_reconciliation_text(
