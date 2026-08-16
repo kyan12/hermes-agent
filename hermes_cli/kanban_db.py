@@ -4786,6 +4786,72 @@ def _validate_reconciliation_verdict(
     if source_event is None or source_event["kind"] not in RECONCILIATION_EVENT_KINDS:
         raise ValueError("reconciliation.source_event_id is not a reconciliation occurrence")
 
+    # Build the exact canonical fields represented in reconciliation_outcome.
+    # This runs before the replay guard so malformed retries cannot exploit an
+    # empty/subset comparison, and text is normalized exactly as on first apply.
+    replay_fields: dict[str, Any] = {}
+    if outcome in {"continuation_created", "cleared/completed"}:
+        replay_fields["continuation_task_id"] = _required_reconciliation_text(
+            reconciliation, "continuation_task_id"
+        )
+    elif outcome == "dependency_wait":
+        replay_fields["dependency_task_id"] = _required_reconciliation_text(
+            reconciliation, "dependency_task_id"
+        )
+    elif outcome == "backoff_scheduled":
+        raw_resume_at = reconciliation.get("resume_at")
+        if type(raw_resume_at) is not int:
+            raise ValueError("reconciliation.resume_at must be a future unix timestamp")
+        replay_fields["resume_at"] = raw_resume_at
+    elif outcome == "genuine_human_gate":
+        replay_fields["human_action"] = _redact_reconciliation_text(
+            _required_reconciliation_text(reconciliation, "human_action"), limit=1000,
+        )
+        owner = _required_reconciliation_text(reconciliation, "attention_owner")
+        if owner != "Kevin Yan":
+            raise ValueError("reconciliation.attention_owner must be exactly Kevin Yan")
+        replay_fields["attention_owner"] = owner
+        for field, limit in (
+            ("why_automation_cannot_perform", 2000),
+            ("current_evidence", 4000),
+        ):
+            replay_fields[field] = _redact_reconciliation_text(
+                _required_reconciliation_text(reconciliation, field), limit=limit,
+            )
+    elif outcome == "reconciliation_failed":
+        replay_fields["error"] = _redact_reconciliation_text(
+            _required_reconciliation_text(reconciliation, "error"), limit=2000,
+        )
+
+    # Idempotent replay: once the recovery is done, a verdict identical to one
+    # already durably applied for this exact occurrence is moot. Return before
+    # the post-assignment scans below, which would otherwise misread the
+    # applied provenance-bearing reconciliation_outcome event (and the ended
+    # evidence run) as source advancement. complete_task still no-ops through
+    # its status guard, so the replay records no second outcome and cannot
+    # resurrect or mutate the source. A stale verdict stays re-validated (and
+    # re-rejected) because source_event_id freshness is checked above.
+    if recovery.status == "done":
+        applied_rows = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='reconciliation_outcome' "
+            "AND json_extract(payload, '$.reconciliation_task_id')=? "
+            "AND json_extract(payload, '$.source_event_id')=?",
+            (source_id, recovery_task_id, source_event_id),
+        ).fetchall()
+        for row in applied_rows:
+            try:
+                applied = json.loads(row["payload"]) if row["payload"] else {}
+            except (TypeError, json.JSONDecodeError):
+                continue
+            applied_outcome = applied.get("discarded_outcome", applied.get("outcome"))
+            if (
+                applied.get("stale") is not True
+                and applied_outcome == outcome
+                and all(applied.get(field) == value for field, value in replay_fields.items())
+            ):
+                return None
+
     if outcome == "cleared/completed":
         continuation_id = _required_reconciliation_text(reconciliation, "continuation_task_id")
         prior = conn.execute(
