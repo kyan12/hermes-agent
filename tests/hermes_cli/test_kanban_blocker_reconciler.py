@@ -2674,7 +2674,7 @@ def test_backfill_repair_after_enqueue_accepts_reconciliation_failed_verdict(
 ) -> None:
     """The reconciliation_failed outcome path must survive the same repair."""
     _enable(monkeypatch)
-    with kb.connect_closing(conn) if False else kb.connect_closing() as conn:
+    with kb.connect_closing() as conn:
         source_id = _running(conn)
         assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
         recovery = _reconciliation_tasks(conn)[0]
@@ -2754,7 +2754,8 @@ def test_backfill_repair_does_not_mask_genuine_later_occurrence(
                 conn, source_id, "gave_up", {"error": "new terminal failure"},
             )
         assert newest_event_id != original_event_id
-        assert kb.claim_task(conn, recovery.id, claimer="reconciler") is not None
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
         with pytest.raises(ValueError, match="stale"):
             kb.complete_task(
                 conn,
@@ -2769,3 +2770,288 @@ def test_backfill_repair_does_not_mask_genuine_later_occurrence(
             )
         current = kb.get_task(conn, recovery.id)
         assert current is not None and current.status == "running"
+
+        # The newest coalesced occurrence is the valid replacement lineage.
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="new occurrence reconciled",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": newest_event_id,
+                "outcome": "reconciliation_failed",
+                "error": "new terminal failure remains current",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        outcomes = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert len(outcomes) == 1
+        assert (outcomes[0].payload or {}).get("source_event_id") == newest_event_id
+
+def test_backfill_repair_after_gave_up_accepts_continuation_created_verdict(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live t_270fa73e sequence: gave_up -> enqueued -> benign repair ->
+    linked/commented -> continuation_created passes with the original id."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        with kb.write_txn(conn):
+            source_event_id = kb._append_event(
+                conn,
+                source_id,
+                "gave_up",
+                {"error": "iteration budget exhausted", "retry_status": "ready"},
+            )
+            # Reproduce the dispatcher circuit-breaker state from the live
+            # occurrence. The event hook creates the exact wrapper; the pending
+            # bit makes the subsequent backfill pass settle that occurrence.
+            conn.execute(
+                "UPDATE tasks SET status='automation_recovery', "
+                "recovery_backfill_pending=1 WHERE id=?",
+                (source_id,),
+            )
+        recovery = _reconciliation_tasks(conn)[0]
+        assert int((recovery.idempotency_key or "").rsplit(":", 1)[1]) == source_event_id
+        repair_event_id = _settle_source_via_backfill(conn, source_id, recovery.id)
+        assert repair_event_id > source_event_id
+
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        continuation_id = kb.create_task(
+            conn, title="business continuation", assignee="code-crab",
+        )
+        kb.link_tasks(conn, continuation_id, source_id)
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body="Continuation linked and running from current source truth.",
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="continuation created",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "continuation_created",
+                "continuation_task_id": continuation_id,
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "todo"
+        outcomes = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert len(outcomes) == 1
+        outcome_payload = outcomes[0].payload or {}
+        assert outcome_payload.get("outcome") == "continuation_created"
+        assert outcome_payload.get("source_event_id") == source_event_id
+        assert outcome_payload.get("continuation_task_id") == continuation_id
+        assert outcome_payload.get("stale") is not True
+
+def _applied_continuation_topology(conn) -> tuple[str, kb.Task, int, str, int]:
+    """Drive one source through the full repaired-backfill continuation path.
+
+    Returns (source_id, recovery, source_event_id, continuation_id, run_id)
+    after the verdict was durably applied and the recovery completed.
+    """
+    source_id = _running(conn)
+    assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+    recovery = _reconciliation_tasks(conn)[0]
+    source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+    _settle_source_via_backfill(conn, source_id, recovery.id)
+    claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+    assert claimed is not None
+    continuation_id = kb.create_task(
+        conn, title="business continuation", assignee="code-crab",
+    )
+    kb.link_tasks(conn, continuation_id, source_id)
+    kb.add_comment(
+        conn,
+        source_id,
+        author="default",
+        body="Continuation linked and running from current source truth.",
+        origin_task_id=recovery.id,
+        origin_run_id=claimed.current_run_id,
+    )
+    metadata = {"reconciliation": {
+        "source_task_id": source_id,
+        "source_event_id": source_event_id,
+        "outcome": "continuation_created",
+        "continuation_task_id": continuation_id,
+    }}
+    assert kb.complete_task(
+        conn,
+        recovery.id,
+        summary="continuation created",
+        metadata=metadata,
+        expected_run_id=claimed.current_run_id,
+    )
+    return source_id, recovery, source_event_id, continuation_id, int(claimed.current_run_id)
+
+def test_applied_verdict_duplicate_completion_is_an_idempotent_noop(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replaying an already-applied verdict must no-op, not raise on the
+    provenance-bearing reconciliation_outcome event the first pass recorded."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id, continuation_id, _run_id = (
+            _applied_continuation_topology(conn)
+        )
+        replay_metadata = {"reconciliation": {
+            "source_task_id": source_id,
+            "source_event_id": source_event_id,
+            "outcome": "continuation_created",
+            "continuation_task_id": continuation_id,
+        }}
+        assert not kb.complete_task(
+            conn, recovery.id, summary="duplicate replay", metadata=replay_metadata,
+        )
+        outcomes = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert len(outcomes) == 1
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "todo"
+        current = kb.get_task(conn, recovery.id)
+        assert current is not None and current.status == "done"
+
+        # Required fields are validated before replay matching; a subset cannot
+        # vacuously match an already-applied verdict.
+        with pytest.raises(ValueError, match="continuation_task_id"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="malformed replay",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "continuation_created",
+                }},
+            )
+
+        # Same lineage/outcome but a different continuation is not the same
+        # durable verdict and must not be swallowed by the replay guard.
+        different_continuation_id = kb.create_task(
+            conn, title="different continuation", assignee="code-crab",
+        )
+        kb.link_tasks(conn, different_continuation_id, source_id)
+        with pytest.raises(ValueError):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="not an identical replay",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "continuation_created",
+                    "continuation_task_id": different_continuation_id,
+                }},
+            )
+        assert len([
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]) == 1
+
+
+def test_applied_verdict_replay_matches_canonical_redacted_text(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact retry is compared to the canonical persisted payload, not the
+    raw credential-bearing text that was intentionally normalized on apply."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        raw_error = "provider rejected api_key=not-a-real-secret during retry"
+        metadata = {"reconciliation": {
+            "source_task_id": source_id,
+            "source_event_id": source_event_id,
+            "outcome": "reconciliation_failed",
+            "error": raw_error,
+        }}
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="failed safely",
+            metadata=metadata,
+            expected_run_id=claimed.current_run_id,
+        )
+        assert not kb.complete_task(
+            conn,
+            recovery.id,
+            summary="exact raw replay",
+            metadata=metadata,
+        )
+        outcomes = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
+        assert len(outcomes) == 1
+        assert (outcomes[0].payload or {}).get("error") == (
+            "provider rejected api_key=[REDACTED] during retry"
+        )
+
+
+def test_stale_discarded_verdict_replay_still_rejects(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verdict the kernel discarded as stale is not an applied verdict: its
+    replay must re-validate and re-reject rather than no-op."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="first failure", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        original_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        # A genuine later occurrence makes the first verdict stale. It is
+        # rejected before apply, and repeating it remains rejected rather than
+        # being mistaken for an idempotent replay.
+        with kb.write_txn(conn):
+            newest_event_id = kb._append_event(
+                conn, source_id, "gave_up", {"error": "new terminal failure"},
+            )
+        assert newest_event_id != original_event_id
+        stale_metadata = {"reconciliation": {
+            "source_task_id": source_id,
+            "source_event_id": original_event_id,
+            "outcome": "reconciliation_failed",
+            "error": "superseded by a genuine later occurrence",
+        }}
+        with pytest.raises(ValueError, match="stale"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="obsolete result",
+                metadata=stale_metadata,
+                expected_run_id=claimed.current_run_id,
+            )
+        with pytest.raises(ValueError, match="stale"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="obsolete replay",
+                metadata=stale_metadata,
+                expected_run_id=claimed.current_run_id,
+            )
+        assert not [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_outcome"
+        ]
