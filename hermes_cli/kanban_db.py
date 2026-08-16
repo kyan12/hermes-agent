@@ -4658,7 +4658,6 @@ def _is_reconciliation_evidence_comment(
         recovery = get_task(conn, recovery_task_id)
         if (
             recovery is None
-            or recovery.current_run_id != origin_run_id
             or origin_task_id != recovery_task_id
             or event["run_id"] != origin_run_id
         ):
@@ -4668,12 +4667,196 @@ def _is_reconciliation_evidence_comment(
             "WHERE id = ? AND task_id = ?",
             (origin_run_id, recovery_task_id),
         ).fetchone()
-        return bool(
-            run is not None
-            and run["profile"] == comment["author"]
+        if run is None or run["profile"] != comment["author"]:
+            return False
+        evidence_times = (comment["created_at"], event["created_at"])
+        started_at = run["started_at"]
+        if type(started_at) is not int or any(
+            type(created_at) is not int for created_at in evidence_times
+        ):
+            return False
+        if any(created_at < started_at for created_at in evidence_times):
+            return False
+        active_run_id = (
+            int(recovery.current_run_id)
+            if type(recovery.current_run_id) is int
+            else None
+        )
+        current_run = active_run_id == origin_run_id
+        current_run_row_is_valid = (
+            current_run
             and run["status"] == "running"
             and run["ended_at"] is None
-            and int(run["started_at"]) <= int(comment["created_at"])
+        )
+        current_run_row = (
+            conn.execute(
+                "SELECT status, started_at, ended_at FROM task_runs "
+                "WHERE id = ? AND task_id = ?",
+                (active_run_id, recovery_task_id),
+            ).fetchone()
+            if not current_run and active_run_id is not None
+            else None
+        )
+        next_run_row = (
+            conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? AND id > ? "
+                "ORDER BY id ASC LIMIT 1",
+                (recovery_task_id, origin_run_id),
+            ).fetchone()
+            if not current_run and active_run_id is not None
+            else None
+        )
+        origin_claim_events = conn.execute(
+            "SELECT id, task_id, run_id, payload, created_at FROM task_events "
+            "WHERE kind = 'claimed' AND run_id = ? ORDER BY id ASC",
+            (origin_run_id,),
+        ).fetchall()
+        # A claimed run has exactly one canonical claim event. A replayed event
+        # must not re-anchor the provenance chain after an intervening retry.
+        origin_claim_event = (
+            origin_claim_events[0] if len(origin_claim_events) == 1 else None
+        )
+        origin_claim_is_valid = False
+        if origin_claim_event is not None:
+            try:
+                origin_claim_payload = json.loads(origin_claim_event["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                origin_claim_payload = {}
+            origin_claim_is_valid = (
+                origin_claim_event["task_id"] == recovery_task_id
+                and origin_claim_event["run_id"] == origin_run_id
+                and isinstance(origin_claim_payload, dict)
+                and type(origin_claim_payload.get("run_id")) is int
+                and origin_claim_payload.get("run_id") == origin_run_id
+                and type(origin_claim_event["created_at"]) is int
+                and origin_claim_event["id"] < event["id"]
+                and origin_claim_event["created_at"] == started_at
+            )
+        current_run_is_valid = current_run_row_is_valid and origin_claim_is_valid
+        active_claim_events = (
+            conn.execute(
+                "SELECT id, task_id, run_id, payload, created_at FROM task_events "
+                "WHERE kind = 'claimed' AND run_id = ? ORDER BY id ASC",
+                (active_run_id,),
+            ).fetchall()
+            if not current_run and active_run_id is not None
+            else []
+        )
+        active_claim_event = (
+            active_claim_events[0] if len(active_claim_events) == 1 else None
+        )
+        next_claim_event = (
+            conn.execute(
+                "SELECT id, run_id, payload, created_at FROM task_events "
+                "WHERE task_id = ? AND kind = 'claimed' "
+                "AND id > ? ORDER BY id ASC LIMIT 1",
+                (recovery_task_id, origin_claim_event["id"]),
+            ).fetchone()
+            if (
+                not current_run
+                and active_run_id is not None
+                and origin_claim_event is not None
+            )
+            else None
+        )
+        close_events = (
+            conn.execute(
+                "SELECT id, task_id, kind, created_at FROM task_events "
+                "WHERE run_id = ? ORDER BY id ASC",
+                (origin_run_id,),
+            ).fetchall()
+            if not current_run
+            else []
+        )
+        terminal_event_kinds = {
+            "blocked": {"blocked", "block_loop_detected", "dependency_wait"},
+            "crashed": {"crashed", "protocol_violation"},
+            "gave_up": {"gave_up"},
+            "protocol_violation": {"protocol_violation"},
+            "rate_limited": {"rate_limited"},
+            "reclaimed": {"claim_expired", "reclaimed", "reconciled"},
+            "spawn_failed": {"spawn_failed"},
+            "stale": {"stale"},
+            "timed_out": {"timed_out"},
+        }
+        recognized_terminal_kinds = {
+            kind
+            for kinds in terminal_event_kinds.values()
+            for kind in kinds
+        }
+        bounded_terminal_events = [
+            close_event
+            for close_event in close_events
+            if close_event["kind"] in recognized_terminal_kinds
+        ]
+        next_claim_event_id = next_claim_event["id"] if next_claim_event is not None else None
+        next_claim_is_active = False
+        if next_claim_event is not None and active_run_id is not None:
+            try:
+                next_claim_payload = json.loads(next_claim_event["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                next_claim_payload = {}
+            next_claim_is_active = (
+                active_claim_event is not None
+                and active_claim_event["task_id"] == recovery_task_id
+                and next_claim_event["id"] == active_claim_event["id"]
+                and next_claim_event["run_id"] == active_run_id
+                and isinstance(next_claim_payload, dict)
+                and type(next_claim_payload.get("run_id")) is int
+                and next_claim_payload.get("run_id") == active_run_id
+                and event["id"] < next_claim_event["id"]
+                and current_run_row is not None
+                and type(next_claim_event["created_at"]) is int
+                and type(current_run_row["started_at"]) is int
+                and next_claim_event["created_at"] == current_run_row["started_at"]
+            )
+        terminal_event_is_valid = (
+            type(run["ended_at"]) is int
+            and current_run_row is not None
+            and type(current_run_row["started_at"]) is int
+            and next_claim_event_id is not None
+            and len(bounded_terminal_events) == 1
+            and all(
+                close_event["task_id"] == recovery_task_id
+                and close_event["kind"] in terminal_event_kinds.get(run["status"], set())
+                and type(close_event["created_at"]) is int
+                and event["id"] < close_event["id"]
+                < next_claim_event_id
+                and run["ended_at"] <= close_event["created_at"]
+                <= current_run_row["started_at"]
+                for close_event in bounded_terminal_events
+            )
+        )
+        # A retry must not turn exact evidence from its own prior worker into a
+        # permanent source advance. Accept only a genuinely closed prior run of
+        # this same recovery task, with both durable writes inside its lifetime.
+        # Canonical origin-claim -> source-comment -> matching terminal-event ->
+        # immediate next-claim ordering proves this is an actual retry. Task-run
+        # rows or same-second timestamps alone are not sufficient provenance.
+        # Synthetic, belated, unrelated, and later runs remain material.
+        prior_run_is_valid = (
+            not current_run
+            and run["status"] in {
+                "blocked", "crashed", "gave_up", "protocol_violation",
+                "rate_limited", "reclaimed", "spawn_failed", "stale", "timed_out",
+            }
+            and run["ended_at"] is not None
+            and current_run_row is not None
+            and current_run_row["status"] == "running"
+            and current_run_row["ended_at"] is None
+            and type(current_run_row["started_at"]) is int
+            and origin_claim_is_valid
+            and next_claim_is_active
+            and terminal_event_is_valid
+            and active_run_id is not None
+            and origin_run_id < active_run_id
+            and next_run_row is not None
+            and next_run_row["id"] == active_run_id
+            and run["ended_at"] <= current_run_row["started_at"]
+            and all(created_at <= run["ended_at"] for created_at in evidence_times)
+        )
+        return bool(
+            current_run_is_valid or prior_run_is_valid
         )
 
     # Bounded compatibility for already-durable pre-provenance events.  The

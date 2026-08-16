@@ -2023,6 +2023,587 @@ def test_reconciliation_owned_comment_does_not_invalidate_original_occurrence(
         )
 
 
+@pytest.mark.parametrize("retry_outcome", ("protocol_violation", "rate_limited", "stale"))
+def test_prior_retry_run_evidence_does_not_invalidate_original_occurrence(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_outcome: str,
+) -> None:
+    """Exact evidence survives a failed worker run and retry of the same wrapper."""
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        first_claim = kb.claim_task(conn, recovery.id, claimer="reconciler-first")
+        assert first_claim is not None and first_claim.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: exact retry evidence.",
+            origin_task_id=recovery.id,
+            origin_run_id=first_claim.current_run_id,
+        )
+        assert not kb._record_task_failure(
+            conn,
+            recovery.id,
+            "synthetic retryable worker failure",
+            outcome=retry_outcome,
+            release_claim=True,
+            end_run=True,
+        )
+        second_claim = kb.claim_task(conn, recovery.id, claimer="reconciler-second")
+        assert second_claim is not None and second_claim.current_run_id is not None
+        assert second_claim.current_run_id != first_claim.current_run_id
+
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="prior-run evidence remains valid",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=second_claim.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "ready"
+
+
+def test_unrelated_recovery_run_provenance_remains_material(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+
+        unrelated_id = kb.create_task(conn, title="unrelated recovery", assignee="default")
+        unrelated = kb.claim_task(conn, unrelated_id, claimer="unrelated")
+        assert unrelated is not None and unrelated.current_run_id is not None
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: unrelated worker.",
+            origin_task_id=unrelated.id,
+            origin_run_id=unrelated.current_run_id,
+        )
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject unrelated worker provenance",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
+def test_later_closed_same_recovery_run_provenance_remains_material(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        now = int(kb.time.time())
+        later_run_id = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, outcome, started_at, ended_at) "
+            "VALUES (?, ?, 'timed_out', 'timed_out', ?, ?)",
+            (recovery.id, "default", now, now),
+        ).lastrowid
+        assert later_run_id is not None
+        assert later_run_id > claimed.current_run_id
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: later fake run.",
+            origin_task_id=recovery.id,
+            origin_run_id=later_run_id,
+        )
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject later same-task run provenance",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
+def test_unclaimed_earlier_closed_same_recovery_run_remains_material(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A synthetic task_runs row is not proof that a recovery worker produced evidence."""
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        now = int(kb.time.time())
+        synthetic_run_id = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, outcome, started_at, ended_at) "
+            "VALUES (?, ?, 'timed_out', 'timed_out', ?, ?)",
+            (recovery.id, "default", now, now),
+        ).lastrowid
+        assert synthetic_run_id is not None
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: unclaimed fake run.",
+            origin_task_id=recovery.id,
+            origin_run_id=synthetic_run_id,
+        )
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert synthetic_run_id < claimed.current_run_id
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject unclaimed prior-run provenance",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
+def test_belated_prior_terminal_event_after_intervening_claim_remains_material(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler-first")
+        assert first is not None and first.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: belated close.",
+            origin_task_id=recovery.id,
+            origin_run_id=first.current_run_id,
+        )
+        now = int(kb.time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='timed_out', outcome='timed_out', ended_at=? "
+                "WHERE id=?",
+                (now, first.current_run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (recovery.id,),
+            )
+        intervening = kb.claim_task(conn, recovery.id, claimer="reconciler-intervening")
+        assert intervening is not None and intervening.current_run_id is not None
+        assert not kb._record_task_failure(
+            conn,
+            recovery.id,
+            "intervening retry",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                recovery.id,
+                "timed_out",
+                {"error": "belated synthetic close"},
+                run_id=first.current_run_id,
+            )
+        current = kb.claim_task(conn, recovery.id, claimer="reconciler-current")
+        assert current is not None and current.current_run_id is not None
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject belated close provenance",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=current.current_run_id,
+            )
+
+
+def test_belated_prior_comment_after_intervening_claim_remains_material(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler-first")
+        assert first is not None and first.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        now = int(kb.time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='timed_out', outcome='timed_out', ended_at=? "
+                "WHERE id=?",
+                (now, first.current_run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (recovery.id,),
+            )
+        intervening = kb.claim_task(conn, recovery.id, claimer="reconciler-intervening")
+        assert intervening is not None and intervening.current_run_id is not None
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: late comment.",
+            origin_task_id=recovery.id,
+            origin_run_id=first.current_run_id,
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                recovery.id,
+                "timed_out",
+                {"error": "belated synthetic close"},
+                run_id=first.current_run_id,
+            )
+        assert not kb._record_task_failure(
+            conn,
+            recovery.id,
+            "intervening retry",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+        )
+        current = kb.claim_task(conn, recovery.id, claimer="reconciler-current")
+        assert current is not None and current.current_run_id is not None
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject belated comment provenance",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=current.current_run_id,
+            )
+
+
+def test_replayed_prior_claim_cannot_hide_intervening_run(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler-first")
+        assert first is not None and first.current_run_id is not None
+        now = int(kb.time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='timed_out', outcome='timed_out', ended_at=? "
+                "WHERE id=?",
+                (now, first.current_run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (recovery.id,),
+            )
+        middle = kb.claim_task(conn, recovery.id, claimer="reconciler-middle")
+        assert middle is not None and middle.current_run_id is not None
+        assert not kb._record_task_failure(
+            conn,
+            recovery.id,
+            "middle retry",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                recovery.id,
+                "claimed",
+                {"lock": "replayed", "expires": now + 60, "run_id": first.current_run_id},
+                run_id=first.current_run_id,
+            )
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: replayed claim.",
+            origin_task_id=recovery.id,
+            origin_run_id=first.current_run_id,
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                recovery.id,
+                "timed_out",
+                {"error": "belated synthetic close"},
+                run_id=first.current_run_id,
+            )
+        current = kb.claim_task(conn, recovery.id, claimer="reconciler-current")
+        assert current is not None and current.current_run_id is not None
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject replayed prior claim provenance",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=current.current_run_id,
+            )
+
+
+def test_duplicated_current_claim_provenance_remains_material(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: duplicated claim.",
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        unrelated_id = kb.create_task(conn, title="unrelated claim owner", assignee="default")
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                unrelated_id,
+                "claimed",
+                {"lock": "duplicate", "expires": 0, "run_id": claimed.current_run_id},
+                run_id=claimed.current_run_id,
+            )
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject globally duplicated current claim",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
+def test_unclaimed_intervening_run_breaks_prior_retry_provenance(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler-first")
+        assert first is not None and first.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: intervening run.",
+            origin_task_id=recovery.id,
+            origin_run_id=first.current_run_id,
+        )
+        assert not kb._record_task_failure(
+            conn,
+            recovery.id,
+            "first retry",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+        )
+        now = int(kb.time.time())
+        synthetic_run_id = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, outcome, started_at, ended_at) "
+            "VALUES (?, ?, 'timed_out', 'timed_out', ?, ?)",
+            (recovery.id, "default", now, now),
+        ).lastrowid
+        assert synthetic_run_id is not None
+        current = kb.claim_task(conn, recovery.id, claimer="reconciler-current")
+        assert current is not None and current.current_run_id is not None
+        assert first.current_run_id < synthetic_run_id < current.current_run_id
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject intervening task_runs row",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=current.current_run_id,
+            )
+
+
+def test_prior_dependency_block_run_evidence_survives_retry(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler-first")
+        assert first is not None and first.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: dependency retry.",
+            origin_task_id=recovery.id,
+            origin_run_id=first.current_run_id,
+        )
+        dependency_id = kb.create_task(conn, title="retry dependency", assignee="code-crab")
+        kb.link_tasks(conn, dependency_id, recovery.id)
+        assert kb.block_task(
+            conn,
+            recovery.id,
+            reason="wait for retry dependency",
+            kind="dependency",
+            expected_run_id=first.current_run_id,
+        )
+        dependency = kb.claim_task(conn, dependency_id, claimer="dependency")
+        assert dependency is not None and dependency.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            dependency_id,
+            summary="dependency done",
+            expected_run_id=dependency.current_run_id,
+        )
+        kb.recompute_ready(conn)
+        current = kb.claim_task(conn, recovery.id, claimer="reconciler-current")
+        assert current is not None and current.current_run_id is not None
+
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="dependency retry evidence remains valid",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=current.current_run_id,
+        )
+
+
+@pytest.mark.parametrize("present_origin", ("task", "run"))
+def test_partial_explicit_origin_provenance_remains_material(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    present_origin: str,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        comment_id = conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (
+                source_id,
+                "default",
+                f"Reconciliation evidence for source event {source_event_id}: partial origin.",
+                int(kb.time.time()),
+            ),
+        ).lastrowid
+        payload = {"author": "default", "len": 0, "comment_id": comment_id}
+        if present_origin == "task":
+            payload["origin_task_id"] = recovery.id
+        else:
+            payload["origin_run_id"] = claimed.current_run_id
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                source_id,
+                "commented",
+                payload,
+                run_id=claimed.current_run_id,
+            )
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject partial provenance",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+
 def test_legacy_reconciler_evidence_comment_is_tied_to_active_recovery_run(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
