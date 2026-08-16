@@ -4907,6 +4907,10 @@ def _is_reconciliation_evidence_comment(
 
     body = str(comment["body"] or "")
     evidence_prefix = f"Reconciliation evidence for source event {source_event_id}:"
+    acknowledgment_prefix = (
+        f"Reconciliation acknowledgment for source event {source_event_id}, "
+        "source comment event "
+    )
     origin_task_id = payload.get("origin_task_id")
     origin_run_id = payload.get("origin_run_id")
     if type(comment_id) is int:
@@ -4924,6 +4928,7 @@ def _is_reconciliation_evidence_comment(
         if claim is None or (
             int(claim["id"]) < int(source_event_id)
             and not body.startswith(evidence_prefix)
+            and not body.startswith(acknowledgment_prefix)
         ):
             return False
         recovery = get_task(conn, recovery_task_id)

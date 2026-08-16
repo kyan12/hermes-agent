@@ -2453,6 +2453,52 @@ def test_current_recovery_can_acknowledge_exact_post_occurrence_comment(
         )
 
 
+def test_pre_coalescence_run_can_acknowledge_exact_later_comment_after_reread(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A still-current run may re-read, then acknowledge, a post-coalescence comment."""
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        with kb.write_txn(conn):
+            source_event_id = kb._append_event(
+                conn, source_id, "gave_up", {"error": "new occurrence"},
+            )
+            kb._append_event(conn, source_id, "reconciliation_coalesced", {
+                "source_event_id": source_event_id,
+                "source_status": "automation_recovery",
+                "reconciliation_task_id": recovery.id,
+            })
+        kb.add_comment(conn, source_id, author="worker", body="late stale worker note")
+        target_event_id = int(kb.list_events(conn, source_id)[-1].id)
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=(
+                f"Reconciliation acknowledgment for source event {source_event_id}, "
+                f"source comment event {target_event_id}: re-read after coalescence."
+            ),
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="coalesced occurrence and exact late comment incorporated",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+
+
 @pytest.mark.parametrize("mismatch", ("wrong_event", "wrong_task", "later_blocker"))
 def test_comment_acknowledgment_fails_closed(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch, mismatch: str,
