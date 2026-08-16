@@ -4824,7 +4824,14 @@ def _idempotency_key_cites_other_occurrence(
     retained for call-site symmetry with the legacy branch's citation
     check."""
     del source_task_id  # the marker binds regardless of which source is named
-    markers = re.findall(r"(?<![0-9A-Za-z_])event-(\d+)(?![0-9])", key)
+    # Rejection-side detection is broader than the acceptance-side citation
+    # check: underscore is a separator throughout this key namespace (task
+    # ids themselves use them), so ``continuation_event-999`` is
+    # occurrence-shaped and must bind.  Letter-glued shapes (``xevent-99``)
+    # remain non-markers, preserving word-boundary protection.  The
+    # acceptance side stays strict — an unrecognized marker can only ever
+    # reject, never accept.
+    markers = re.findall(r"(?<![0-9A-Za-z])event-(\d+)(?![0-9])", key)
     return any(int(marker) != int(source_event_id) for marker in markers)
 
 

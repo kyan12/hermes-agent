@@ -3659,6 +3659,48 @@ def test_cleared_resumed_accepts_prior_run_stamped_required_parent_link(
         assert (outcomes[0].payload or {}).get("outcome") == "cleared/resumed"
 
 
+def test_stamped_link_with_underscore_glued_occurrence_key_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Marker detection must treat underscore as a separator too: a key like
+    ``continuation_event-999`` is occurrence-shaped to any reader of this
+    key namespace (task ids themselves use underscores), so a
+    wrong-occurrence marker glued to an underscore must still bind and
+    reject — it must not slip through as 'no marker' on run provenance."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        glued_keyed_id = kb.create_task(
+            conn,
+            title="underscore-glued occurrence continuation",
+            assignee="code-crab",
+            idempotency_key=f"continuation_event-{source_event_id + 1000}",
+        )
+        kb.link_tasks(
+            conn,
+            glued_keyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
 def test_stamped_link_with_foreign_provenance_still_invalidates(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
