@@ -3171,3 +3171,1418 @@ def test_stale_discarded_verdict_replay_still_rejects(
             event for event in kb.list_events(conn, source_id)
             if event.kind == "reconciliation_outcome"
         ]
+
+
+def _gave_up_source_with_settled_recovery(conn) -> tuple[str, kb.Task, int]:
+    """Mirror the live t_270fa73e occurrence 27798 shape.
+
+    gave_up occurrence -> automation_recovery + recovery wrapper -> benign
+    exact_occurrence_present backfill repair. Returns (source_id, recovery,
+    source_event_id).
+    """
+    source_id = _running(conn)
+    with kb.write_txn(conn):
+        source_event_id = kb._append_event(
+            conn,
+            source_id,
+            "gave_up",
+            {"error": "iteration budget exhausted", "retry_status": "ready"},
+        )
+        conn.execute(
+            "UPDATE tasks SET status='automation_recovery', "
+            "recovery_backfill_pending=1 WHERE id=?",
+            (source_id,),
+        )
+    recovery = [
+        task for task in _reconciliation_tasks(conn)
+        if source_id in (task.idempotency_key or "")
+    ][0]
+    repair_event_id = _settle_source_via_backfill(conn, source_id, recovery.id)
+    assert repair_event_id > source_event_id
+    return source_id, recovery, source_event_id
+
+
+def _occurrence_keyed_continuation(conn, source_id: str, source_event_id: int) -> str:
+    """Create the reconciliation-owned continuation shape live workers produce."""
+    return kb.create_task(
+        conn,
+        title="business continuation",
+        assignee="code-crab",
+        created_by="default",
+        idempotency_key=(
+            f"reconcile-{source_id}-event-{source_event_id}-continuation"
+        ),
+    )
+
+
+def _last_linked_event_id(conn, source_id: str) -> int:
+    linked = [
+        event for event in kb.list_events(conn, source_id) if event.kind == "linked"
+    ]
+    assert linked
+    return int(linked[-1].id)
+
+
+def _reconciliation_outcomes(conn, source_id: str) -> list:
+    return [
+        event for event in kb.list_events(conn, source_id)
+        if event.kind == "reconciliation_outcome"
+    ]
+
+
+def _dependency_block_recovery(conn, recovery_id: str) -> str:
+    """End the recovery run as a dependency wait (the live run-1146 shape).
+
+    A dependency block requires at least one parent, so park the recovery
+    behind a throwaway holder; the holder edge lands on the recovery, never
+    on the source, so it cannot exercise the mirrored-parent exemption.
+    """
+    holder_id = kb.create_task(conn, title="repair hold", assignee="code-crab")
+    kb.link_tasks(conn, holder_id, recovery_id)
+    assert kb.block_task(
+        conn, recovery_id, reason="waiting on validator repair", kind="dependency"
+    )
+    return holder_id
+
+
+def _release_recovery_for_retry(conn, recovery_id: str, holder_id: str) -> None:
+    """Finish the dependency hold so the recovery can be legitimately re-claimed."""
+    assert kb.complete_task(conn, holder_id, summary="repair shipped")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (recovery_id,))
+
+
+def test_cleared_resumed_accepts_same_run_required_parent_link(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The protocol-required direct-parent link must not self-invalidate a
+    cleared/resumed verdict for the same reconciliation occurrence.
+
+    Live t_3226491c failure: source_event_id=27798 rejected as advanced via
+    linked:27822 while 27822 was rejected as stale (newest coalesced 27798).
+    """
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(conn, continuation_id, source_id)
+        link_event_id = _last_linked_event_id(conn, source_id)
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body="Continuation linked and running from current source truth.",
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+
+        # Substituting the required link's event id stays stale: the newest
+        # coalesced occurrence is still the original gave_up event.
+        with pytest.raises(ValueError, match="stale"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="wrong occurrence id",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": link_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="source resumed from current truth",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        source = kb.get_task(conn, source_id)
+        # The linked continuation is not done yet, so the resumed source waits
+        # behind its required parent (todo), exactly like continuation_created.
+        assert source is not None and source.status == "todo"
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        payload = outcomes[0].payload or {}
+        assert payload.get("outcome") == "cleared/resumed"
+        assert payload.get("source_event_id") == source_event_id
+        assert payload.get("stale") is not True
+
+
+def test_cleared_resumed_accepts_prior_run_required_parent_link(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exact live t_3226491c shape: the required link was recorded by an
+    earlier (now blocked) run of the same recovery task; the retry run's
+    cleared/resumed verdict for the original occurrence must pass."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert first is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(conn, continuation_id, source_id)
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body="Continuation linked and running from current source truth.",
+            origin_task_id=recovery.id,
+            origin_run_id=first.current_run_id,
+        )
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None
+        assert second.current_run_id != first.current_run_id
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="source resumed from current truth",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=second.current_run_id,
+        )
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        assert (outcomes[0].payload or {}).get("outcome") == "cleared/resumed"
+
+
+def test_reconciliation_failed_accepts_required_parent_link(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reconciliation_failed carries no topology field either; the owned
+    required link must not invalidate it (live run attempted this shape)."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(conn, continuation_id, source_id)
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="bounded automation failed",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "reconciliation_failed",
+                "error": "sanitized failure",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        assert (outcomes[0].payload or {}).get("outcome") == "reconciliation_failed"
+
+
+def test_unowned_link_still_invalidates_cleared_resumed(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrelated link recorded outside the recovery task's runs and naming
+    no occurrence-scoped continuation is still a material source advance."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        # Linked BEFORE the recovery task ever ran: no run window covers it and
+        # the parent carries no occurrence provenance.
+        unrelated_id = kb.create_task(conn, title="unrelated parent", assignee="code-crab")
+        kb.link_tasks(conn, unrelated_id, source_id)
+        link_event_id = _last_linked_event_id(conn, source_id)
+
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        with pytest.raises(
+            ValueError, match=rf"source advanced after source event {source_event_id} via linked:{link_event_id}"
+        ):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_keyed_link_outside_recovery_run_windows_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even an occurrence-keyed continuation link is material when it was not
+    recorded inside a run window of THIS recovery task (concurrent actor)."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert first is not None and first.current_run_id is not None
+        first_run_id = int(first.current_run_id)
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        # Link lands between runs: no recovery run window covers it.  Durable
+        # timestamps are second-precision, so make the gap explicit in the
+        # disposable fixture instead of racing the wall clock.
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(conn, continuation_id, source_id)
+        link_event_id = _last_linked_event_id(conn, source_id)
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+        with kb.write_txn(conn):
+            run_a = conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id=?",
+                (first_run_id,),
+            ).fetchone()
+            assert run_a is not None and run_a["ended_at"] is not None
+            gap = int(run_a["ended_at"])
+            conn.execute(
+                "UPDATE task_events SET created_at=? WHERE id=?",
+                (gap + 5, link_event_id),
+            )
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None and second.current_run_id is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET started_at=? WHERE id=?",
+                (gap + 10, int(second.current_run_id)),
+            )
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=second.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_stamped_link_with_recovery_run_provenance_accepted(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New writes carry exact run provenance: a link stamped with the recovery
+    task's own active run is reconciliation-owned even without a keyed parent."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        continuation_id = kb.create_task(
+            conn, title="unkeyed continuation", assignee="code-crab",
+        )
+        kb.link_tasks(
+            conn,
+            continuation_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body="Continuation linked and running from current source truth.",
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="source resumed from current truth",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        assert (outcomes[0].payload or {}).get("outcome") == "cleared/resumed"
+
+
+def test_stamped_link_with_other_source_occurrence_key_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Occurrence-shaped keys bind no matter WHICH source they name: a
+    stamped link whose parent key carries an event-N marker for a different
+    occurrence (here: another source's reconciliation continuation) holds
+    wrong-occurrence provenance for the cited occurrence and stays
+    material.  Run provenance alone cannot launder it."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        other_source_id = _running(conn, title="unrelated other source")
+        foreign_keyed_id = kb.create_task(
+            conn,
+            title="other source continuation",
+            assignee="code-crab",
+            idempotency_key=(
+                f"reconcile-{other_source_id}-event-{source_event_id + 1000}-continuation"
+            ),
+        )
+        kb.link_tasks(
+            conn,
+            foreign_keyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+@pytest.mark.parametrize(
+    ("outcome", "extra"),
+    (
+        ("backoff_scheduled", {"resume_at": 1999999999}),
+        ("genuine_human_gate", {
+            "human_action": "operator must rotate the key",
+            "attention_owner": "Kevin Yan",
+            "why_automation_cannot_perform": "credential rotation needs the human's 1Password unlock",
+            "current_evidence": "provider rejects the stored key with 401",
+        }),
+    ),
+)
+def test_no_topology_outcomes_accept_same_run_required_parent_link(
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    extra: dict,
+) -> None:
+    """backoff_scheduled and genuine_human_gate also name no
+    continuation/dependency in their verdict metadata; the protocol-required
+    direct-parent link must not self-invalidate them either."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(conn, continuation_id, source_id)
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body="Reconciliation evidence: source re-read from current truth.",
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        verdict = {
+            "source_task_id": source_id,
+            "source_event_id": source_event_id,
+            "outcome": outcome,
+            **extra,
+        }
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="verdict with required link",
+            metadata={"reconciliation": verdict},
+            expected_run_id=claimed.current_run_id,
+        )
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        assert (outcomes[0].payload or {}).get("outcome") == outcome
+
+
+def test_cleared_resumed_accepts_prior_run_stamped_required_parent_link(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stamped prior-run shape: the required link was recorded by an earlier
+    (now dependency-blocked) run of the same recovery task WITH exact run
+    provenance; the retry run's cleared/resumed verdict for the original
+    occurrence must pass on the stamped branch, not the legacy fallback."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert first is not None and first.current_run_id is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(
+            conn,
+            continuation_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=first.current_run_id,
+        )
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None
+        assert second.current_run_id != first.current_run_id
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="source resumed from current truth",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=second.current_run_id,
+        )
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        assert (outcomes[0].payload or {}).get("outcome") == "cleared/resumed"
+
+
+def test_stamped_link_with_underscore_glued_occurrence_key_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Marker detection must treat underscore as a separator too: a key like
+    ``continuation_event-999`` is occurrence-shaped to any reader of this
+    key namespace (task ids themselves use underscores), so a
+    wrong-occurrence marker glued to an underscore must still bind and
+    reject — it must not slip through as 'no marker' on run provenance."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        glued_keyed_id = kb.create_task(
+            conn,
+            title="underscore-glued occurrence continuation",
+            assignee="code-crab",
+            idempotency_key=f"continuation_event-{source_event_id + 1000}",
+        )
+        kb.link_tasks(
+            conn,
+            glued_keyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=claimed.current_run_id,
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_stamped_link_with_foreign_provenance_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A link stamped with another task's run is not this reconciliation's own
+    topology mutation and must stay material (wrong reconciliation task)."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        foreign_id = _running(conn, title="foreign worker task")
+        foreign = kb.get_task(conn, foreign_id)
+        assert foreign is not None and foreign.current_run_id is not None
+
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(
+            conn,
+            continuation_id,
+            source_id,
+            origin_task_id=foreign_id,
+            origin_run_id=int(foreign.current_run_id),
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_stamped_link_outside_stamped_run_window_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run provenance must cover the event: a link stamped with an ended
+    recovery run but recorded after that run closed stays material."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert first is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(
+            conn,
+            continuation_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=first.current_run_id,
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        with kb.write_txn(conn):
+            # Forge the durable timestamp past the stamped run's end: the
+            # provenance tuple no longer covers the event.
+            conn.execute(
+                "UPDATE task_events SET created_at = created_at + 100000 WHERE id=?",
+                (link_event_id,),
+            )
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=second.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_genuine_later_occurrence_still_rejects_with_owned_link(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine later blocker occurrence still invalidates the stale verdict.
+    The pre-occurrence owned link then satisfies the retried verdict for the
+    newest coalesced occurrence, because only post-occurrence mutations are
+    material for it."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(conn, continuation_id, source_id)
+
+        with kb.write_txn(conn):
+            newer_event_id = kb._append_event(
+                conn,
+                source_id,
+                "gave_up",
+                {"error": "iteration budget exhausted again", "retry_status": "ready"},
+            )
+        coalesced = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "reconciliation_coalesced"
+        ]
+        assert coalesced and coalesced[-1].payload.get("source_event_id") == newer_event_id
+
+        # The original occurrence is now stale.
+        with pytest.raises(ValueError, match="stale"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="old occurrence verdict",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        # The retried verdict for the newest coalesced occurrence passes: the
+        # owned link predates the cited occurrence and nothing material
+        # advanced the source after it.
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="resumed from newest occurrence",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": newer_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        payload = outcomes[0].payload or {}
+        assert payload.get("outcome") == "cleared/resumed"
+        assert payload.get("source_event_id") == newer_event_id
+
+
+def test_post_occurrence_link_with_wrong_event_provenance_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A link recorded AFTER the cited occurrence whose parent names a
+    different (older) occurrence is not this occurrence's required topology:
+    wrong source-event provenance stays a material advance."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        # Continuation keyed to a DIFFERENT occurrence than the cited one.
+        stale_keyed_id = kb.create_task(
+            conn,
+            title="continuation for an older occurrence",
+            assignee="code-crab",
+            created_by="default",
+            idempotency_key=f"reconcile-{source_id}-event-{source_event_id - 100}-continuation",
+        )
+        kb.link_tasks(conn, stale_keyed_id, source_id)
+        link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="verdict citing the assigned occurrence",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_settled_cleared_resumed_duplicate_is_zero_write(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the owned-link verdict settles, an exact replay is an idempotent
+    no-op: no new outcome event, no source status change."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(conn, continuation_id, source_id)
+        verdict = {"reconciliation": {
+            "source_task_id": source_id,
+            "source_event_id": source_event_id,
+            "outcome": "cleared/resumed",
+        }}
+        assert kb.complete_task(
+            conn, recovery.id, summary="source resumed", metadata=verdict,
+            expected_run_id=claimed.current_run_id,
+        )
+        assert not kb.complete_task(conn, recovery.id, summary="duplicate replay", metadata=verdict)
+        assert len(_reconciliation_outcomes(conn, source_id)) == 1
+        source = kb.get_task(conn, source_id)
+        assert source is not None and source.status == "todo"
+        current = kb.get_task(conn, recovery.id)
+        assert current is not None and current.status == "done"
+
+
+def test_simultaneous_wrappers_keep_owned_links_isolated(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two live reconciliations completing in interleaved order: each wrapper's
+    owned link satisfies only its own source verdict; neither cross-exempts."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_a, recovery_a, event_a = _gave_up_source_with_settled_recovery(conn)
+        source_b, recovery_b, event_b = _gave_up_source_with_settled_recovery(conn)
+
+        claimed_a = kb.claim_task(conn, recovery_a.id, claimer="reconciler-a")
+        claimed_b = kb.claim_task(conn, recovery_b.id, claimer="reconciler-b")
+        assert claimed_a is not None and claimed_b is not None
+
+        continuation_a = _occurrence_keyed_continuation(conn, source_a, event_a)
+        kb.link_tasks(conn, continuation_a, source_a)
+        continuation_b = _occurrence_keyed_continuation(conn, source_b, event_b)
+        kb.link_tasks(conn, continuation_b, source_b)
+
+        assert kb.complete_task(
+            conn, recovery_a.id, summary="A resumed",
+            metadata={"reconciliation": {
+                "source_task_id": source_a,
+                "source_event_id": event_a,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed_a.current_run_id,
+        )
+        assert kb.complete_task(
+            conn, recovery_b.id, summary="B resumed",
+            metadata={"reconciliation": {
+                "source_task_id": source_b,
+                "source_event_id": event_b,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed_b.current_run_id,
+        )
+        assert len(_reconciliation_outcomes(conn, source_a)) == 1
+        assert len(_reconciliation_outcomes(conn, source_b)) == 1
+
+
+def test_partial_link_provenance_never_uses_legacy_fallback(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A linked event naming origin_task_id without a matching origin_run_id
+    is current-format with partial provenance: material, never legacy."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (continuation_id, source_id),
+            )
+            partial_event_id = kb._append_event(
+                conn,
+                source_id,
+                "linked",
+                {
+                    "parent": continuation_id,
+                    "child": source_id,
+                    "origin_task_id": recovery.id,
+                },
+            )
+        with pytest.raises(ValueError, match=rf"via linked:{partial_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_mismatched_link_run_provenance_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The payload origin run and the durable row run_id must agree exactly;
+    a forged mismatch stays material even for the recovery's own run."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = int(claimed.current_run_id)
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (continuation_id, source_id),
+            )
+            forged_event_id = kb._append_event(
+                conn,
+                source_id,
+                "linked",
+                {
+                    "parent": continuation_id,
+                    "child": source_id,
+                    "origin_task_id": recovery.id,
+                    "origin_run_id": run_id + 1000,
+                },
+                run_id=run_id,
+            )
+        with pytest.raises(ValueError, match=rf"via linked:{forged_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_occurrence_key_prefix_collision_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Digit-boundary citation: a parent keyed to event-<occ><digit> must not
+    vouch for occurrence <occ>, and a task-id prefix run-on must not either."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        digit_collision_id = kb.create_task(
+            conn,
+            title="continuation keyed to a run-on occurrence",
+            assignee="code-crab",
+            created_by="default",
+            idempotency_key=(
+                f"reconcile-{source_id}-event-{source_event_id}9-continuation"
+            ),
+        )
+        kb.link_tasks(conn, digit_collision_id, source_id)
+        first_link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{first_link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_concurrent_unprovenanced_keyed_link_inside_window_is_accepted(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Documented trust boundary: an UNPROVENANCED link whose parent cites the
+    exact occurrence, with creation AND link inside recovery run windows, is
+    indistinguishable from a pre-provenance durable row and recognized as
+    reconciliation-owned.  Local non-tool writers (CLI/dashboard/direct DB)
+    are trusted cooperative actors in this model — they could rewrite history
+    directly regardless — while the worker tool path now always stamps exact
+    provenance, and every un-keyed or out-of-window link stays material."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(conn, continuation_id, source_id)
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="source resumed from current truth",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": source_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=claimed.current_run_id,
+        )
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        assert (outcomes[0].payload or {}).get("outcome") == "cleared/resumed"
+
+
+def test_stamped_link_with_wrong_occurrence_key_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run provenance cannot vouch for occurrence-shaped keys: a stamped link
+    whose parent cites this source with a DIFFERENT event marker carries the
+    wrong source-event provenance and stays material (stale coalesced worker
+    linking an old-occurrence continuation after a newer occurrence)."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        stale_keyed_id = kb.create_task(
+            conn,
+            title="continuation for an older occurrence",
+            assignee="code-crab",
+            created_by="default",
+            idempotency_key=f"reconcile-{source_id}-event-{source_event_id + 100}-continuation",
+        )
+        kb.link_tasks(
+            conn,
+            stale_keyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=int(claimed.current_run_id),
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_occurrence_key_task_id_run_on_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary citation for the task id too: a key containing the source id
+    only as an alphanumeric run-on (<source_task_id>x) is not a citation."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None
+        run_on_id = kb.create_task(
+            conn,
+            title="continuation with a run-on source id",
+            assignee="code-crab",
+            created_by="default",
+            idempotency_key=(
+                f"reconcile-{source_id}x-event-{source_event_id}-continuation"
+            ),
+        )
+        kb.link_tasks(conn, run_on_id, source_id)
+        link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def _coalesce_newer_occurrence(conn, source_id: str) -> int:
+    with kb.write_txn(conn):
+        newer_event_id = kb._append_event(
+            conn,
+            source_id,
+            "gave_up",
+            {"error": "iteration budget exhausted again", "retry_status": "ready"},
+        )
+    coalesced = [
+        event for event in kb.list_events(conn, source_id)
+        if event.kind == "reconciliation_coalesced"
+    ]
+    assert coalesced and coalesced[-1].payload.get("source_event_id") == newer_event_id
+    return int(newer_event_id)
+
+
+def test_pre_occurrence_run_unkeyed_stamped_link_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Independent-review scenario: R1 starts for E1; a genuine later E2
+    coalesces mid-run; stale R1 stamps an UNKEYED parent link after E2; R1
+    blocks; R2's verdict for E2 must still reject — a run that predates the
+    cited occurrence cannot vouch for topology without occurrence-key
+    evidence."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert first is not None and first.current_run_id is not None
+        first_run_id = int(first.current_run_id)
+        # No timestamp manipulation: R1 and the coalesced E2 share the same
+        # wall-clock second, the exact frozen-clock case. Rejection must come
+        # from durable event ordering, not clock granularity.
+        newer_event_id = _coalesce_newer_occurrence(conn, source_id)
+        unkeyed_id = kb.create_task(
+            conn, title="unkeyed continuation", assignee="code-crab",
+        )
+        kb.link_tasks(
+            conn,
+            unkeyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=first_run_id,
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None and second.current_run_id is not None
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="retry verdict for the newest occurrence",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": newer_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=second.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_pre_occurrence_run_keyed_stamped_link_is_accepted(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same coalesced sequence, but the pre-occurrence run's stamped link names
+    a parent keyed to the CITED (newest) occurrence: occurrence-key evidence
+    backs the pre-occurrence run and the retried verdict passes."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert first is not None and first.current_run_id is not None
+        first_run_id = int(first.current_run_id)
+        newer_event_id = _coalesce_newer_occurrence(conn, source_id)
+        keyed_id = kb.create_task(
+            conn,
+            title="continuation for the newest occurrence",
+            assignee="code-crab",
+            created_by="default",
+            idempotency_key=f"reconcile-{source_id}-event-{newer_event_id}-continuation",
+        )
+        kb.link_tasks(
+            conn,
+            keyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=first_run_id,
+        )
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None and second.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            recovery.id,
+            summary="retry verdict for the newest occurrence",
+            metadata={"reconciliation": {
+                "source_task_id": source_id,
+                "source_event_id": newer_event_id,
+                "outcome": "cleared/resumed",
+            }},
+            expected_run_id=second.current_run_id,
+        )
+        outcomes = _reconciliation_outcomes(conn, source_id)
+        assert len(outcomes) == 1
+        payload = outcomes[0].payload or {}
+        assert payload.get("outcome") == "cleared/resumed"
+        assert payload.get("source_event_id") == newer_event_id
+
+
+def test_foreign_profile_prior_run_stamped_link_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reassignment must not launder provenance: a link stamped by a run of
+    this recovery task while it was assigned to a FOREIGN profile is not the
+    authorized reconciler's topology mutation and stays material after the
+    task is reassigned to the configured reconciler profile."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee='rogue-profile' WHERE id=?", (recovery.id,)
+            )
+        first = kb.claim_task(conn, recovery.id, claimer="rogue-profile")
+        assert first is not None and first.current_run_id is not None
+        first_run_id = int(first.current_run_id)
+        unkeyed_id = kb.create_task(
+            conn, title="unkeyed continuation", assignee="code-crab",
+        )
+        kb.link_tasks(
+            conn,
+            unkeyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=first_run_id,
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee='default' WHERE id=?", (recovery.id,)
+            )
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None and second.current_run_id is not None
+        with kb.write_txn(conn):
+            # Second-precision durable clock: pin the retry run's start past
+            # the link so ONLY the foreign-profile run window covers it.
+            conn.execute(
+                "UPDATE task_runs SET started_at = started_at + 10 WHERE id=?",
+                (int(second.current_run_id),),
+            )
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="retry verdict after reassignment",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=second.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_foreign_profile_prior_run_legacy_keyed_link_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same reassignment binding for the legacy branch: an occurrence-keyed
+    link from a foreign-profile run window must not vouch after reassignment."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee='rogue-profile' WHERE id=?", (recovery.id,)
+            )
+        first = kb.claim_task(conn, recovery.id, claimer="rogue-profile")
+        assert first is not None
+        continuation_id = _occurrence_keyed_continuation(conn, source_id, source_event_id)
+        kb.link_tasks(conn, continuation_id, source_id)
+        link_event_id = _last_linked_event_id(conn, source_id)
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee='default' WHERE id=?", (recovery.id,)
+            )
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None and second.current_run_id is not None
+        with kb.write_txn(conn):
+            # Second-precision durable clock: pin the retry run's start past
+            # the link so ONLY the foreign-profile run window covers it.
+            conn.execute(
+                "UPDATE task_runs SET started_at = started_at + 10 WHERE id=?",
+                (int(second.current_run_id),),
+            )
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="retry verdict after reassignment",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=second.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_multi_marker_occurrence_key_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key citing the source with multiple occurrence markers must name the
+    cited occurrence UNANIMOUSLY: `event-<cited>-event-<other>` is ambiguous
+    wrong-occurrence provenance and stays material in both branches."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        ambiguous_id = kb.create_task(
+            conn,
+            title="continuation with a two-marker key",
+            assignee="code-crab",
+            created_by="default",
+            idempotency_key=(
+                f"reconcile-{source_id}-event-{source_event_id}"
+                f"-event-{source_event_id + 7}-continuation"
+            ),
+        )
+        # Legacy branch: unprovenanced link inside the run window.
+        kb.link_tasks(conn, ambiguous_id, source_id)
+        link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_multi_marker_occurrence_key_stamped_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same ambiguity through the stamped branch: first marker matches, second
+    does not — run provenance cannot rescue a split-verdict key."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        claimed = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert claimed is not None and claimed.current_run_id is not None
+        ambiguous_id = kb.create_task(
+            conn,
+            title="continuation with a two-marker key",
+            assignee="code-crab",
+            created_by="default",
+            idempotency_key=(
+                f"reconcile-{source_id}-event-{source_event_id}"
+                f"-event-{source_event_id + 7}-continuation"
+            ),
+        )
+        kb.link_tasks(
+            conn,
+            ambiguous_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=int(claimed.current_run_id),
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="source resumed from current truth",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=claimed.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_stamped_link_from_settled_run_without_ending_event_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed: a settled stamped run with NO durable ending event
+    cannot vouch for a link — the recorded run window alone is weaker
+    evidence than durable event ordering, so a run row claiming to be
+    settled without its ending event (deleted, lost, or forged) must not
+    have its provenance accepted on the timestamp fence alone."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert first is not None and first.current_run_id is not None
+        first_run_id = int(first.current_run_id)
+        unkeyed_id = kb.create_task(
+            conn, title="unkeyed continuation", assignee="code-crab",
+        )
+        kb.link_tasks(
+            conn,
+            unkeyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=first_run_id,
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        # Forge the anomaly: the run row says settled, but its durable
+        # ending event is gone — only the recorded window remains.
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id = ? AND run_id = ? "
+                "AND kind = 'dependency_wait'",
+                (recovery.id, first_run_id),
+            )
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None and second.current_run_id is not None
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="retry verdict",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=second.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []
+
+
+def test_stamped_link_recorded_after_run_end_still_invalidates(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Frozen-clock run-end fence: a link stamped with run R1 but RECORDED
+    after R1's durable run-ending event (same wall-clock second) is a
+    post-mortem write, not R1's topology mutation, and stays material."""
+    _enable(monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, recovery, source_event_id = _gave_up_source_with_settled_recovery(conn)
+        first = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert first is not None and first.current_run_id is not None
+        first_run_id = int(first.current_run_id)
+        holder_id = _dependency_block_recovery(conn, recovery.id)
+        # Post-mortem stamped write: recorded after the run-ending event but
+        # inside the same wall-clock second, so only durable event ordering
+        # can reject it.
+        unkeyed_id = kb.create_task(
+            conn, title="unkeyed continuation", assignee="code-crab",
+        )
+        kb.link_tasks(
+            conn,
+            unkeyed_id,
+            source_id,
+            origin_task_id=recovery.id,
+            origin_run_id=first_run_id,
+        )
+        link_event_id = _last_linked_event_id(conn, source_id)
+        _release_recovery_for_retry(conn, recovery.id, holder_id)
+
+        second = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert second is not None and second.current_run_id is not None
+        with pytest.raises(ValueError, match=rf"via linked:{link_event_id}"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="retry verdict",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=second.current_run_id,
+            )
+        assert _reconciliation_outcomes(conn, source_id) == []

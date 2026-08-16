@@ -4578,6 +4578,14 @@ def _newer_reconciliation_source_event(
                 ).fetchone()
                 if parent_id == allowed_link_parent_id or mirrored_recovery_parent is not None:
                     continue
+                if _is_reconciliation_owned_link(
+                    conn,
+                    row,
+                    source_task_id=source_task_id,
+                    source_event_id=source_event_id,
+                    recovery_task_id=recovery_task_id,
+                ):
+                    continue
         if row["kind"] == "commented" and _is_reconciliation_evidence_comment(
             conn,
             row,
@@ -4588,6 +4596,243 @@ def _newer_reconciliation_source_event(
             continue
         return row
     return None
+
+
+def _recovery_run_covers_event(
+    conn: sqlite3.Connection,
+    recovery_task_id: str,
+    created_at: int,
+    required_profile: Optional[str] = None,
+) -> bool:
+    """Return True when a settled-or-live run of the recovery task covers the
+    durable timestamp.  Crashed/timed-out attempts never vouch for a write,
+    and a run recorded under a different profile than the recovery's current
+    authorized assignee never vouches after reassignment."""
+    rows = conn.execute(
+        "SELECT profile, status, started_at, ended_at FROM task_runs WHERE task_id = ?",
+        (recovery_task_id,),
+    ).fetchall()
+    for run in rows:
+        if run["status"] not in {"running", "blocked", "completed"}:
+            continue
+        if required_profile is not None and run["profile"] != required_profile:
+            continue
+        if int(run["started_at"]) > int(created_at):
+            continue
+        if run["ended_at"] is not None and int(created_at) > int(run["ended_at"]):
+            continue
+        return True
+    return False
+
+
+def _is_reconciliation_owned_link(
+    conn: sqlite3.Connection,
+    event: sqlite3.Row,
+    *,
+    source_task_id: str,
+    source_event_id: int,
+    recovery_task_id: str,
+) -> bool:
+    """Recognize only the required direct-parent link the reconciliation made.
+
+    The recovery protocol requires the worker to link its continuation or
+    dependency as a direct parent of the source before reporting any verdict —
+    including verdict shapes (cleared/resumed, backoff_scheduled,
+    genuine_human_gate, reconciliation_failed) whose metadata names no
+    continuation/dependency id.  That edge is the reconciliation's own required
+    topology mutation, not an independent source advance — but only when
+    durable provenance ties it to THIS recovery task and occurrence:
+
+    * Current-format rows carry exact run provenance (like comments): the
+      stamped run must belong to the recovery task and cover the event, and
+      an occurrence-shaped parent key citing this source must name the cited
+      occurrence.  When the stamped run's claim predates the cited occurrence
+      (durable event ordering, exact even within one wall-clock second), the
+      parent key must name the cited occurrence.
+      Partial or foreign provenance never falls back to the legacy branch.
+    * Legacy rows (run_id NULL, no origin fields) fail closed unless the
+      linked parent's idempotency key cites the exact source occurrence
+      (digit-boundary matched) AND the parent's creation AND the link both
+      fall inside run windows of this recovery task.  New tool writes
+      cannot enter this branch.
+
+    The edge itself must still be present: a link whose parentage was later
+    undone cannot satisfy the protocol, and the removal is separately
+    material.  Every run that vouches for a link — stamped or window-based —
+    must also belong to the recovery's current authorized assignee, so
+    reassignment cannot launder a foreign profile's topology mutation.
+    Everything else — unrelated parents, foreign runs, links outside the
+    recovery task's run windows, wrong-occurrence keys — remains a material
+    source advance and deterministically rejects the verdict.
+    """
+    try:
+        payload = json.loads(event["payload"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("child") != source_task_id:
+        return False
+    parent_id = payload.get("parent")
+    if not isinstance(parent_id, str) or not parent_id:
+        return False
+    if conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (parent_id, source_task_id),
+    ).fetchone() is None:
+        return False
+
+    if event["run_id"] is not None or (
+        "origin_task_id" in payload or "origin_run_id" in payload
+    ):
+        if payload.get("origin_task_id") != recovery_task_id:
+            return False
+        origin_run_id = payload.get("origin_run_id")
+        if type(origin_run_id) is not int or event["run_id"] != origin_run_id:
+            return False
+        recovery = get_task(conn, recovery_task_id)
+        if recovery is None:
+            return False
+        run = conn.execute(
+            "SELECT profile, status, started_at, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (origin_run_id, recovery_task_id),
+        ).fetchone()
+        if (
+            run is None
+            or run["status"] not in {"running", "blocked", "completed"}
+            or int(run["started_at"]) > int(event["created_at"])
+        ):
+            return False
+        # Reassignment must not launder provenance: the stamped run must
+        # belong to the recovery's current authorized assignee, exactly like
+        # the comment-evidence contract.
+        if run["profile"] != recovery.assignee:
+            return False
+        if run["status"] == "running":
+            if (
+                recovery.current_run_id != origin_run_id
+                or run["ended_at"] is not None
+            ):
+                return False
+        else:
+            # Run-end fence — durable event ordering AND the recorded window
+            # must both hold, and the durable ending event must EXIST.  A
+            # settled run without its ending event (deleted, lost, or a
+            # forged run row) cannot vouch on the weaker recorded-window
+            # evidence alone: fail closed.  Event ordering is exact even
+            # when the link and the run-ending event share one wall-clock
+            # second: a link recorded after the run's durable ending event
+            # is a post-mortem write, not that run's topology mutation.  The
+            # recorded window independently rejects a link whose durable
+            # timestamp lies outside the stamped run's lifetime.
+            ending = conn.execute(
+                "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
+                "AND kind IN ('dependency_wait', 'blocked', 'gave_up', 'completed') "
+                "ORDER BY id LIMIT 1",
+                (recovery_task_id, origin_run_id),
+            ).fetchone()
+            if ending is None or int(event["id"]) > int(ending["id"]):
+                return False
+            if (
+                run["ended_at"] is None
+                or int(event["created_at"]) > int(run["ended_at"])
+            ):
+                return False
+        # Run provenance alone cannot vouch for occurrence-shaped keys: a
+        # parent whose idempotency key carries ANY event-N marker must name
+        # the cited occurrence, no matter which source the key cites, or
+        # the link carries the wrong source-event provenance and stays
+        # material.
+        parent = get_task(conn, parent_id)
+        if parent is not None:
+            if _idempotency_key_cites_other_occurrence(
+                parent.idempotency_key or "", source_task_id, source_event_id
+            ):
+                return False
+        # A stamped run whose CLAIM predates the cited occurrence acted under
+        # an older occurrence's context (a mid-run coalescing).  The fence is
+        # durable event ordering — the claimed event id on the recovery task
+        # versus the cited source event id share one global id sequence — so
+        # it is exact even when both land in the same wall-clock second.  A
+        # run without a durable claimed event cannot prove it started after
+        # the occurrence and is treated as predating it.  Such a run's link
+        # is reconciliation-owned only with occurrence-key evidence naming
+        # the cited occurrence; unkeyed or wrongly-keyed parents keep the
+        # wrong source-run/event provenance material.
+        claim = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id LIMIT 1",
+            (recovery_task_id, origin_run_id),
+        ).fetchone()
+        if claim is None or int(claim["id"]) < int(source_event_id):
+            if parent is None or not _idempotency_key_cites_occurrence(
+                parent.idempotency_key or "", source_task_id, source_event_id
+            ):
+                return False
+        return True
+
+    # Bounded compatibility for already-durable pre-provenance links.  The
+    # whole mutation — continuation creation AND the link — must fall inside
+    # run windows of this recovery task, and the parent's idempotency key
+    # must cite the exact occurrence with digit-boundary matching (an
+    # ``event-123`` key must never vouch for occurrence 12).  Unprovenanced
+    # writes from local non-tool paths (CLI/dashboard) cannot be told apart
+    # from pre-provenance durable rows; they are trusted cooperative actors
+    # in the local trust model, exactly as with direct DB writes, while the
+    # worker tool path always stamps exact provenance now.
+    recovery = get_task(conn, recovery_task_id)
+    if recovery is None:
+        return False
+    parent = get_task(conn, parent_id)
+    if parent is None:
+        return False
+    key = parent.idempotency_key or ""
+    if not _idempotency_key_cites_occurrence(key, source_task_id, source_event_id):
+        return False
+    if not _recovery_run_covers_event(
+        conn, recovery_task_id, int(parent.created_at), recovery.assignee
+    ):
+        return False
+    return _recovery_run_covers_event(
+        conn, recovery_task_id, int(event["created_at"]), recovery.assignee
+    )
+
+
+def _idempotency_key_cites_occurrence(
+    key: str, source_task_id: str, source_event_id: int
+) -> bool:
+    """Boundary-exact occurrence citation: the source task id must appear
+    without alphanumeric run-on, and EVERY ``event-<id>`` marker in the key
+    must unanimously name the cited occurrence — a split-verdict key like
+    ``event-100-event-99`` cites nothing."""
+    if not re.search(rf"(?<![0-9A-Za-z_]){re.escape(source_task_id)}(?![0-9A-Za-z_])", key):
+        return False
+    markers = re.findall(r"(?<![0-9A-Za-z_])event-(\d+)(?![0-9])", key)
+    return bool(markers) and all(int(marker) == int(source_event_id) for marker in markers)
+
+
+def _idempotency_key_cites_other_occurrence(
+    key: str, source_task_id: str, source_event_id: int
+) -> bool:
+    """True when the key carries ANY occurrence marker naming a DIFFERENT
+    event id than the cited occurrence — wrong (or split) occurrence
+    provenance, no matter which source task the key names.  A continuation
+    keyed for another source's occurrence (``reconcile-t_other-event-99-…``)
+    must never vouch for THIS occurrence.  Keys without an event marker are
+    not occurrence-shaped and impose no binding.  ``source_task_id`` is
+    retained for call-site symmetry with the legacy branch's citation
+    check."""
+    del source_task_id  # the marker binds regardless of which source is named
+    # Rejection-side detection is broader than the acceptance-side citation
+    # check: underscore is a separator throughout this key namespace (task
+    # ids themselves use them), so ``continuation_event-999`` is
+    # occurrence-shaped and must bind.  Letter-glued shapes (``xevent-99``)
+    # remain non-markers, preserving word-boundary protection.  The
+    # acceptance side stays strict — an unrecognized marker can only ever
+    # reject, never accept.
+    markers = re.findall(r"(?<![0-9A-Za-z])event-(\d+)(?![0-9])", key)
+    return any(int(marker) != int(source_event_id) for marker in markers)
 
 
 def _is_reconciliation_evidence_comment(
@@ -5636,9 +5881,18 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    origin_task_id: Optional[str] = None,
+    origin_run_id: Optional[int] = None,
+) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    if origin_run_id is not None and type(origin_run_id) is not int:
+        raise ValueError("origin_run_id must be an integer or None")
     with write_txn(conn):
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
@@ -5660,9 +5914,17 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
+        event_payload: dict[str, Any] = {"parent": parent_id, "child": child_id}
+        # Stamp exact worker provenance (same contract as add_comment) so the
+        # reconciliation validator can audit WHO created this edge. Without it
+        # the required direct-parent link is indistinguishable from an
+        # unrelated concurrent topology mutation on the source.
+        if origin_task_id:
+            event_payload["origin_task_id"] = origin_task_id
+        if origin_run_id is not None:
+            event_payload["origin_run_id"] = origin_run_id
         _append_event(
-            conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
+            conn, child_id, "linked", event_payload, run_id=origin_run_id,
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
 
