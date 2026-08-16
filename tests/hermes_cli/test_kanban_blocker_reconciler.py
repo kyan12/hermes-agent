@@ -2090,6 +2090,55 @@ def test_prior_run_reconciler_evidence_comment_remains_non_material_on_retry(
         assert source is not None and source.status == "done"
 
 
+def test_prior_run_comment_from_previous_recovery_profile_remains_material(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, profile="default")
+    with kb.connect_closing() as conn:
+        source_id = _running(conn)
+        assert kb.block_task(conn, source_id, reason="retry me", kind="transient")
+        recovery = _reconciliation_tasks(conn)[0]
+        source_event_id = int((recovery.idempotency_key or "").rsplit(":", 1)[1])
+        prior = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert prior is not None and prior.current_run_id is not None
+
+        rollout_id = kb.create_task(conn, title="guard rollout", assignee="code-crab")
+        kb.link_tasks(conn, rollout_id, recovery.id)
+        kb.add_comment(
+            conn,
+            source_id,
+            author="default",
+            body=f"Reconciliation evidence for source event {source_event_id}: prior profile.",
+            origin_task_id=recovery.id,
+            origin_run_id=prior.current_run_id,
+        )
+        assert kb.block_task(
+            conn,
+            recovery.id,
+            reason="waiting for rollout",
+            kind="dependency",
+            expected_run_id=prior.current_run_id,
+        )
+        assert kb.assign_task(conn, recovery.id, "operator")
+        assert kb.complete_task(conn, rollout_id, summary="guard activated")
+        kb.recompute_ready(conn)
+        current = kb.claim_task(conn, recovery.id, claimer="reconciler")
+        assert current is not None and current.current_run_id is not None
+
+        with pytest.raises(ValueError, match="advanced after source event"):
+            kb.complete_task(
+                conn,
+                recovery.id,
+                summary="must reject previous profile evidence",
+                metadata={"reconciliation": {
+                    "source_task_id": source_id,
+                    "source_event_id": source_event_id,
+                    "outcome": "cleared/resumed",
+                }},
+                expected_run_id=current.current_run_id,
+            )
+
+
 def test_legacy_reconciler_evidence_comment_is_tied_to_active_recovery_run(
     isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -4670,6 +4670,7 @@ def _is_reconciliation_evidence_comment(
         if (
             run is None
             or run["profile"] != comment["author"]
+            or run["profile"] != recovery.assignee
             or run["status"] not in {"running", "blocked", "completed"}
             or int(run["started_at"]) > int(comment["created_at"])
         ):
