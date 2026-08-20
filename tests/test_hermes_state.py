@@ -4621,3 +4621,115 @@ class TestFts5SanitizerCharacterClass:
         # text; keep % intact there (pre-existing contract).
         sanitized = self._sanitize("完成50%")
         assert "%" in sanitized
+
+
+class TestListSessionsRichPagingPerf:
+    """Regression for the /api/sessions list perf bug (kanban t_97374e29).
+
+    The order_by_last_active list query used to compute the preview and
+    last_active correlated subqueries — and copy every full session row,
+    system-prompt blob included — for EVERY surfaced session, because
+    ORDER BY effective_last_active has no supporting index and SQLite had
+    to materialize the whole result set into the sorter before LIMIT could
+    apply. On a ~6k-session / multi-GB store that turned a 20-row page into
+    ~3s of work. The query must page first on cheap columns and pay the
+    per-row enrichment only for the rows that survive LIMIT.
+
+    This test measures SQLite VM instruction counts (via the connection
+    progress handler), which are machine-speed independent: the assertion
+    is on the SHAPE of the work, not wall time. The fixture gives each
+    session a long run of assistant messages before its first user message
+    so the preview subquery is genuinely expensive per session; pre-fix the
+    query paid that walk for all 200 sessions (~212k steps), post-fix it
+    pays it only for the 20-row page (~52k steps). The 100k bound keeps
+    ~2x margin against both shapes.
+    """
+
+    _STEP_BOUND = 100_000
+
+    def _bulk_seed(self, db, n_sessions=200, msgs_per_session=150):
+        now = time.time()
+        prompt = "x" * 8192
+        with db._lock:
+            # The list query never touches the FTS tables; dropping the sync
+            # triggers makes bulk fixture seeding ~6x faster without changing
+            # anything the query under test reads.
+            triggers = [
+                r[0]
+                for r in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                ).fetchall()
+            ]
+            for name in triggers:
+                db._conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            for i in range(n_sessions):
+                sid = f"bulk-{i:04d}"
+                base = now - (n_sessions - i) * 1000
+                db._conn.execute(
+                    "INSERT INTO sessions"
+                    " (id, source, started_at, system_prompt, message_count)"
+                    " VALUES (?, 'cli', ?, ?, ?)",
+                    (sid, base, prompt, msgs_per_session),
+                )
+                # Assistant rows land at EARLIER timestamps than the first
+                # user row, so the preview subquery must walk past all of
+                # them (off-index role/content filters → per-row table
+                # lookups) before it can stop.
+                rows = [
+                    (sid, "assistant", f"assistant reply {j} " + "y" * 200, base + j)
+                    for j in range(msgs_per_session - 1)
+                ]
+                rows.append((sid, "user", f"hello from session {i}", base + msgs_per_session))
+                db._conn.executemany(
+                    "INSERT INTO messages (session_id, role, content, timestamp)"
+                    " VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+            db._conn.commit()
+
+    def _count_vm_steps(self, db, fn, quantum=1000):
+        """Run fn() with a progress handler on the read connection the query
+        actually uses (pooled under WAL), returning SQLite VM steps."""
+        from contextlib import contextmanager
+
+        counter = {"n": 0}
+
+        def handler():
+            counter["n"] += 1
+            return 0
+
+        orig = db._read_ctx
+
+        @contextmanager
+        def counting_ctx():
+            with orig() as conn:
+                conn.set_progress_handler(handler, quantum)
+                try:
+                    yield conn
+                finally:
+                    conn.set_progress_handler(None, 0)
+
+        db._read_ctx = counting_ctx
+        try:
+            result = fn()
+        finally:
+            db._read_ctx = orig
+        return counter["n"] * quantum, result
+
+    def test_order_by_last_active_enriches_only_the_page(self, db):
+        self._bulk_seed(db)
+        steps, sessions = self._count_vm_steps(
+            db,
+            lambda: db.list_sessions_rich(limit=20, order_by_last_active=True),
+        )
+        # Behavior is unchanged: freshest 20 sessions, previews resolved.
+        assert len(sessions) == 20
+        assert [s["id"] for s in sessions[:3]] == ["bulk-0199", "bulk-0198", "bulk-0197"]
+        assert all(s["preview"].startswith("hello from session") for s in sessions)
+        assert all(s["last_active"] > 0 for s in sessions)
+        # Perf contract: work is bounded by the page, not the store size.
+        assert steps < self._STEP_BOUND, (
+            f"list_sessions_rich(limit=20) executed {steps:,} SQLite VM steps "
+            f"on a 200-session store — per-surfaced-session enrichment is back "
+            f"(bound: {self._STEP_BOUND:,})"
+        )

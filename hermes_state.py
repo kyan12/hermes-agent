@@ -56,7 +56,6 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _ephemeral_child_sql,
     _shape_preview,
     _sql_session_last_active,
-    _sql_session_last_active_by_id,
     escape_like as _escape_like,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
@@ -7306,11 +7305,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"{where_sql} AND {combined}" if where_sql else f"WHERE {combined}"
                 )
             _sel = self._compact_session_cols() if compact_rows else "s.*"
+            # Page FIRST on cheap columns, then enrich only the rows that
+            # survive LIMIT/OFFSET.
+            #
+            # The previous shape computed the preview/last_active correlated
+            # subqueries and the system_prompt join for EVERY surfaced
+            # session, because ORDER BY _effective_last_active has no
+            # supporting index and SQLite must materialize the full result
+            # set (all columns, including the prompt blob) into the sorter
+            # before it can apply LIMIT. On a ~6k-session / 9 GB store that
+            # meant thousands of message-content reads per 20-row page and
+            # ~3s of latency for GET /api/sessions?limit=20.
+            #
+            # Here the recursive CTE carries last_activity_at/started_at
+            # along (dropping two per-chain-row session lookups), chain_max
+            # stays covering-index only, and the ``page`` CTE applies
+            # ORDER BY + LIMIT while selecting just id/started_at. The outer
+            # query then pays the preview subquery, the last_active
+            # subquery, and the prompt join for ~LIMIT rows instead of
+            # ~COUNT(surfaced) rows.
             query = f"""
-                WITH RECURSIVE chain(root_id, cur_id) AS (
-                    SELECT s.id, s.id FROM sessions s {where_sql}
+                WITH RECURSIVE chain(root_id, cur_id, cur_last_activity, cur_started) AS (
+                    SELECT s.id, s.id, s.last_activity_at, s.started_at FROM sessions s {where_sql}
                     UNION ALL
-                    SELECT c.root_id, child.id
+                    SELECT c.root_id, child.id, child.last_activity_at, child.started_at
                     FROM chain c
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
@@ -7322,9 +7340,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 chain_max AS (
                     SELECT
                         root_id,
-                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
+                        MAX(COALESCE(
+                            (SELECT MAX(_act_v.v) FROM (
+                                SELECT cur_last_activity AS v
+                                UNION ALL
+                                SELECT (SELECT MAX(_act_m.timestamp) FROM messages _act_m
+                                        WHERE _act_m.session_id = cur_id)
+                            ) _act_v),
+                            cur_started
+                        )) AS effective_last_active
                     FROM chain
                     GROUP BY root_id
+                ),
+                page AS (
+                    SELECT s.id, s.started_at,
+                        COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
+                    FROM sessions s
+                    LEFT JOIN chain_max cm ON cm.root_id = s.id
+                    {outer_where}
+                    ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                    LIMIT ? OFFSET ?
                 )
                 SELECT {_sel}{prompt_select},
                     COALESCE(
@@ -7335,16 +7370,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         ''
                     ) AS _preview_raw,
                     {_sql_session_last_active("s")} AS last_active,
-                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
-                FROM sessions s
-                LEFT JOIN chain_max cm ON cm.root_id = s.id
+                    p._effective_last_active
+                FROM page p
+                JOIN sessions s ON s.id = p.id
                 {prompt_join}
-                {outer_where}
-                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
-                LIMIT ? OFFSET ?
+                ORDER BY p._effective_last_active DESC, s.started_at DESC, s.id DESC
             """
-            # WHERE params apply twice (CTE seed + outer select); the id filter
-            # only applies to the outer select.
+            # WHERE params apply twice (CTE seed + page select); the id filter
+            # only applies to the page select.
             params = params + params + id_params + [limit, offset]
         else:
             _sel = self._compact_session_cols() if compact_rows else "s.*"
