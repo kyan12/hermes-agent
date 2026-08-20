@@ -6022,6 +6022,19 @@ class AIAgent:
         self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
 
+        if self.api_mode != "anthropic_messages" and isinstance(runtime_base, str):
+            # Pool entries store the credential-level base URL, which can lack
+            # the path suffix the OpenAI wire needs (Kimi Code stores
+            # ``/coding`` but chat_completions lives at ``/coding/v1``; MiniMax
+            # stores ``/anthropic`` but OpenAI calls land on ``/v1``).  Every
+            # client-construction path runs the URL through
+            # ``_to_openai_base_url``; rotation must apply the same
+            # normalization or the rebound client loses the wire path and
+            # 404s (observed: delegate_task subagent lease swap dropping /v1).
+            from agent.auxiliary_client import _to_openai_base_url
+
+            runtime_base = _to_openai_base_url(runtime_base)
+
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(
             runtime_base
         )
