@@ -139,31 +139,6 @@ def _sql_session_last_active(alias: str = "s") -> str:
     )
 
 
-def _sql_session_last_active_by_id(session_id_expr: str) -> str:
-    """Same freshest-of expression keyed by a session-id SQL expression."""
-    msg_max = (
-        f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
-        f"WHERE _act_m.session_id = {session_id_expr})"
-    )
-    activity = (
-        f"(SELECT last_activity_at FROM sessions _act_s "
-        f"WHERE _act_s.id = {session_id_expr})"
-    )
-    started = (
-        f"(SELECT started_at FROM sessions _act_s "
-        f"WHERE _act_s.id = {session_id_expr})"
-    )
-    return (
-        f"COALESCE("
-        f"(SELECT MAX(_act_v.v) FROM ("
-        f"SELECT {activity} AS v "
-        f"UNION ALL "
-        f"SELECT {msg_max}"
-        f") _act_v), "
-        f"{started})"
-    )
-
-
 SCHEMA_VERSION = 25
 
 
