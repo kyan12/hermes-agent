@@ -110,9 +110,15 @@ def test_pool_entry_minimax_pinned_chat_completions_rebases_anthropic_suffix(mon
     assert resolved["base_url"] == "https://api.minimax.io/v1"
 
 
-def test_pool_entry_unknown_wire_provider_unchanged(monkeypatch):
+@pytest.mark.parametrize(
+    "entry_base_url",
+    ["https://api.deepseek.com/v1", "https://api.deepseek.com"],
+    ids=["already-normalized", "bare-url-byte-identical"],
+)
+def test_pool_entry_unknown_wire_provider_unchanged(monkeypatch, entry_base_url):
     """Acceptance 3 (pool path): providers without a known wire rewrite are
-    byte-identical before and after the normalization."""
+    byte-identical before and after the normalization — both for URLs that
+    already carry a wire path and for bare URLs with no path suffix."""
     monkeypatch.setattr(rp, "_get_model_config", lambda: {
         "provider": "deepseek",
         "api_mode": "chat_completions",
@@ -121,7 +127,7 @@ def test_pool_entry_unknown_wire_provider_unchanged(monkeypatch):
     entry = SimpleNamespace(
         access_token="deepseek-pool-test-key",
         runtime_api_key=None,
-        base_url="https://api.deepseek.com/v1",
+        base_url=entry_base_url,
         runtime_base_url=None,
         source="manual",
     )
@@ -133,7 +139,7 @@ def test_pool_entry_unknown_wire_provider_unchanged(monkeypatch):
     )
 
     assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://api.deepseek.com/v1"
+    assert resolved["base_url"] == entry_base_url
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +284,8 @@ def test_non_pool_unknown_wire_provider_unchanged(monkeypatch):
         # Identity: already-normalized and unknown-rewrite URLs pass through.
         ("chat_completions", KIMI_CODE_OPENAI, KIMI_CODE_OPENAI),
         ("chat_completions", "https://api.deepseek.com/v1", "https://api.deepseek.com/v1"),
+        # Bare URL for a provider with no known rewrite stays byte-identical.
+        ("chat_completions", "https://api.deepseek.com", "https://api.deepseek.com"),
         ("chat_completions", "", ""),
     ],
 )
