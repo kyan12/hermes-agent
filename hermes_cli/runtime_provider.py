@@ -442,6 +442,33 @@ def _maybe_apply_codex_app_server_runtime(
     return api_mode
 
 
+_OPENAI_WIRE_API_MODES = frozenset({"chat_completions", "codex_responses"})
+
+
+def _normalize_openai_wire_base_url(api_mode: str, base_url: str) -> str:
+    """Rebase credential-level base URLs onto the OpenAI wire when the resolved
+    transport is an OpenAI-wire mode.
+
+    Provider credentials (pool entries, api_key resolver defaults) store the
+    base URL the credential was issued against — e.g. Kimi Code's
+    ``https://api.kimi.com/coding``, which is correct for the Anthropic SDK
+    wire but 404s on ``/coding/chat/completions``.  When the resolved
+    api_mode is an OpenAI-wire mode (chat_completions / codex_responses), the
+    final base_url must pass through the same ``_to_openai_base_url``
+    normalization every client-construction path and ``AIAgent._swap_credential``
+    already apply.  The helper is identity for URLs that already carry a wire
+    path (``.../v1``) and for providers with no known rewrite, and is never
+    applied to anthropic_messages (bare ``/coding`` / ``/anthropic`` are the
+    correct Anthropic-wire URLs there).
+    """
+    if api_mode not in _OPENAI_WIRE_API_MODES or not base_url:
+        return base_url
+    # Lazy import: agent.auxiliary_client lazily imports this module.
+    from agent.auxiliary_client import _to_openai_base_url
+
+    return _to_openai_base_url(base_url)
+
+
 def _resolve_runtime_from_pool_entry(
     *,
     provider: str,
@@ -577,6 +604,13 @@ def _resolve_runtime_from_pool_entry(
 
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
+
+    # Credential-level URLs describe the credential's issuing wire, not the
+    # resolved transport: a Kimi Code pool entry stores bare /coding (the
+    # Anthropic-wire URL).  When the resolved api_mode is OpenAI-wire, rebase
+    # onto the OpenAI wire — same normalization _swap_credential applies on
+    # mid-session leases.  Identity for URLs already carrying a wire path.
+    base_url = _normalize_openai_wire_base_url(api_mode, base_url)
 
     return {
         "provider": provider,
@@ -2271,6 +2305,13 @@ def resolve_runtime_provider(
             base_url = normalize_opencode_base_url(provider, api_mode, base_url)
         if provider == "lmstudio":
             base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
+        # Credential-level URLs describe the credential's issuing wire, not the
+        # resolved transport (e.g. an sk-kimi- key resolves bare
+        # api.kimi.com/coding — the Anthropic-wire URL).  When the resolved
+        # api_mode is OpenAI-wire, rebase onto the OpenAI wire; identity for
+        # URLs already carrying a wire path (e.g. user-set model.base_url
+        # ending in /v1).
+        base_url = _normalize_openai_wire_base_url(api_mode, base_url)
         api_key = creds.get("api_key", "")
         if provider == "actual" and not api_key and is_actual_local_base_url(base_url):
             api_key = ACTUAL_LOCAL_NOAUTH_PLACEHOLDER
