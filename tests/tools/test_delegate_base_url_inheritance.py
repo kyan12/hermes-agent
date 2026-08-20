@@ -1,10 +1,17 @@
 """Subagent base_url inheritance must preserve the parent's live wire path.
 
-Regression coverage for kanban t_f736ebb5: a kimi-coding parent's credential
-surface URL is ``https://api.kimi.com/coding`` while its live OpenAI client
-calls ``https://api.kimi.com/coding/v1``.  The spawned child must inherit the
+Characterization coverage for the inheritance contract referenced by kanban
+t_f736ebb5: a kimi-coding parent's credential surface URL is
+``https://api.kimi.com/coding`` while its live OpenAI client calls
+``https://api.kimi.com/coding/v1``.  The spawned child must inherit the
 full path (``/v1`` included) or its first chat_completions request 404s on
 ``/coding/chat/completions``.
+
+Note: these tests intentionally exercise ``_inherit_parent_base_url`` /
+``_build_child_agent``, which were never broken — the t_f736ebb5 404 came
+from the later pool-lease ``_swap_credential`` clobber, covered by
+``tests/run_agent/test_swap_credential_wire_base_url.py``.  This file locks
+the inheritance contract so a future change to either side is caught.
 """
 
 import threading
