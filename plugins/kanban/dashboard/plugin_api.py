@@ -39,6 +39,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -398,16 +399,177 @@ def get_board(
     ``board`` selects which board to read from. Omitting it falls
     through to the active board (``HERMES_KANBAN_BOARD`` env → on-disk
     ``current`` pointer → ``default``).
+
+    Performance: the UI refetches this endpoint on every WebSocket task
+    event (250ms debounce), and a full build is multi-second CPU on large
+    boards, so responses are served from a small versioned cache with
+    single-flight builds — see ``_board_cache`` below. Task bodies are
+    excluded from the payload (they dominated it: >80% of bytes on large
+    boards); cards never render them and the drawer fetches the full task
+    via ``GET /tasks/:id``.
     """
     board = _resolve_board(board)
+    # Key the cache by resolved DB path, not slug: the active-board
+    # resolution for an omitted slug can change between requests, and a
+    # slug-keyed entry would then serve the wrong board.
+    db_path = str(kanban_db.kanban_db_path(board=board))
+    key = (db_path, tenant, include_archived, workflow_template_id, current_step_key)
+    wait_deadline = time.monotonic() + _BOARD_BUILD_WAIT_SECONDS
+    while True:
+        probe = _board_version_probe(db_path)
+        now = time.time()
+        builder_event: Optional[threading.Event] = None
+        am_builder = False
+        with _board_cache_lock:
+            entry = _board_cache.get(key)
+            if (
+                entry is not None
+                and probe is not None
+                and entry["version"] == probe[1]
+                and now - entry["built_at"] < _BOARD_CACHE_TTL_SECONDS
+            ):
+                # Fresh cache hit: patch the live cursor/clock fields so
+                # the client's WebSocket cursor stays aligned, and serve.
+                return {
+                    **entry["payload"],
+                    "latest_event_id": probe[0],
+                    "now": int(now),
+                }
+            builder_event = _board_builders.get(key)
+            if builder_event is None:
+                builder_event = threading.Event()
+                _board_builders[key] = builder_event
+                am_builder = True
+        if not am_builder:
+            # Another worker thread is already building this exact board
+            # view — wait for it instead of piling a duplicate multi-second
+            # build onto the GIL, then loop around to read the cache.
+            remaining = wait_deadline - time.monotonic()
+            if remaining <= 0:
+                # Defensive fallback: the builder is pathologically slow;
+                # build directly rather than stall the request forever.
+                am_builder = True
+                builder_event = None
+            else:
+                builder_event.wait(min(remaining, _BOARD_BUILD_WAIT_SECONDS))
+                continue
+        # Version probed BEFORE the build: the cache entry must describe
+        # the payload's actual snapshot. Events landing mid-build make the
+        # entry immediately stale (next request rebuilds) — never the
+        # reverse, where a stale payload would be certified under a newer
+        # version while the WS refetch that would repair it already joined
+        # this flight.
+        pre_version = probe[1] if probe is not None else -1
+        try:
+            payload = _build_board_payload(
+                board=board,
+                tenant=tenant,
+                include_archived=include_archived,
+                workflow_template_id=workflow_template_id,
+                current_step_key=current_step_key,
+            )
+        except Exception:
+            if builder_event is not None:
+                with _board_cache_lock:
+                    _board_builders.pop(key, None)
+                    builder_event.set()
+            raise
+        post = _board_version_probe(db_path)
+        latest_event_id = post[0] if post is not None else 0
+        with _board_cache_lock:
+            if len(_board_cache) >= _BOARD_CACHE_MAX_KEYS:
+                _board_cache.clear()
+            _board_cache[key] = {
+                "version": pre_version,
+                "built_at": time.time(),
+                "payload": payload,
+            }
+            # Publish the entry BEFORE releasing the single-flight, so a
+            # waking waiter always finds it and never starts a duplicate
+            # build in the gap.
+            if builder_event is not None:
+                _board_builders.pop(key, None)
+                builder_event.set()
+        return {**payload, "latest_event_id": latest_event_id, "now": int(time.time())}
+
+
+# ---------------------------------------------------------------------------
+# Board response cache
+# ---------------------------------------------------------------------------
+# ``/board`` is the dashboard's hottest read: the UI refetches it on every
+# WebSocket task event (250ms debounce), so an active board with several
+# open tabs can demand many full builds per minute. Each build costs
+# multiple seconds of GIL-holding CPU on large boards (diagnostics
+# rollups, per-task serialization), which starves every other route.
+#
+# Cache entries are keyed by (board, filters) and invalidated by a cheap
+# version probe — ``MAX(id)`` over ``task_events`` excluding 'heartbeat'
+# rows, which change no board-rendered field (heartbeat timestamps only
+# surface via ``/workers/active`` and the drawer's run history, both
+# fetched separately). A TTL backstop catches out-of-band writes that
+# emit no events (manual SQL, DB file swaps). Concurrent requests for the
+# same key share a single in-flight build via ``_board_builders``.
+_BOARD_CACHE_TTL_SECONDS = 30.0
+_BOARD_BUILD_WAIT_SECONDS = 20.0
+_BOARD_CACHE_MAX_KEYS = 16
+_board_cache: dict[tuple, dict] = {}
+_board_builders: dict[tuple, threading.Event] = {}
+_board_cache_lock = threading.Lock()
+
+
+def _board_version_probe(db_path: str) -> Optional[tuple[int, int]]:
+    """Cheap board freshness probe: ``(latest_event_id, content_version)``.
+
+    ``latest_event_id`` is the true MAX(id) over task_events (the client's
+    WebSocket cursor); ``content_version`` is MAX(id) excluding 'heartbeat'
+    events, which do not change any board-rendered field. Uses a raw
+    SQLite connection because ``kanban_db.connect()`` costs ~0.4s in WAL
+    setup — far too much for a per-request freshness check. Returns None
+    when the board DB does not exist yet (fresh install), which forces a
+    build so ``_conn()`` can auto-initialize the schema.
+    """
+    try:
+        path = Path(db_path)
+        if not path.exists():
+            return None
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS latest, "
+                "COALESCE(MAX(CASE WHEN kind != 'heartbeat' THEN id END), 0) AS version "
+                "FROM task_events"
+            ).fetchone()
+            return int(row["latest"]), int(row["version"])
+        finally:
+            conn.close()
+    except Exception as exc:  # probe failure must never break the board
+        log.debug("board version probe failed: %s", exc)
+        return None
+
+
+def _build_board_payload(
+    *,
+    board: Optional[str],
+    tenant: Optional[str],
+    include_archived: bool,
+    workflow_template_id: Optional[str],
+    current_step_key: Optional[str],
+) -> dict:
+    """Full board build — everything except ``latest_event_id``/``now``,
+    which the caller patches in at serve time."""
     conn = _conn(board=board)
     try:
+        # Task bodies are excluded at the SQL layer: they accounted for
+        # >80% of the payload on large boards and no board-list consumer
+        # renders them (the drawer fetches /tasks/:id for the full body).
         tasks = kanban_db.list_tasks(
             conn,
             tenant=tenant,
             include_archived=include_archived,
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
+            include_body=False,
         )
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
@@ -447,10 +609,6 @@ def get_board(
         # summary for the card badge (so cards don't carry the detail
         # text; the drawer fetches that via /tasks/:id or /diagnostics).
         diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
-
-        latest_event_id = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
-        ).fetchone()["m"]
 
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
@@ -506,8 +664,6 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
-            "latest_event_id": int(latest_event_id),
-            "now": int(time.time()),
         }
     finally:
         conn.close()

@@ -3670,8 +3670,22 @@ def list_tasks(
     order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    include_body: bool = True,
 ) -> list[Task]:
-    query = "SELECT * FROM tasks WHERE 1=1"
+    if include_body:
+        select_cols = "*"
+    else:
+        # Skip the (potentially very large) body column — list consumers
+        # like the dashboard board view never render it, and projecting it
+        # for hundreds of tasks dominates both query and serialization
+        # time. ``NULL AS body`` keeps ``Task.from_row`` happy.
+        cols = [
+            r[1]
+            for r in conn.execute("PRAGMA table_info(tasks)").fetchall()
+            if r[1] != "body"
+        ]
+        select_cols = ", ".join(cols) + ", NULL AS body"
+    query = f"SELECT {select_cols} FROM tasks WHERE 1=1"
     params: list[Any] = []
     if assignee is not None:
         query += " AND assignee = ?"
