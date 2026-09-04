@@ -181,6 +181,34 @@ def test_intentional_park_requires_current_trusted_evidence(board):
     assert tid in {row["task_id"] for row in health["no_forward_path"]}
 
 
+def test_untyped_schedule_clears_stale_typed_hold_fields(board):
+    tid = _mk(board)
+    with kb.write_txn(board):
+        board.execute(
+            "UPDATE tasks SET hold_kind='wake', hold_wake_at=?, gate_evidence=? WHERE id=?",
+            (int(time.time()) + 60, '{"stale": true}', tid),
+        )
+
+    assert kb.schedule_task(board, tid, reason="legacy scheduler")
+    task = kb.get_task(board, tid)
+    assert task is not None
+    assert (task.hold_kind, task.hold_wake_at, task.gate_evidence) == (None, None, None)
+
+
+def test_new_schedule_occurrence_invalidates_stale_typed_hold(board):
+    tid = _mk(board)
+    future = int(time.time()) + 3600
+    assert kh.set_hold(board, tid, kind="wake", wake_at=future, apply=True)
+    with kb.write_txn(board):
+        kb._append_event(board, tid, "scheduled", {"reason": "new occurrence"})
+
+    health = kh.board_health(board)
+    hold = next(row for row in health["holds"] if row["task_id"] == tid)
+    assert hold["healthy"] is False
+    assert hold["reason_code"] == "stale_hold_occurrence"
+    assert tid in {row["task_id"] for row in health["no_forward_path"]}
+
+
 def test_set_hold_rejects_parentless_dependency(board):
     tid = _mk(board)
 
@@ -189,14 +217,18 @@ def test_set_hold_rejects_parentless_dependency(board):
 
 
 def test_parentless_dependency_hold_is_broken_and_never_resumed(board):
+    # A dependency hold typed against real parents, whose links then vanish.
+    # The classification stays bound to this occurrence, so the verdict is
+    # about the dependency itself rather than about a stale typing.
+    parent = _mk(board, "parent")
     tid = _mk(board)
+    kb.link_tasks(board, parent_id=parent, child_id=tid)
+    assert kh.set_hold(board, tid, kind="dependency", apply=True)
     with kb.write_txn(board):
-        board.execute(
-            "UPDATE tasks SET status='scheduled', hold_kind='dependency' WHERE id=?",
-            (tid,),
-        )
+        board.execute("DELETE FROM task_links WHERE child_id=?", (tid,))
 
     state = kh.classify_hold(
+        board,
         kb.get_task(board, tid),
         now=int(time.time()),
         wake_health={"healthy": True},

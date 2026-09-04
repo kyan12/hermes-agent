@@ -262,6 +262,7 @@ REASON_DEPENDENCY_UNFINISHED = "dependency_unfinished"
 REASON_DEPENDENCY_SATISFIED = "dependency_satisfied"
 REASON_DEPENDENCY_BROKEN = "dependency_broken"
 REASON_UNKNOWN_HOLD_KIND = "unknown_hold_kind"
+REASON_STALE_HOLD_OCCURRENCE = "stale_hold_occurrence"
 
 # Forward path
 REASON_LIVE_WORKER = "live_worker"
@@ -680,8 +681,6 @@ def set_hold(
     task = kb.get_task(conn, task_id)
     if task is None:
         return False
-    if parsed is not None:
-        parsed = replace(parsed, task_id=task_id)
 
     # Status, typed fields, closing run, and both audit events are one commit.
     # A crash or constraint failure cannot leave a scheduled-but-untyped row.
@@ -712,8 +711,27 @@ def set_hold(
                 run_id = kb._synthesize_ended_run(
                     conn, task_id, outcome="scheduled", summary=reason
                 )
-            kb._append_event(
+            occurrence_id = kb._append_event(
                 conn, task_id, "scheduled", {"reason": reason}, run_id=run_id
+            )
+        else:
+            occurrence_id = latest_hold_occurrence(conn, task_id)
+            if occurrence_id is None and apply:
+                # The card is already ``scheduled`` but no event proves which
+                # occurrence that is — a legacy or foreign writer moved it.
+                # Open one now, so the classification written below is bound to
+                # something a reader can verify instead of to the task id alone.
+                occurrence_id = kb._append_event(
+                    conn, task_id, "scheduled", {"reason": reason}
+                )
+
+        # Bind the evidence to THIS occurrence, not just to the card. Evidence
+        # carrying only a task id stays valid across an unblock/re-schedule
+        # cycle, which is how a previous park's affirmation gets replayed as
+        # authority for a park nobody approved.
+        if parsed is not None:
+            parsed = replace(
+                parsed, task_id=task_id, occurrence_event_id=occurrence_id
             )
         cur = conn.execute(
             "UPDATE tasks SET hold_kind = ?, hold_wake_at = ?, "
@@ -732,7 +750,12 @@ def set_hold(
             conn,
             task_id,
             "hold_typed",
-            {"kind": kind, "wake_at": wake_at, "reason": reason},
+            {
+                "kind": kind,
+                "wake_at": wake_at,
+                "reason": reason,
+                "occurrence_event_id": occurrence_id,
+            },
             run_id=run_id,
         )
         if reason and author:
@@ -921,6 +944,108 @@ def latest_block_occurrence(conn, task_id: str) -> Optional[int]:
         return None
 
 
+# Event kinds that end a card's current ``scheduled`` occurrence. Anything
+# after the opening ``scheduled`` event from this list means the card left the
+# hold, so whatever typed classification the row still carries describes an
+# occurrence that is over.
+_HOLD_OCCURRENCE_EXIT_KINDS = (
+    "unblocked", "claimed", "completed", "archived", "blocked",
+    "promoted", "promoted_manual", "reclaimed", "hold_resumed",
+    "review_requested", "review_reopened", "changes_requested",
+)
+
+
+def latest_hold_occurrence(conn, task_id: Optional[str]) -> Optional[int]:
+    """Event id of the ``scheduled`` event that opened the CURRENT hold.
+
+    ``None`` when the event log cannot prove one: no ``scheduled`` event at
+    all, or a later event that took the card back out of ``scheduled``.
+
+    The ``tasks`` row alone cannot answer this, for the same reason
+    :func:`latest_block_occurrence` exists. ``hold_kind``, ``hold_wake_at`` and
+    ``gate_evidence`` are plain columns, and a writer that predates them — or
+    an older version running against the same shared DB — can resume and
+    re-schedule a card while leaving all three untouched. A row-only reader
+    would then treat the PREVIOUS occurrence's classification as current.
+    """
+    if conn is None or not task_id:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'scheduled' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        event_id = int(row["id"])
+        placeholders = ",".join("?" * len(_HOLD_OCCURRENCE_EXIT_KINDS))
+        left = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+            f"AND kind IN ({placeholders}) LIMIT 1",
+            (task_id, event_id, *_HOLD_OCCURRENCE_EXIT_KINDS),
+        ).fetchone()
+        if left is not None:
+            return None
+        return event_id
+    except Exception:
+        # An unreadable event log is not proof of a current classification.
+        return None
+
+
+def hold_occurrence_binding(conn, task) -> Optional[int]:
+    """The current scheduled occurrence this card's typed hold is bound to.
+
+    ``None`` — fail closed — unless the event log proves that the row's typed
+    fields (and any evidence they cite) were written by :func:`set_hold` *for
+    the occurrence the card is sitting in right now*. That covers the two ways
+    a stale classification becomes unearned authority: an intentional park
+    replaying a previous occurrence's affirmation, and a dependency or wake
+    hold resuming on a classification that a later re-schedule invalidated.
+    """
+    occurrence = latest_hold_occurrence(conn, getattr(task, "id", None))
+    if occurrence is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'hold_typed' AND id > ? ORDER BY id DESC LIMIT 1",
+            (task.id, occurrence),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["payload"] or "{}")
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("occurrence_event_id") or 0) != occurrence:
+        return None
+    # The typing event must describe the fields the row actually carries;
+    # otherwise the row was edited after it was classified.
+    if payload.get("kind") != getattr(task, "hold_kind", None):
+        return None
+    if _as_epoch(payload.get("wake_at")) != _as_epoch(
+        getattr(task, "hold_wake_at", None)
+    ):
+        return None
+    raw_evidence = getattr(task, "gate_evidence", None)
+    if raw_evidence is not None:
+        evidence = parse_evidence(raw_evidence)
+        if evidence is None or evidence.task_id != task.id:
+            return None
+        if evidence.occurrence_event_id != occurrence:
+            return None
+    return occurrence
+
+
+def _as_epoch(value: Any) -> Optional[int]:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def classify_block(conn, task) -> BlockProjection:
     """Decide whether a ``blocked`` card is a human gate or a machine hold.
 
@@ -1001,9 +1126,41 @@ class HoldState:
 
 
 def classify_hold(
+    conn, task, *, now: int, wake_health: dict, parents_done: Optional[bool]
+) -> HoldState:
+    """Classify a ``scheduled`` card against the clock and its dependencies.
+
+    A classification only carries authority for the occurrence it was written
+    for. Before any typed field is believed, it must be bound to the card's
+    current scheduled occurrence (see :func:`hold_occurrence_binding`) —
+    otherwise ``hold_kind``, ``hold_wake_at`` and ``gate_evidence`` describe an
+    occurrence that is over, and every verdict derived from them (a healthy
+    park, a due wake, even ``dependency_broken``) is a statement about the
+    wrong one. Unbound fails closed to ``stale_hold_occurrence`` and needs
+    re-typing; that is what stops a previous park's affirmation, or a
+    previous wait's wake time, from authorizing this occurrence.
+
+    *conn* is required for that reason. The two shape verdicts below are
+    properties of the row itself rather than of any occurrence, so they keep
+    their more specific diagnostic.
+    """
+    state = _classify_hold_state(
+        task, now=now, wake_health=wake_health, parents_done=parents_done
+    )
+    if state.reason_code in (REASON_LEGACY_UNTYPED, REASON_UNKNOWN_HOLD_KIND):
+        return state
+    if hold_occurrence_binding(conn, task) is None:
+        return HoldState(
+            task.id, state.kind, state.wake_at, False,
+            REASON_STALE_HOLD_OCCURRENCE, needs_classification=True,
+        )
+    return state
+
+
+def _classify_hold_state(
     task, *, now: int, wake_health: dict, parents_done: Optional[bool]
 ) -> HoldState:
-    """Classify a ``scheduled`` card against the clock and its dependencies."""
+    """The occurrence-independent half of :func:`classify_hold`."""
     kind = getattr(task, "hold_kind", None)
     wake_at = getattr(task, "hold_wake_at", None)
 
@@ -1220,7 +1377,7 @@ def forward_path(
 
     if status == "scheduled":
         hold = classify_hold(
-            task, now=now, wake_health=wake_health,
+            conn, task, now=now, wake_health=wake_health,
             parents_done=_parents_done(conn, task.id),
         )
         return ForwardPath(
@@ -1338,7 +1495,7 @@ def reconcile_board(
     for task in scheduled:
         try:
             hold = classify_hold(
-                task, now=ts, wake_health=wake,
+                conn, task, now=ts, wake_health=wake,
                 parents_done=_parents_done(conn, task.id),
             )
             entry = {
@@ -1380,6 +1537,7 @@ def reconcile_board(
                     report.parked.append({**entry, "reason_code": "already_resumed"})
                     continue
                 current_hold = classify_hold(
+                    conn,
                     current,
                     now=ts,
                     wake_health=wake,
@@ -1958,7 +2116,7 @@ def board_health(
 
         if task.status == "scheduled":
             hold = classify_hold(
-                task, now=ts, wake_health=wake,
+                conn, task, now=ts, wake_health=wake,
                 parents_done=_parents_done(conn, task.id),
             )
             holds.append(

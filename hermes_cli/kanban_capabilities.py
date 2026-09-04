@@ -279,6 +279,7 @@ def _probe_typed_scheduled_hold(conn) -> bool:
     if not kh.set_hold(conn, parked, kind="external", apply=True):
         return False
     state = kh.classify_hold(
+        conn,
         kb.get_task(conn, parked),
         now=int(time.time()),
         wake_health={"enabled": True, "healthy": True, "reason_code": None},
@@ -326,6 +327,7 @@ def _probe_legacy_hold_is_loud(conn) -> bool:
             (tid,),
         )
     state = kh.classify_hold(
+        conn,
         kb.get_task(conn, tid),
         now=int(time.time()),
         wake_health={"enabled": True, "healthy": True, "reason_code": None},

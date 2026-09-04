@@ -8026,6 +8026,13 @@ def schedule_task(
     ``scheduled`` tasks are intentionally not dispatchable; an external cron,
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
+
+    This is the *untyped* scheduling path, so it clears the typed hold columns:
+    the new occurrence has not been classified by anyone. Carrying a previous
+    occurrence's ``hold_kind``/``hold_wake_at``/``gate_evidence`` forward would
+    let ``kanban_health`` read a stale park or wake as authority for this one.
+    Untyped is the honest answer here — the control loop reports it as
+    ``legacy_untyped`` until a human types it.
     """
     with write_txn(conn):
         params: list[Any] = [task_id]
@@ -8034,7 +8041,10 @@ def schedule_task(
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   hold_kind    = NULL,
+                   hold_wake_at = NULL,
+                   gate_evidence= NULL
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
