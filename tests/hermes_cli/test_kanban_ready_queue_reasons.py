@@ -88,6 +88,40 @@ def test_default_assignee_census_matches_dispatch_eligibility(board, real_profil
     assert [item[0] for item in dispatched.spawned] == [tid]
 
 
+def test_default_assignee_does_not_make_unassigned_review_spawnable(
+    board, real_profiles, monkeypatch
+):
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+    tid = kb.create_task(board, title="unowned review", assignee=None)
+    assert kb.request_review(board, tid, summary="review")
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+
+    report = kh.ready_queue_report(board, default_assignee="alice")
+    dispatched = kb.dispatch_once(board, dry_run=True, default_assignee="alice")
+    assert _reasons(report)[tid] == kh.READY_UNASSIGNED
+    assert report.spawnable_ids == []
+    assert dispatched.spawned == []
+    assert dispatched.skipped_unassigned == [tid]
+
+
+def test_ready_report_matches_separate_lane_order_and_review_reservation(
+    board, real_profiles, monkeypatch
+):
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+    ready_high = kb.create_task(board, title="ready high", assignee="alice", priority=30)
+    ready_low = kb.create_task(board, title="ready low", assignee="bob", priority=20)
+    review = kb.create_task(board, title="review low", assignee="carol", priority=1)
+    assert kb.request_review(board, review, summary="review")
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+
+    report = kh.ready_queue_report(board, max_spawn=2, memory_pressure="unknown")
+    dispatched = kb.dispatch_once(board, dry_run=True, max_spawn=2)
+    expected = [item[0] for item in dispatched.spawned]
+    assert expected == [ready_high, review]
+    assert report.spawnable_ids == expected
+    assert _reasons(report)[ready_low] == kh.READY_CAPACITY_MAX_SPAWN
+
+
 def test_global_capacity_wait_is_a_capacity_reason(board, real_profiles):
     running = kb.create_task(board, title="already running", assignee="alice")
     kb.claim_task(board, running)

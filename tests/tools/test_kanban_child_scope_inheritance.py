@@ -55,9 +55,11 @@ def scoped_worker(monkeypatch, tmp_path):
             session_id="sess-principal-1",
         )
         kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
     return tid
 
@@ -152,6 +154,78 @@ def test_child_without_an_executor_is_refused(scoped_worker):
     assert "assignee" in out["error"]
 
 
+def test_task_bound_create_fails_closed_when_self_row_is_missing(
+    scoped_worker, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing_authority")
+    out = _create(
+        title="escape", assignee="test-worker", parents=["t_missing_authority"]
+    )
+    assert "error" in out
+    assert "authoritative" in out["error"].lower() or "not found" in out["error"].lower()
+
+
+def test_task_bound_create_requires_self_as_parent(scoped_worker):
+    out = _create(title="orphan continuation", assignee="test-worker", parents=[])
+    assert "error" in out
+    assert "parent" in out["error"].lower()
+
+
+def test_task_bound_create_rejects_stale_run_and_executor(
+    scoped_worker, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999999")
+    stale = _create(
+        title="stale run", assignee="test-worker", parents=[scoped_worker]
+    )
+    assert "error" in stale and "run" in stale["error"].lower()
+
+    with kb.connect() as conn:
+        current_run = kb.get_task(conn, scoped_worker).current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current_run))
+    monkeypatch.setenv("HERMES_PROFILE", "other-worker")
+    wrong_executor = _create(
+        title="wrong executor", assignee="test-worker", parents=[scoped_worker]
+    )
+    assert "error" in wrong_executor
+    assert "executor" in wrong_executor["error"].lower()
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        ("tenant", "other-tenant"),
+        ("session_id", "other-session"),
+        ("project_id", "other-project"),
+        ("assignee", "other-worker"),
+        ("workspace_path", "/other/repository/worktree"),
+    ],
+)
+def test_task_bound_create_rejects_cross_scope_additional_parent(
+    scoped_worker, column, value
+):
+    with kb.connect() as conn:
+        other = kb.create_task(
+            conn, title="foreign authority", assignee="test-worker",
+            tenant="acme-legal-entity", session_id="sess-principal-1",
+        )
+        authoritative = kb.get_task(conn, scoped_worker)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET project_id=?, workspace_kind=?, workspace_path=? WHERE id=?",
+                (authoritative.project_id, authoritative.workspace_kind,
+                 authoritative.workspace_path, other),
+            )
+            conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, other))
+
+    out = _create(
+        title="mixed graph", assignee="test-worker",
+        parents=[scoped_worker, other],
+    )
+    assert "error" in out, (column, out)
+    assert "parent" in out["error"].lower() or column.split("_")[0] in out["error"].lower()
+
+
 # ---------------------------------------------------------------------------
 # authority
 # ---------------------------------------------------------------------------
@@ -162,10 +236,13 @@ def test_child_records_the_acting_profile_as_creator(scoped_worker):
     assert _task(child).created_by == "test-worker"
 
 
-def test_child_creator_authority_comes_from_parent_not_ambient(scoped_worker, monkeypatch):
+def test_child_creator_authority_rejects_ambient_executor_impostor(scoped_worker, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "ambient-impostor")
-    child = _child_of(scoped_worker)
-    assert _task(child).created_by == "test-worker"
+    out = _create(
+        title="continuation", assignee="test-worker", parents=[scoped_worker]
+    )
+    assert "error" in out
+    assert "executor" in out["error"].lower()
 
 
 def test_worker_cannot_route_a_continuation_off_its_pinned_board(scoped_worker):
@@ -263,9 +340,11 @@ def project_worker(monkeypatch, tmp_path):
                 ("alpha", str(parent_wt), f"alpha/{tid}", tid),
             )
         kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
     return tid, repo
 

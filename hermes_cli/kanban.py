@@ -57,8 +57,8 @@ def _fmt_task_line(t: kb.Task) -> str:
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
-def _task_to_dict(t: kb.Task) -> dict[str, Any]:
-    return {
+def _task_to_dict(t: kb.Task, conn=None) -> dict[str, Any]:
+    payload = {
         "id": t.id,
         "title": t.title,
         "body": t.body,
@@ -83,6 +83,10 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
+    if conn is not None:
+        from hermes_cli import kanban_health as kh
+        return kh.project_task_serialization(conn, t, payload)
+    return payload
 
 
 def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
@@ -1854,20 +1858,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
             }
             if args.status == "blocked":
                 tasks = [t for t in tasks if projections[t.id].visible]
+        serialized = {t.id: _task_to_dict(t, conn) for t in tasks}
     if getattr(args, "json", False):
         payload = []
         for t in tasks:
-            row = _task_to_dict(t)
-            projection = projections.get(t.id)
-            if projection is not None:
-                row["block_projection"] = {
-                    "visible": projection.visible,
-                    "reason_code": projection.reason_code,
-                    "action": projection.action,
-                }
-                if not projection.visible:
-                    row["status"] = "triage"
-            payload.append(row)
+            payload.append(serialized[t.id])
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     # Passive discoverability: when the user has multiple boards, surface
@@ -1920,12 +1915,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        task_payload = _task_to_dict(task, conn)
+        projected_status = task_payload["status"]
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
 
     if getattr(args, "json", False):
         payload = {
-            "task": _task_to_dict(task),
+            "task": task_payload,
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -1963,7 +1960,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return 0
 
     print(f"Task {task.id}: {task.title}")
-    print(f"  status:    {task.status}")
+    print(f"  status:    {projected_status}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")

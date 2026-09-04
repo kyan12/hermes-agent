@@ -63,9 +63,11 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return tid
 
 
@@ -78,6 +80,20 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
+
+
+def test_show_projects_untyped_block_as_triage(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="legacy block", assignee="test-worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+    task = json.loads(kt._handle_show({"task_id": tid}))["task"]
+    assert task["status"] == "triage"
+    assert task["block_projection"]["visible"] is False
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
@@ -860,6 +876,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "auto-sub gateway",
         "assignee": "test-worker",
+        "parents": [worker_env],
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -894,6 +911,7 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "auto-sub tui",
         "assignee": "test-worker",
+        "parents": [worker_env],
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -920,6 +938,7 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "no sub cli",
         "assignee": "test-worker",
+        "parents": [worker_env],
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -942,6 +961,8 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
         "kanban:\n  auto_subscribe_on_create: false\n"
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
 
@@ -976,6 +997,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
         "assignee": "test-worker",
+        "parents": [worker_env],
     })
     d = json.loads(out)
     assert d["ok"] is True, d

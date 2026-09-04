@@ -164,6 +164,16 @@ def _mirror_install(root: Path, patch: dict | None = None) -> Path:
     return root
 
 
+def _candidate_with_replacement(tmp_path: Path, rel: str, old: str, new: str) -> Path:
+    """Mirror this install with one deliberate production-seam regression."""
+    source = (REPO_ROOT / rel).read_text(encoding="utf-8")
+    assert source.count(old) == 1, f"regression fixture is stale for {rel}"
+    return _mirror_install(
+        tmp_path / "staged",
+        patch={rel: source.replace(old, new)},
+    )
+
+
 def _self_certifying_manifest() -> str:
     """A candidate manifest that declares every capability present."""
     return textwrap.dedent(
@@ -224,6 +234,54 @@ def test_canary_fails_a_candidate_that_keeps_symbols_but_no_ops_behaviour(tmp_pa
     # … and the canary fails anyway, because the behaviour is gone.
     assert result.ok is False
     assert "kanban.sentinel" in result.missing
+
+
+def test_canary_fails_when_dispatch_drops_native_reconciliation(tmp_path):
+    staged = _candidate_with_replacement(
+        tmp_path,
+        "hermes_cli/kanban_db.py",
+        "    if not dry_run:\n        try:\n            from hermes_cli import kanban_health as _kh\n\n            _health = _kh.reconcile_board(conn)\n",
+        "    if False and not dry_run:\n        try:\n            from hermes_cli import kanban_health as _kh\n\n            _health = _kh.reconcile_board(conn)\n",
+    )
+    result = kc.preactivation_canary(staged)
+    assert result.ok is False, result.detail
+    assert "kanban.durable_wake_reconciler" in result.missing
+
+
+def test_canary_fails_when_dispatch_and_ready_report_drift(tmp_path):
+    staged = _candidate_with_replacement(
+        tmp_path,
+        "hermes_cli/kanban_health.py",
+        '        assignee = task.assignee or (fallback_assignee if lane == "ready" else None)\n',
+        "        assignee = task.assignee or fallback_assignee\n",
+    )
+    result = kc.preactivation_canary(staged)
+    assert result.ok is False, result.detail
+    assert "kanban.ready_queue_reason_codes" in result.missing
+
+
+def test_canary_fails_when_continuation_authority_is_reduced_to_ambient_scope(tmp_path):
+    staged = _candidate_with_replacement(
+        tmp_path,
+        "tools/kanban_tools.py",
+        '    self_tid = os.environ.get("HERMES_KANBAN_TASK")\n',
+        "    self_tid = None  # regression: trust ambient scope, not the task row\n",
+    )
+    result = kc.preactivation_canary(staged)
+    assert result.ok is False, result.detail
+    assert "kanban.continuation_scope_inheritance" in result.missing
+
+
+def test_canary_fails_when_user_surface_block_projection_is_bypassed(tmp_path):
+    staged = _candidate_with_replacement(
+        tmp_path,
+        "hermes_cli/kanban_health.py",
+        "    projected = dict(payload)\n    status = getattr(task, \"status\", None)\n",
+        "    return dict(payload)  # regression: expose durable blocked blindly\n    status = getattr(task, \"status\", None)\n",
+    )
+    result = kc.preactivation_canary(staged)
+    assert result.ok is False, result.detail
+    assert "kanban.typed_block_projection" in result.missing
 
 
 def test_canary_fails_closed_when_the_staged_tree_cannot_be_probed(tmp_path):

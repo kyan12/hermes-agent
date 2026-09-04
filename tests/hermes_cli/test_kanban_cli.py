@@ -79,6 +79,19 @@ def test_list_blocked_json_projects_only_current_affirmed_gates(kanban_home, mon
     assert payload[0]["block_projection"]["visible"] is True
 
 
+def test_show_projects_unaffirmed_block_without_mutating_row(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="machine hold", assignee="alice")
+        assert kb.block_task(conn, tid, reason="retry internally", kind="transient")
+
+    payload = json.loads(kc.run_slash(f"show {tid} --json"))["task"]
+    assert payload["status"] == "triage"
+    assert payload["block_projection"]["visible"] is False
+    assert "status:    triage" in kc.run_slash(f"show {tid}")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")

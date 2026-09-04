@@ -952,6 +952,32 @@ def classify_block(conn, task) -> BlockProjection:
     )
 
 
+def project_task_serialization(conn, task, payload: dict) -> dict:
+    """Return a user-facing task payload with authority-aware block state.
+
+    The durable row remains untouched. A raw ``blocked`` value is not itself
+    proof of a current human gate; serializers must consult the event log.
+    """
+    projected = dict(payload)
+    status = getattr(task, "status", None)
+    # ``triage`` is the durable destination for an unaffirmed block request.
+    # It still benefits from the same explanation payload as a legacy raw
+    # blocked row, while remaining non-visible and non-mutating.
+    if status != "blocked" and not (
+        status == "triage" and getattr(task, "block_kind", None) is not None
+    ):
+        return projected
+    block = classify_block(conn, task)
+    projected["block_projection"] = {
+        "visible": block.visible,
+        "reason_code": block.reason_code,
+        "action": block.action,
+    }
+    if not block.visible:
+        projected["status"] = "triage"
+    return projected
+
+
 # ---------------------------------------------------------------------------
 # Hold classification (invariants B + D)
 # ---------------------------------------------------------------------------
@@ -1612,7 +1638,14 @@ def ready_queue_report(
     except Exception:
         profile_exists = None  # type: ignore[assignment]
     configured_control_plane = control_plane_assignees()
-    fallback_assignee = (default_assignee or "").strip() or None
+    configured_fallback = (default_assignee or "").strip() or None
+    fallback_assignee = configured_fallback
+    if fallback_assignee and profile_exists is not None:
+        try:
+            if not profile_exists(fallback_assignee):
+                fallback_assignee = None
+        except Exception:
+            pass
 
     review_enabled = True
     try:
@@ -1620,18 +1653,47 @@ def ready_queue_report(
     except Exception:
         review_enabled = True
 
-    rows = conn.execute(
-        "SELECT id, status FROM tasks WHERE status IN ('ready','review') "
+    ready_rows = conn.execute(
+        "SELECT id, status, assignee FROM tasks WHERE status = 'ready' "
+        "AND claim_lock IS NULL ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    review_rows = conn.execute(
+        "SELECT id, status, assignee FROM tasks WHERE status = 'review' "
         "AND claim_lock IS NULL ORDER BY priority DESC, created_at ASC"
     ).fetchall()
 
+    # Mirror dispatch's lane reservation exactly: only an assigned review for
+    # a spawnable profile reserves one bounded slot. Unassigned review never
+    # receives default_assignee and therefore never taxes ready throughput.
+    def _review_reserves_slot(row) -> bool:
+        assignee = row["assignee"]
+        if not review_enabled or not assignee:
+            return False
+        if profile_exists is None:
+            return True
+        try:
+            return bool(profile_exists(assignee))
+        except Exception:
+            return True
+
+    ready_budget = spawn_budget
+    if (
+        spawn_budget is not None
+        and spawn_budget > 0
+        and any(_review_reserves_slot(row) for row in review_rows)
+    ):
+        ready_budget = max(spawn_budget - 1, 0)
+
+    rows = [(row, "ready") for row in ready_rows]
+    rows.extend((row, "review") for row in review_rows)
+
     spawned = 0
-    for row in rows:
+    ready_spawned = 0
+    for row, lane in rows:
         task = kb.get_task(conn, row["id"])
         if task is None:
             continue
-        assignee = task.assignee or fallback_assignee
-        lane = "review" if row["status"] == "review" else "ready"
+        assignee = task.assignee or (fallback_assignee if lane == "ready" else None)
 
         if not assignee:
             report.entries.append(
@@ -1731,7 +1793,16 @@ def ready_queue_report(
 
         # Everything card-specific passed. What is left is the tick's shared
         # budget, which the dispatcher consumes in this same order.
-        if spawn_budget is not None and spawned >= spawn_budget:
+        lane_budget_exhausted = (
+            lane == "ready"
+            and ready_budget is not None
+            and ready_spawned >= ready_budget
+        ) or (
+            lane == "review"
+            and spawn_budget is not None
+            and spawned >= spawn_budget
+        )
+        if lane_budget_exhausted:
             reason = (
                 READY_MEMORY_PRESSURE_ELEVATED
                 if memory_pressure == "elevated"
@@ -1751,6 +1822,8 @@ def ready_queue_report(
         report.entries.append(ReadyEntry(task.id, assignee, READY_SPAWNABLE))
         report.spawnable_ids.append(task.id)
         spawned += 1
+        if lane == "ready":
+            ready_spawned += 1
         if per_profile_cap is not None:
             per_profile_running[assignee] = per_profile_running.get(assignee, 0) + 1
 

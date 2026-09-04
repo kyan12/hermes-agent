@@ -514,17 +514,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "parent_count": len(parents),
         "child_count": len(children),
     }
-    if task.status == "blocked":
-        from hermes_cli import kanban_health as kh
-        projection = kh.classify_block(conn, task)
-        result["block_projection"] = {
-            "visible": projection.visible,
-            "reason_code": projection.reason_code,
-            "action": projection.action,
-        }
-        if not projection.visible:
-            result["status"] = "triage"
-    return result
+    from hermes_cli import kanban_health as kh
+    return kh.project_task_serialization(conn, task, result)
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +544,7 @@ def _handle_show(args: dict, **kw) -> str:
             children = kb.child_ids(conn, tid)
 
             def _task_dict(t):
-                return {
+                result = {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
@@ -567,6 +558,8 @@ def _handle_show(args: dict, **kw) -> str:
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
                 }
+                from hermes_cli import kanban_health as kh
+                return kh.project_task_serialization(conn, t, result)
 
             def _run_dict(r):
                 return {
@@ -1375,7 +1368,7 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
-def _inherited_parent_scope(kb, conn) -> dict:
+def _inherited_parent_scope(kb, conn, parents) -> tuple[dict, Optional[str]]:
     """Scope a continuation must carry forward from the card that spawned it.
 
     Read from the parent task ROW, not from the ambient environment. A worker
@@ -1389,13 +1382,69 @@ def _inherited_parent_scope(kb, conn) -> dict:
     """
     self_tid = os.environ.get("HERMES_KANBAN_TASK")
     if not self_tid:
-        return {}
+        # An orchestrator is deliberately not task-bound.  Preserve its
+        # existing authority to create roots and cross-scope routing cards.
+        return {}, None
     try:
         parent = kb.get_task(conn, self_tid)
-    except Exception:
-        return {}
+    except Exception as exc:
+        return {}, (
+            "cannot load the authoritative parent task "
+            f"{self_tid!r}: {exc}"
+        )
     if parent is None:
-        return {}
+        return {}, f"authoritative parent task {self_tid!r} was not found"
+
+    parent_ids = [str(parent_id) for parent_id in parents]
+    if self_tid not in parent_ids:
+        return {}, (
+            f"task-bound continuation must include its authoritative parent "
+            f"{self_tid!r} in parents"
+        )
+
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    try:
+        worker_run_id = int(raw_run_id) if raw_run_id is not None else None
+    except (TypeError, ValueError):
+        worker_run_id = None
+    if worker_run_id is None or parent.current_run_id != worker_run_id:
+        return {}, (
+            "task-bound continuation has stale or missing run authority: "
+            f"HERMES_KANBAN_RUN_ID={raw_run_id!r}, "
+            f"authoritative current_run_id={parent.current_run_id!r}"
+        )
+
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not profile or profile != (parent.assignee or ""):
+        return {}, (
+            "task-bound continuation executor does not match the authoritative "
+            f"parent: HERMES_PROFILE={profile!r}, assignee={parent.assignee!r}"
+        )
+
+    dimensions = (
+        "tenant",
+        "session_id",
+        "project_id",
+        "assignee",
+        "workspace_kind",
+        "workspace_path",
+    )
+    for parent_id in parent_ids:
+        candidate = kb.get_task(conn, parent_id)
+        if candidate is None:
+            return {}, f"parent task {parent_id!r} was not found on the authoritative board"
+        if candidate.id == self_tid:
+            continue
+        for dimension in dimensions:
+            expected = getattr(parent, dimension)
+            actual = getattr(candidate, dimension)
+            if actual != expected:
+                return {}, (
+                    f"additional parent {parent_id!r} conflicts with authoritative "
+                    f"parent {self_tid!r} on {dimension}: "
+                    f"expected {expected!r}, got {actual!r}"
+                )
+
     return {
         "tenant": parent.tenant,
         "session_id": parent.session_id,
@@ -1405,7 +1454,7 @@ def _inherited_parent_scope(kb, conn) -> dict:
         "workspace_path": parent.workspace_path,
         "created_by": parent.created_by or parent.assignee,
         "task_id": parent.id,
-    }
+    }, None
 
 
 def _board_authority_error(requested_board) -> Optional[str]:
@@ -1531,7 +1580,9 @@ def _handle_create(args: dict, **kw) -> str:
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
-            _scope = _inherited_parent_scope(kb, conn)
+            _scope, scope_err = _inherited_parent_scope(kb, conn, parents)
+            if scope_err:
+                return tool_error(f"kanban_create: {scope_err}")
             if _scope:
                 # A dispatcher-spawned worker cannot grant itself authority in
                 # another tenant/session/project/repository. Redundant exact

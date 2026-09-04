@@ -158,6 +158,7 @@ _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
 def _task_dict(
+    conn: sqlite3.Connection,
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
@@ -175,7 +176,8 @@ def _task_dict(
     # ``tasks.result``. ``None`` when no run has produced a summary yet.
     d["latest_summary"] = latest_summary
     # Keep body short on list endpoints; full body comes from /tasks/:id.
-    return d
+    from hermes_cli import kanban_health as kh
+    return kh.project_task_serialization(conn, task, d)
 
 
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
@@ -625,7 +627,7 @@ def _build_board_payload(
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
-            d = _task_dict(t, latest_summary=preview)
+            d = _task_dict(conn, t, latest_summary=preview)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -642,15 +644,7 @@ def _build_board_payload(
                 # a raw status dump. Legacy/machine block rows remain durable
                 # but appear in automation triage unless they carry one current
                 # typed Kevin action.
-                from hermes_cli import kanban_health as kh
-
-                projection = kh.classify_block(conn, t)
-                d["block_projection"] = {
-                    "visible": projection.visible,
-                    "reason_code": projection.reason_code,
-                    "action": projection.action,
-                }
-                if not projection.visible:
+                if d["status"] == "triage":
                     col = "triage"
             columns[col].append(d)
 
@@ -719,7 +713,7 @@ def get_task(
         # operators can read the complete worker handoff without making
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
-        task_d = _task_dict(task, latest_summary=full_summary)
+        task_d = _task_dict(conn, task, latest_summary=full_summary)
         links = _links_for(conn, task_id)
         child_ids = links["children"]
         child_summaries = kanban_db.latest_summaries(conn, child_ids)
@@ -728,13 +722,15 @@ def get_task(
             child = kanban_db.get_task(conn, child_id)
             if child is None:
                 continue
-            child_results.append({
+            child_result = {
                 "id": child.id,
                 "title": child.title,
                 "status": child.status,
                 "latest_summary": child_summaries.get(child.id),
                 "result": child.result,
-            })
+            }
+            from hermes_cli import kanban_health as kh
+            child_results.append(kh.project_task_serialization(conn, child, child_result))
         # Attach diagnostics so the drawer's Diagnostics section can
         # render recovery actions without a second round-trip.
         diags = _compute_task_diagnostics(conn, task_ids=[task_id])
@@ -821,7 +817,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
-        body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        body: dict[str, Any] = {"task": _task_dict(conn, task) if task else None}
         # Surface a dispatcher-presence warning so the UI can show a
         # banner when a `ready` task would otherwise sit idle because no
         # gateway is running (or dispatch_in_gateway=false). Only emit
@@ -1401,7 +1397,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             )
 
         updated = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(updated) if updated else None}
+        return {"task": _task_dict(conn, updated) if updated else None}
     finally:
         conn.close()
 

@@ -95,6 +95,7 @@ _ISOLATED_ENV_KEYS = (
     "HERMES_KANBAN_DB",
     "HERMES_KANBAN_BOARD",
     "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_OPERATOR",
     "HERMES_PROFILE",
     "HERMES_TENANT",
@@ -179,21 +180,30 @@ def _evidence(action="Sign the named contract", **overrides):
 
 
 def _probe_typed_block_projection(conn) -> bool:
-    """A machine hold, an affirmed gate, and a stale affirmation must differ."""
+    """CLI, tool and dashboard serializers must all project block authority."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_health as kh
+    from hermes_cli import kanban as kcli
+    from plugins.kanban.dashboard import plugin_api as dashboard
+    from tools import kanban_tools as kt
 
-    machine = kb.create_task(conn, title="machine hold", assignee="default")
-    if not kb.block_task(conn, machine, kind="needs_input", reason="claim"):
-        return False
-    # A worker claiming it needs input is routed to automation recovery, not
-    # to the human column.
-    if kb.get_task(conn, machine).status == "blocked":
-        return False
-    if kh.classify_block(conn, kb.get_task(conn, machine)).visible:
-        return False
+    def _surfaces(task):
+        return (
+            kcli._task_to_dict(task, conn),
+            kt._task_summary_dict(kb, conn, task),
+            dashboard._task_dict(conn, task),
+        )
 
-    gate = kb.create_task(conn, title="human gate", assignee="default")
+    legacy = kb.create_task(conn, title="legacy block", assignee="default")
+    unaffirmed = kb.create_task(conn, title="unaffirmed block", assignee="default")
+    stale_id = kb.create_task(conn, title="stale gate", assignee="default")
+    gate = kb.create_task(conn, title="current gate", assignee="default")
+
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (legacy,))
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (unaffirmed,))
+        kb._append_event(conn, unaffirmed, "blocked", {"reason": "untyped"})
+
     # Fail-closed: a transport identity is not a human principal.
     if kh.affirm_human_gate(
         conn, gate, evidence=_evidence(affirmed_by="operator:dashboard")
@@ -206,22 +216,33 @@ def _probe_typed_block_projection(conn) -> bool:
         return False
     if not kh.affirm_human_gate(conn, gate, evidence=_evidence()):
         return False
-    task = kb.get_task(conn, gate)
-    if task.status != "blocked":
+    if not kh.affirm_human_gate(conn, stale_id, evidence=_evidence(action="Old ask")):
         return False
-    projection = kh.classify_block(conn, task)
-    if not (projection.visible and projection.action == "Sign the named contract"):
-        return False
-
-    # Fail-closed: a later blocked occurrence invalidates the affirmation
-    # bound to the previous one, even with the columns left in place.
     with kb.write_txn(conn):
-        kb._append_event(conn, gate, "unblocked", {"by": "probe"})
-        kb._append_event(conn, gate, "blocked", {"reason": "re-block"})
-    stale = kb.get_task(conn, gate)
-    if stale.gate_evidence is None:
+        kb._append_event(conn, stale_id, "unblocked", {"by": "probe"})
+        kb._append_event(conn, stale_id, "blocked", {"reason": "re-block"})
+
+    for task_id in (legacy, unaffirmed, stale_id):
+        task = kb.get_task(conn, task_id)
+        if task is None or task.status != "blocked":
+            return False
+        for payload in _surfaces(task):
+            projection = payload.get("block_projection") or {}
+            if payload.get("status") != "triage" or projection.get("visible") is not False:
+                return False
+
+    current = kb.get_task(conn, gate)
+    if current is None or current.status != "blocked":
         return False
-    return kh.classify_block(conn, stale).visible is False
+    for payload in _surfaces(current):
+        projection = payload.get("block_projection") or {}
+        if not (
+            payload.get("status") == "blocked"
+            and projection.get("visible") is True
+            and projection.get("action") == "Sign the named contract"
+        ):
+            return False
+    return True
 
 
 def _probe_typed_scheduled_hold(conn) -> bool:
@@ -267,30 +288,29 @@ def _probe_typed_scheduled_hold(conn) -> bool:
 
 
 def _probe_durable_wake_reconciler(conn) -> bool:
-    """A due wake must actually resume, exactly once, and stamp a checkpoint."""
+    """A dispatcher tick must resume a due wake once and stamp its checkpoint."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_health as kh
 
+    if kh.read_checkpoint(conn, kh.CHECKPOINT_RECONCILE) is not None:
+        return False
     now = int(time.time())
-    kh.record_checkpoint(conn, kh.CHECKPOINT_RECONCILE, status="ok", now=now)
-    checkpoint = kh.read_checkpoint(conn, kh.CHECKPOINT_RECONCILE)
-    if not checkpoint or checkpoint["status"] != "ok":
-        return False
-    health = kh.wake_subsystem_health(conn, now=now)
-    if not health["healthy"]:
-        return False
-
     tid = kb.create_task(conn, title="due wake", assignee="default")
     if not kh.set_hold(conn, tid, kind="wake", wake_at=now - 60, apply=True):
         return False
-    first = kh.reconcile_board(conn, now=now)
-    if tid not in {row["task_id"] for row in first.resumed}:
+    # max_spawn=0 keeps the resumed card in ready, making the transition easy
+    # to observe without starting any worker process.
+    first = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None, max_spawn=0)
+    if first.health_resumed.count(tid) != 1:
         return False
-    if kb.get_task(conn, tid).status == "scheduled":
+    resumed_task = kb.get_task(conn, tid)
+    if resumed_task is None or resumed_task.status == "scheduled":
         return False
-    # Idempotent: a second pass must not resume it again.
-    second = kh.reconcile_board(conn, now=now)
-    return tid not in {row["task_id"] for row in second.resumed}
+    checkpoint = kh.read_checkpoint(conn, kh.CHECKPOINT_RECONCILE)
+    if not checkpoint or checkpoint["status"] != "ok":
+        return False
+    second = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None, max_spawn=0)
+    return tid not in second.health_resumed
 
 
 def _probe_legacy_hold_is_loud(conn) -> bool:
@@ -373,9 +393,10 @@ def _probe_board_health_report(conn) -> bool:
 
 
 def _probe_ready_queue_reason_codes(conn) -> bool:
-    """Every wait must name its own cause, against real production caps."""
+    """Dispatcher dry-run and telemetry must agree across production gates."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_health as kh
+    from hermes_cli import profiles
 
     codes = {
         kh.READY_SPAWNABLE,
@@ -393,33 +414,150 @@ def _probe_ready_queue_reason_codes(conn) -> bool:
     if len(codes) != 11:
         return False
 
-    unassigned = kb.create_task(conn, title="unrouted", assignee=None)
-    broken = kb.create_task(
-        conn, title="bad workspace", assignee="default",
-        workspace_kind="dir", workspace_path="relative/not/absolute",
-    )
-    ready = kb.create_task(conn, title="ready", assignee="default")
-    report = kh.ready_queue_report(conn, memory_pressure="ok")
-    reasons = {entry.task_id: entry.reason_code for entry in report.entries}
-    if reasons.get(unassigned) != kh.READY_UNASSIGNED:
-        return False
-    if reasons.get(broken) != kh.READY_INVALID_WORKSPACE:
-        return False
-    if reasons.get(ready) != kh.READY_SPAWNABLE:
-        return False
+    originals = {
+        "profile_exists": profiles.profile_exists,
+        "review_dispatch_enabled": kb.review_dispatch_enabled,
+        "memory": kb._memory_pressure_level,
+        "other_boards": kb.count_running_tasks_other_boards,
+        "guard": kb.check_respawn_guard,
+        "release": kb.release_stale_claims,
+        "stale": kb.detect_stale_running,
+        "crashed": kb.detect_crashed_workers,
+    }
 
-    # The dispatcher's live concurrency cap must be represented, or telemetry
-    # calls a card spawnable that dispatch correctly refused to spawn.
-    running = kb.create_task(conn, title="in flight", assignee="default")
-    kb.claim_task(conn, running)
-    capped = kh.ready_queue_report(conn, max_spawn=1, memory_pressure="ok")
-    if capped.reason_for(ready) != kh.READY_CAPACITY_MAX_SPAWN:
-        return False
-    if capped.spawnable_ids:
-        return False
+    def _retire(*task_ids):
+        with kb.write_txn(conn):
+            for task_id in task_ids:
+                conn.execute(
+                    "UPDATE tasks SET status='done', claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                    (task_id,),
+                )
 
-    pressured = kh.ready_queue_report(conn, memory_pressure="critical")
-    return pressured.reason_for(ready) == kh.READY_MEMORY_PRESSURE_CRITICAL
+    def _review(task_id):
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+
+    def _parity(*, expected, report_kw=None, **dispatch_kw):
+        report_kw = dict(report_kw or dispatch_kw)
+        report = kh.ready_queue_report(conn, **report_kw)
+        result = kb.dispatch_once(
+            conn, dry_run=True, spawn_fn=lambda *_a, **_k: None,
+            reconcile_orphans=False, **dispatch_kw,
+        )
+        dispatched = {task_id for task_id, _assignee, _workspace in result.spawned}
+        return dispatched == set(report.spawnable_ids) == set(expected), report
+
+    try:
+        # Make executor and host-state decisions deterministic while retaining
+        # the candidate's real dispatch/report implementations.
+        profiles.profile_exists = lambda name: name in {"default", "other"}
+        kb.review_dispatch_enabled = lambda: True
+        kb._memory_pressure_level = lambda: "ok"
+        kb.count_running_tasks_other_boards = lambda _board: 0
+        kb.check_respawn_guard = lambda _conn, _tid, **_kw: None
+        kb.release_stale_claims = lambda _conn: []
+        kb.detect_stale_running = lambda _conn, **_kw: []
+        kb.detect_crashed_workers = lambda _conn: []
+
+        # default_assignee applies to ready only; review remains unassigned.
+        ready_default = kb.create_task(conn, title="ready default", assignee=None)
+        review_unassigned = kb.create_task(conn, title="review unassigned", assignee=None)
+        _review(review_unassigned)
+        ok, report = _parity(
+            expected={ready_default}, max_spawn=4,
+            default_assignee="default",
+        )
+        if not ok or report.reason_for(review_unassigned) != kh.READY_UNASSIGNED:
+            return False
+        _retire(ready_default, review_unassigned)
+
+        # Separate lane ordering reserves one bounded slot for review.
+        ready_high = kb.create_task(conn, title="ready high", assignee="default", priority=20)
+        ready_low = kb.create_task(conn, title="ready low", assignee="default", priority=10)
+        review = kb.create_task(conn, title="review", assignee="default", priority=-10)
+        _review(review)
+        ok, _ = _parity(
+            expected={ready_high, review}, max_spawn=2
+        )
+        if not ok:
+            return False
+        _retire(ready_high, ready_low, review)
+
+        # Card gates: workspace precondition and lane-specific respawn guard.
+        broken = kb.create_task(
+            conn, title="bad workspace", assignee="default", priority=30,
+            workspace_kind="dir", workspace_path="relative/not/absolute",
+        )
+        guarded = kb.create_task(conn, title="active PR", assignee="default", priority=20)
+        eligible = kb.create_task(conn, title="eligible", assignee="default", priority=10)
+        kb.check_respawn_guard = (
+            lambda _conn, tid, **_kw: "active_pr" if tid == guarded else None
+        )
+        ok, report = _parity(expected={eligible}, max_spawn=8)
+        if not (
+            ok
+            and report.reason_for(broken) == kh.READY_INVALID_WORKSPACE
+            and report.reason_for(guarded) == kh.READY_GUARD_ACTIVE_PR
+        ):
+            return False
+        _retire(broken, guarded, eligible)
+        kb.check_respawn_guard = lambda _conn, _tid, **_kw: None
+
+        # max_spawn, host-global and per-profile budgets are distinct reasons.
+        running = kb.create_task(conn, title="running", assignee="default")
+        kb.claim_task(conn, running)
+        waiting = kb.create_task(conn, title="max wait", assignee="other")
+        ok, report = _parity(expected=set(), max_spawn=1)
+        if not ok or report.reason_for(waiting) != kh.READY_CAPACITY_MAX_SPAWN:
+            return False
+        _retire(running, waiting)
+
+        kb.count_running_tasks_other_boards = lambda _board: 1
+        global_wait = kb.create_task(conn, title="global wait", assignee="default")
+        ok, report = _parity(
+            expected=set(), max_in_progress=1,
+            report_kw={
+                "max_in_progress": 1, "memory_pressure": "ok",
+                "include_other_boards": True,
+            },
+        )
+        if not ok or report.reason_for(global_wait) != kh.READY_CAPACITY_GLOBAL:
+            return False
+        _retire(global_wait)
+        kb.count_running_tasks_other_boards = lambda _board: 0
+
+        running = kb.create_task(conn, title="profile running", assignee="default")
+        kb.claim_task(conn, running)
+        profile_wait = kb.create_task(conn, title="profile wait", assignee="default")
+        ok, report = _parity(
+            expected=set(), max_in_progress_per_profile=1
+        )
+        if not ok or report.reason_for(profile_wait) != kh.READY_CAPACITY_PER_PROFILE:
+            return False
+        _retire(running, profile_wait)
+
+        # Dynamic memory pressure is part of the real dispatch decision too.
+        first = kb.create_task(conn, title="pressure first", assignee="default", priority=2)
+        second = kb.create_task(conn, title="pressure second", assignee="other", priority=1)
+        kb._memory_pressure_level = lambda: "critical"
+        ok, report = _parity(expected=set())
+        if not ok or report.reason_for(first) != kh.READY_MEMORY_PRESSURE_CRITICAL:
+            return False
+        kb._memory_pressure_level = lambda: "elevated"
+        ok, report = _parity(expected={first})
+        return bool(
+            ok and report.reason_for(second) == kh.READY_MEMORY_PRESSURE_ELEVATED
+        )
+    finally:
+        profiles.profile_exists = originals["profile_exists"]
+        kb.review_dispatch_enabled = originals["review_dispatch_enabled"]
+        kb._memory_pressure_level = originals["memory"]
+        kb.count_running_tasks_other_boards = originals["other_boards"]
+        kb.check_respawn_guard = originals["guard"]
+        kb.release_stale_claims = originals["release"]
+        kb.detect_stale_running = originals["stale"]
+        kb.detect_crashed_workers = originals["crashed"]
 
 
 def _probe_dispatcher_stuck_is_gated(conn) -> bool:
@@ -453,27 +591,51 @@ def _probe_dispatcher_stuck_is_gated(conn) -> bool:
 
 
 def _probe_continuation_scope_inheritance(conn) -> bool:
-    """A child must carry the parent row's scope, not the ambient env's."""
+    """A child must carry the full parent-row authority, not ambient scope."""
     import json as _json
 
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
+    repo = Path(os.environ["HOME"]) / "probe-repo"
+    (repo / ".worktrees").mkdir(parents=True)
     parent = kb.create_task(
         conn,
         title="scoped parent",
         assignee="default",
+        created_by="probe-originator",
         tenant="probe-legal-entity",
         session_id="probe-session",
     )
+    parent_workspace = repo / ".worktrees" / parent
+    parent_workspace.mkdir()
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET project_id=?, workspace_kind='worktree', "
+            "workspace_path=?, branch_name=? WHERE id=?",
+            ("probe-project", str(parent_workspace), f"probe-project/{parent}", parent),
+        )
     kb.claim_task(conn, parent)
+    parent_task = kb.get_task(conn, parent)
+    if parent_task is None or parent_task.current_run_id is None:
+        return False
 
     previous = {
         key: os.environ.get(key)
-        for key in ("HERMES_KANBAN_TASK", "HERMES_TENANT", "HERMES_SESSION_ID")
+        for key in (
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_BOARD",
+            "HERMES_PROFILE",
+            "HERMES_TENANT",
+            "HERMES_SESSION_ID",
+        )
     }
     try:
         os.environ["HERMES_KANBAN_TASK"] = parent
+        os.environ["HERMES_KANBAN_RUN_ID"] = str(parent_task.current_run_id)
+        os.environ["HERMES_KANBAN_BOARD"] = kb.DEFAULT_BOARD
+        os.environ["HERMES_PROFILE"] = "default"
         # A stale ambient scope (a restart, a re-exec) must lose to the row.
         os.environ["HERMES_TENANT"] = "stale-ambient-tenant"
         os.environ["HERMES_SESSION_ID"] = "stale-ambient-session"
@@ -497,8 +659,25 @@ def _probe_continuation_scope_inheritance(conn) -> bool:
     child = kb.get_task(conn, result["task_id"])
     if child is None:
         return False
-    return (child.tenant, child.session_id) == (
-        "probe-legal-entity", "probe-session",
+    child_workspace = Path(child.workspace_path or "")
+    return (
+        child.tenant,
+        child.session_id,
+        child.project_id,
+        child.assignee,
+        child.created_by,
+        child.workspace_kind,
+        child_workspace.parent,
+        child_workspace.name,
+    ) == (
+        "probe-legal-entity",
+        "probe-session",
+        "probe-project",
+        "default",
+        "probe-originator",
+        "worktree",
+        repo / ".worktrees",
+        child.id,
     )
 
 
@@ -634,17 +813,17 @@ def probe_capabilities() -> dict:
     could not tell" must never read as "fine".
     """
     out: dict[str, bool] = {}
-    try:
-        with _isolated_board() as conn:
-            for cap in REQUIRED_CAPABILITIES:
-                try:
-                    out[cap.name] = bool(cap.probe(conn))
-                except Exception as exc:
-                    logger.debug("capability probe %s failed: %s", cap.name, exc)
-                    out[cap.name] = False
-    except Exception as exc:
-        logger.debug("capability probe state could not be built: %s", exc)
-        return dict.fromkeys(REQUIRED_CAPABILITY_NAMES, False)
+    for cap in REQUIRED_CAPABILITIES:
+        try:
+            # A probe owns its entire board fixture. Besides preventing one
+            # probe's writes from changing a later probe's census, this makes
+            # each result reproducible in both the live process and the
+            # running-install-owned subprocess used for mirrored candidates.
+            with _isolated_board() as conn:
+                out[cap.name] = bool(cap.probe(conn))
+        except Exception as exc:
+            logger.debug("capability probe %s failed: %s", cap.name, exc)
+            out[cap.name] = False
     return out
 
 

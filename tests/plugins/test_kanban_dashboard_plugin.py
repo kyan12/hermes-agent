@@ -100,7 +100,34 @@ def test_board_projects_unaffirmed_block_into_automation_triage(client):
     columns = {column["name"]: column["tasks"] for column in data["columns"]}
     assert tid not in {task["id"] for task in columns["blocked"]}
     triaged = {task["id"]: task for task in columns["triage"]}
+    assert triaged[tid]["status"] == "triage"
     assert triaged[tid]["block_projection"]["visible"] is False
+
+
+def test_board_and_detail_project_stale_affirmation_as_triage(client, monkeypatch):
+    from hermes_cli import kanban_health as kh
+
+    monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "kevin")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stale gate", assignee="worker")
+        evidence = {
+            "type": "human_decision", "action": "Sign the named agreement",
+            "affirmed_by": "kevin", "affirmed_at": int(time.time()),
+        }
+        assert kh.affirm_human_gate(conn, tid, evidence=evidence)
+        assert kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+
+    board = client.get("/api/plugins/kanban/board").json()
+    columns = {column["name"]: column["tasks"] for column in board["columns"]}
+    projected = {task["id"]: task for task in columns["triage"]}[tid]
+    detail = client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]
+    for task in (projected, detail):
+        assert task["status"] == "triage"
+        assert task["block_projection"]["visible"] is False
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
 
 
 def test_board_shows_only_affirmed_gate_in_blocked(client, monkeypatch):
