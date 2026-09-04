@@ -217,7 +217,7 @@ def _ready_queue_reports_for_telemetry() -> list:
     _default_assignee = None
     try:
         cfg = (_load_config() or {}).get("kanban", {})
-        _cap = _kb.resolve_max_in_progress(cfg.get("max_in_progress"))
+        _cap = _kb.resolve_max_in_progress(_kb.configured_max_in_progress())
         _per_profile = cfg.get("max_in_progress_per_profile")
         _max_spawn = cfg.get("max_spawn")
         _default_assignee = (cfg.get("default_assignee") or "").strip() or None

@@ -113,3 +113,49 @@ def test_daemon_stuck_census_receives_exact_effective_max(isolated_kanban_home, 
     assert captured and captured[0]["max_spawn"] == 2
 
 
+@pytest.mark.parametrize(
+    ("raw_cap", "parsed_cap", "expected"),
+    [
+        (0, None, 3),
+        (-2, None, 3),
+        ("not-an-int", None, 3),
+        ("4", 4, 4),
+    ],
+)
+def test_daemon_stuck_census_uses_dispatcher_cap_parser(
+    isolated_kanban_home, monkeypatch, raw_cap, parsed_cap, expected
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+    from hermes_cli import kanban_health
+
+    captured = []
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"max_in_progress": raw_cap}},
+    )
+    monkeypatch.setattr(kanban_db, "configured_max_in_progress", lambda: parsed_cap)
+    monkeypatch.setattr(kanban_db, "derive_default_max_in_progress", lambda: 3)
+    monkeypatch.setattr(
+        kanban_health,
+        "ready_queue_report",
+        lambda conn, **kw: (captured.append(kw), SimpleNamespace(spawnable_ids=[]))[1],
+    )
+    monkeypatch.setattr(
+        kanban_db,
+        "run_daemon",
+        lambda **kw: kw["on_tick"](kanban_db.DispatchResult()),
+    )
+
+    args = argparse.Namespace(
+        interval=1,
+        max=2,
+        failure_limit=2,
+        verbose=False,
+        pidfile=None,
+        force=True,
+    )
+    kb_cli._cmd_daemon(args)
+    assert captured and captured[0]["max_in_progress"] == expected
+
+

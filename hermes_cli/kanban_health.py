@@ -691,6 +691,10 @@ def set_hold(
         ).fetchone()
         if current is None:
             return False
+        if kind == "dependency" and conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,)
+        ).fetchone() is None:
+            return False
         run_id = None
         if apply and current["status"] != "scheduled":
             cur = conn.execute(
@@ -996,7 +1000,9 @@ class HoldState:
     resumable: bool = False
 
 
-def classify_hold(task, *, now: int, wake_health: dict, parents_done: bool) -> HoldState:
+def classify_hold(
+    task, *, now: int, wake_health: dict, parents_done: Optional[bool]
+) -> HoldState:
     """Classify a ``scheduled`` card against the clock and its dependencies."""
     kind = getattr(task, "hold_kind", None)
     wake_at = getattr(task, "hold_wake_at", None)
@@ -1023,6 +1029,11 @@ def classify_hold(task, *, now: int, wake_health: dict, parents_done: bool) -> H
         return HoldState(task.id, kind, wake_at, True, REASON_INTENTIONAL_HOLD)
 
     if kind == "dependency":
+        if parents_done is None:
+            return HoldState(
+                task.id, kind, wake_at, False, REASON_DEPENDENCY_BROKEN,
+                needs_classification=True,
+            )
         if parents_done:
             return HoldState(
                 task.id, kind, wake_at, True, REASON_DEPENDENCY_SATISFIED,
@@ -1044,17 +1055,20 @@ def classify_hold(task, *, now: int, wake_health: dict, parents_done: bool) -> H
         )
     if wake_at <= now:
         return HoldState(
-            task.id, kind, wake_at, True, REASON_WAKE_DUE, resumable=parents_done
+            task.id, kind, wake_at, True, REASON_WAKE_DUE,
+            resumable=parents_done is not False,
         )
     return HoldState(task.id, kind, wake_at, True, REASON_WAKE_ARMED)
 
 
-def _parents_done(conn, task_id: str) -> bool:
+def _parents_done(conn, task_id: str) -> Optional[bool]:
     rows = conn.execute(
         "SELECT t.status FROM tasks t JOIN task_links l ON l.parent_id = t.id "
         "WHERE l.child_id = ?",
         (task_id,),
     ).fetchall()
+    if not rows:
+        return None
     return all(r["status"] in ("done", "archived") for r in rows)
 
 
@@ -1112,6 +1126,7 @@ def configured_ready_census(conn, *, board: Optional[str] = None) -> ReadyQueueR
         max_in_progress=_configured_max_in_progress(),
         max_in_progress_per_profile=_configured_per_profile_cap(),
         default_assignee=_configured_default_assignee(),
+        include_other_boards=True,
     )
 
 
@@ -1515,40 +1530,16 @@ class ReadyQueueReport:
         return None
 
 
-def workspace_precondition_error(task) -> Optional[str]:
+def workspace_precondition_error(task, *, board: Optional[str] = None) -> Optional[str]:
     """Read-only check of whether this card's workspace can resolve.
 
     Mirrors ``kanban_db.resolve_workspace``'s refusals WITHOUT creating any
     directory, so telemetry can name an invalid workspace instead of waiting
     for the spawn to fail and be misreported as a credential problem.
     """
-    from pathlib import Path
+    from hermes_cli import kanban_db as kb
 
-    kind = task.workspace_kind or "scratch"
-    path = (task.workspace_path or "").strip() or None
-    if kind == "dir":
-        if not path:
-            return "workspace_kind=dir but no workspace_path"
-        if not Path(path).expanduser().is_absolute():
-            return f"workspace_path {path!r} is not absolute"
-        return None
-    if kind == "scratch":
-        if path and not Path(path).expanduser().is_absolute():
-            return f"workspace_path {path!r} is not absolute"
-        return None
-    if kind == "worktree":
-        if path:
-            return None
-        try:
-            from hermes_cli import kanban_db as kb
-
-            meta = kb.read_board_metadata()
-            if not (meta.get("default_workdir") or "").strip():
-                return "worktree workspace with no workspace_path and no board default_workdir"
-        except Exception:
-            return None
-        return None
-    return f"unknown workspace_kind {kind!r}"
+    return kb.workspace_precondition_error(task, board=board)
 
 
 def ready_queue_report(
@@ -1581,9 +1572,10 @@ def ready_queue_report(
     from hermes_cli import kanban_db as kb
 
     report = ReadyQueueReport(board=board)
+    max_spawn = kb.normalize_max_spawn(max_spawn)
 
     running = kb.count_running_tasks(conn)
-    if isinstance(max_spawn, int) and max_spawn > 0 and running >= max_spawn:
+    if max_spawn is not None and running >= max_spawn:
         report.at_spawn_cap = True
 
     host_running = running
@@ -1602,7 +1594,7 @@ def ready_queue_report(
     # Convert both caps into one shared additional-spawns budget, exactly as
     # ``_dispatch_once_locked`` does.
     spawn_budget: Optional[int] = None
-    if isinstance(max_spawn, int) and max_spawn > 0:
+    if max_spawn is not None:
         spawn_budget = max(max_spawn - running, 0)
     if isinstance(max_in_progress, int) and max_in_progress > 0:
         remaining = max(max_in_progress - host_running, 0)
@@ -1695,6 +1687,32 @@ def ready_queue_report(
             continue
         assignee = task.assignee or (fallback_assignee if lane == "ready" else None)
 
+        # Tick-global gates run before row-specific gates in real dispatch.
+        if report.at_spawn_cap:
+            report.entries.append(
+                ReadyEntry(
+                    task.id, assignee, READY_CAPACITY_MAX_SPAWN,
+                    f"{running} running at max_spawn={max_spawn}",
+                )
+            )
+            continue
+        if report.at_global_cap:
+            report.entries.append(
+                ReadyEntry(
+                    task.id, assignee, READY_CAPACITY_GLOBAL,
+                    f"{host_running} running at max_in_progress={max_in_progress}",
+                )
+            )
+            continue
+        if memory_pressure == "critical":
+            report.entries.append(
+                ReadyEntry(
+                    task.id, assignee, READY_MEMORY_PRESSURE_CRITICAL,
+                    "system memory pressure is critical; deferred, not dropped",
+                )
+            )
+            continue
+
         if not assignee:
             report.entries.append(
                 ReadyEntry(task.id, None, READY_UNASSIGNED, "needs routing")
@@ -1730,37 +1748,6 @@ def ready_queue_report(
             )
             continue
 
-        ws_error = workspace_precondition_error(task)
-        if ws_error:
-            report.entries.append(
-                ReadyEntry(task.id, assignee, READY_INVALID_WORKSPACE, ws_error)
-            )
-            continue
-
-        if report.at_spawn_cap:
-            report.entries.append(
-                ReadyEntry(
-                    task.id, assignee, READY_CAPACITY_MAX_SPAWN,
-                    f"{running} running at max_spawn={max_spawn}",
-                )
-            )
-            continue
-        if report.at_global_cap:
-            report.entries.append(
-                ReadyEntry(
-                    task.id, assignee, READY_CAPACITY_GLOBAL,
-                    f"{host_running} running at max_in_progress={max_in_progress}",
-                )
-            )
-            continue
-        if memory_pressure == "critical":
-            report.entries.append(
-                ReadyEntry(
-                    task.id, assignee, READY_MEMORY_PRESSURE_CRITICAL,
-                    "system memory pressure is critical; deferred, not dropped",
-                )
-            )
-            continue
         if per_profile_cap is not None:
             current = per_profile_running.get(assignee, 0)
             if current >= per_profile_cap:
@@ -1791,6 +1778,13 @@ def ready_queue_report(
             )
             continue
 
+        ws_error = workspace_precondition_error(task, board=board)
+        if ws_error:
+            report.entries.append(
+                ReadyEntry(task.id, assignee, READY_INVALID_WORKSPACE, ws_error)
+            )
+            continue
+
         # Everything card-specific passed. What is left is the tick's shared
         # budget, which the dispatcher consumes in this same order.
         lane_budget_exhausted = (
@@ -1807,7 +1801,7 @@ def ready_queue_report(
                 READY_MEMORY_PRESSURE_ELEVATED
                 if memory_pressure == "elevated"
                 else READY_CAPACITY_MAX_SPAWN
-                if isinstance(max_spawn, int) and max_spawn > 0
+                if max_spawn is not None
                 else READY_CAPACITY_GLOBAL
             )
             detail = (
@@ -2026,10 +2020,11 @@ def _current_board_safe() -> Optional[str]:
 
 def _configured_max_spawn() -> Optional[int]:
     try:
+        from hermes_cli import kanban_db as kb
         from hermes_cli.config import load_config
 
         value = (load_config() or {}).get("kanban", {}).get("max_spawn")
-        return int(value) if value else None
+        return kb.normalize_max_spawn(value)
     except Exception:
         return None
 

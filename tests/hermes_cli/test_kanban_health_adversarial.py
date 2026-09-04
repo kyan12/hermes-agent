@@ -181,6 +181,37 @@ def test_intentional_park_requires_current_trusted_evidence(board):
     assert tid in {row["task_id"] for row in health["no_forward_path"]}
 
 
+def test_set_hold_rejects_parentless_dependency(board):
+    tid = _mk(board)
+
+    assert kh.set_hold(board, tid, kind="dependency", apply=True) is False
+    assert kb.get_task(board, tid).status == "ready"
+
+
+def test_parentless_dependency_hold_is_broken_and_never_resumed(board):
+    tid = _mk(board)
+    with kb.write_txn(board):
+        board.execute(
+            "UPDATE tasks SET status='scheduled', hold_kind='dependency' WHERE id=?",
+            (tid,),
+        )
+
+    state = kh.classify_hold(
+        kb.get_task(board, tid),
+        now=int(time.time()),
+        wake_health={"healthy": True},
+        parents_done=kh._parents_done(board, tid),
+    )
+    assert state.healthy is False
+    assert state.resumable is False
+    assert state.reason_code == kh.REASON_DEPENDENCY_BROKEN
+
+    report = kh.reconcile_board(board, apply=True)
+    assert tid in {row["task_id"] for row in report.diagnosed}
+    assert not any(row["task_id"] == tid for row in report.resumed)
+    assert kb.get_task(board, tid).status == "scheduled"
+
+
 def test_dead_running_row_has_no_forward_path(board, monkeypatch):
     tid = _mk(board)
     with kb.write_txn(board):
@@ -261,7 +292,9 @@ def test_reconcile_classification_failure_replaces_fresh_ok_checkpoint(
     board, monkeypatch
 ):
     now = int(time.time())
+    parent = _mk(board, "unfinished parent")
     tid = _mk(board)
+    kb.link_tasks(board, parent_id=parent, child_id=tid)
     assert kh.set_hold(board, tid, kind="dependency")
     kh.record_checkpoint(
         board, kh.CHECKPOINT_RECONCILE, status="ok", now=now

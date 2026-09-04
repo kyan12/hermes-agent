@@ -92,6 +92,25 @@ def test_show_projects_unaffirmed_block_without_mutating_row(kanban_home):
         assert kb.get_task(conn, tid).status == "triage"
 
 
+def test_create_json_projects_unaffirmed_initial_block(kanban_home):
+    payload = json.loads(
+        kc.run_slash("create projected-json --initial-status blocked --json")
+    )
+
+    assert payload["status"] == "triage"
+    assert payload["block_projection"]["visible"] is False
+    assert payload["block_projection"]["reason_code"] == "untyped_block"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, payload["id"]).status == "blocked"
+
+
+def test_create_text_projects_unaffirmed_initial_block(kanban_home):
+    output = kc.run_slash("create projected-text --initial-status blocked")
+
+    assert "(triage, assignee=-)" in output
+    assert "blocked" not in output
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")

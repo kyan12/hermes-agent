@@ -260,6 +260,19 @@ def test_canary_fails_when_dispatch_and_ready_report_drift(tmp_path):
     assert "kanban.ready_queue_reason_codes" in result.missing
 
 
+def test_canary_uses_running_probe_to_reject_zero_cap_drift(tmp_path):
+    """The candidate cannot redefine max_spawn=0 as unlimited and self-certify."""
+    staged = _candidate_with_replacement(
+        tmp_path,
+        "hermes_cli/kanban_db.py",
+        "    max_spawn = normalize_max_spawn(max_spawn)\n",
+        "    max_spawn = None if max_spawn == 0 else normalize_max_spawn(max_spawn)\n",
+    )
+    result = kc.preactivation_canary(staged)
+    assert result.ok is False, result.detail
+    assert "kanban.ready_queue_reason_codes" in result.missing
+
+
 def test_canary_fails_when_continuation_authority_is_reduced_to_ambient_scope(tmp_path):
     staged = _candidate_with_replacement(
         tmp_path,

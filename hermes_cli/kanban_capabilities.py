@@ -504,6 +504,13 @@ def _probe_ready_queue_reason_codes(conn) -> bool:
         _retire(broken, guarded, eligible)
         kb.check_respawn_guard = lambda _conn, _tid, **_kw: None
 
+        # max_spawn=0 is an explicit dispatch-off cap, not "unlimited".
+        zero_wait = kb.create_task(conn, title="dispatch disabled", assignee="default")
+        ok, report = _parity(expected=set(), max_spawn=0)
+        if not ok or report.reason_for(zero_wait) != kh.READY_CAPACITY_MAX_SPAWN:
+            return False
+        _retire(zero_wait)
+
         # max_spawn, host-global and per-profile budgets are distinct reasons.
         running = kb.create_task(conn, title="running", assignee="default")
         kb.claim_task(conn, running)
@@ -615,9 +622,24 @@ def _probe_continuation_scope_inheritance(conn) -> bool:
             "workspace_path=?, branch_name=? WHERE id=?",
             ("probe-project", str(parent_workspace), f"probe-project/{parent}", parent),
         )
-    kb.claim_task(conn, parent)
-    parent_task = kb.get_task(conn, parent)
-    if parent_task is None or parent_task.current_run_id is None:
+    parent_task = kb.claim_task(conn, parent, ttl_seconds=3600)
+    if (
+        parent_task is None
+        or parent_task.current_run_id is None
+        or not parent_task.claim_lock
+    ):
+        return False
+    run = conn.execute(
+        "SELECT status, ended_at, claim_lock, claim_expires FROM task_runs WHERE id=?",
+        (parent_task.current_run_id,),
+    ).fetchone()
+    if (
+        run is None
+        or run["status"] != "running"
+        or run["ended_at"] is not None
+        or run["claim_lock"] != parent_task.claim_lock
+        or not run["claim_expires"]
+    ):
         return False
 
     previous = {
@@ -625,6 +647,7 @@ def _probe_continuation_scope_inheritance(conn) -> bool:
         for key in (
             "HERMES_KANBAN_TASK",
             "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_CLAIM_LOCK",
             "HERMES_KANBAN_BOARD",
             "HERMES_PROFILE",
             "HERMES_TENANT",
@@ -634,20 +657,58 @@ def _probe_continuation_scope_inheritance(conn) -> bool:
     try:
         os.environ["HERMES_KANBAN_TASK"] = parent
         os.environ["HERMES_KANBAN_RUN_ID"] = str(parent_task.current_run_id)
+        os.environ["HERMES_KANBAN_CLAIM_LOCK"] = parent_task.claim_lock
         os.environ["HERMES_KANBAN_BOARD"] = kb.DEFAULT_BOARD
         os.environ["HERMES_PROFILE"] = "default"
         # A stale ambient scope (a restart, a re-exec) must lose to the row.
         os.environ["HERMES_TENANT"] = "stale-ambient-tenant"
         os.environ["HERMES_SESSION_ID"] = "stale-ambient-session"
-        result = _json.loads(
-            kt._handle_create(
-                {
-                    "title": "continuation",
-                    "assignee": "default",
-                    "parents": [parent],
-                }
+        create_args = {
+            "title": "continuation",
+            "assignee": "default",
+            "parents": [parent],
+        }
+
+        # Capability certification includes fail-closed run and claim authority,
+        # not merely inheritance on one happy-path continuation.
+        os.environ["HERMES_KANBAN_RUN_ID"] = "999999"
+        if "error" not in _json.loads(kt._handle_create(create_args)):
+            return False
+        os.environ["HERMES_KANBAN_RUN_ID"] = str(parent_task.current_run_id)
+
+        os.environ["HERMES_KANBAN_CLAIM_LOCK"] = "foreign-claim-authority"
+        if "error" not in _json.loads(kt._handle_create(create_args)):
+            return False
+        os.environ["HERMES_KANBAN_CLAIM_LOCK"] = parent_task.claim_lock
+
+        result = _json.loads(kt._handle_create(create_args))
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (parent,))
+            conn.execute(
+                "UPDATE task_runs SET claim_expires=0 WHERE id=?",
+                (parent_task.current_run_id,),
             )
-        )
+        if "error" not in _json.loads(kt._handle_create(create_args)):
+            return False
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires=? WHERE id=?",
+                (parent_task.claim_expires, parent),
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_expires=? WHERE id=?",
+                (parent_task.claim_expires, parent_task.current_run_id),
+            )
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='done', ended_at=strftime('%s','now') "
+                "WHERE id=?",
+                (parent_task.current_run_id,),
+            )
+        if "error" not in _json.loads(kt._handle_create(create_args)):
+            return False
     finally:
         for key, value in previous.items():
             if value is None:

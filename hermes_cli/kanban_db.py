@@ -7749,6 +7749,66 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def workspace_precondition_error(
+    task: Task, *, board: Optional[str] = None
+) -> Optional[str]:
+    """Return a read-only workspace refusal, or ``None`` when resolvable.
+
+    Shared by real dispatch, dry-run dispatch, and health telemetry. It
+    deliberately performs no mkdir/worktree/database writes.
+    """
+    kind = task.workspace_kind or "scratch"
+    raw_path = (task.workspace_path or "").strip() or None
+    if kind in {"scratch", "dir"}:
+        if kind == "dir" and not raw_path:
+            return "workspace_kind=dir but no workspace_path"
+        if raw_path and not Path(raw_path).expanduser().is_absolute():
+            return f"workspace_path {raw_path!r} is not absolute"
+        return None
+    if kind != "worktree":
+        return f"unknown workspace_kind {kind!r}"
+
+    if not raw_path:
+        board_slug = board if board else get_current_board()
+        default = (
+            read_board_metadata(board_slug).get("default_workdir") or ""
+        ).strip()
+        if not default:
+            return "worktree workspace with no workspace_path and no board default_workdir"
+        anchor = Path(default).expanduser()
+        if not anchor.is_absolute():
+            return f"board default_workdir {default!r} is not absolute"
+        if not anchor.exists() or _git_toplevel(anchor) is None:
+            return f"board default_workdir {default!r} is not inside a git repo"
+        return None
+
+    requested = Path(raw_path).expanduser()
+    if not requested.is_absolute():
+        return f"workspace_path {raw_path!r} is not absolute"
+    requested_resolved = requested.resolve(strict=False)
+    if requested.exists() and _is_linked_worktree_checkout(requested):
+        return None
+
+    direct_root = _git_toplevel(requested)
+    if direct_root is not None and requested_resolved == direct_root:
+        return None
+
+    repo_root = _repo_root_for_worktree_target(requested.parent)
+    if repo_root is None:
+        return f"worktree path {raw_path!r} has no valid git repository ancestry"
+    canonical_root = (repo_root / ".worktrees").resolve(strict=False)
+    try:
+        requested_resolved.relative_to(canonical_root)
+    except ValueError:
+        return (
+            f"worktree path {raw_path!r} is not under canonical "
+            f"{str(canonical_root)!r}"
+        )
+    if requested.exists():
+        return f"worktree path {raw_path!r} exists but is not a linked git worktree"
+    return None
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -7792,6 +7852,9 @@ def _resolve_worktree_workspace(
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
     """
+    precondition = workspace_precondition_error(task, board=board)
+    if precondition:
+        raise ValueError(f"task {task.id} {precondition}")
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
@@ -9834,6 +9897,22 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     return total
 
 
+def normalize_max_spawn(value: Any) -> Optional[int]:
+    """Normalize the live worker cap; zero disables new dispatch.
+
+    ``None``, malformed values, and negative values mean no explicit cap.
+    Numeric config strings are accepted because gateway config reaches this
+    boundary without argparse's integer coercion.
+    """
+    if value is None:
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized >= 0 else None
+
+
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     """Classify current system memory pressure: ok/elevated/critical/unknown.
 
@@ -9988,6 +10067,8 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    max_spawn = normalize_max_spawn(max_spawn)
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
@@ -10310,10 +10391,8 @@ def _dispatch_once_locked(
             # directory or claiming the task, so health telemetry can compare
             # its report to this result instead of certifying a card the real
             # dispatcher would immediately fail.
-            from hermes_cli import kanban_health as _kh
-
             _task = get_task(conn, row["id"])
-            if _task is None or _kh.workspace_precondition_error(_task):
+            if _task is None or workspace_precondition_error(_task, board=board):
                 continue
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
@@ -10446,10 +10525,8 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
-            from hermes_cli import kanban_health as _kh
-
             _task = get_task(conn, row["id"])
-            if _task is None or _kh.workspace_precondition_error(_task):
+            if _task is None or workspace_precondition_error(_task, board=board):
                 continue
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1

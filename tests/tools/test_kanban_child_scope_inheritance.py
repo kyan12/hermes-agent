@@ -51,15 +51,25 @@ def scoped_worker(monkeypatch, tmp_path):
             conn,
             title="parent work",
             assignee="test-worker",
+            created_by="test-worker",
             tenant="acme-legal-entity",
             session_id="sess-principal-1",
         )
-        kb.claim_task(conn, tid)
-        run_id = kb.get_task(conn, tid).current_run_id
+        claimed = kb.claim_task(conn, tid, ttl_seconds=3600)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        claim_lock = claimed.claim_lock
+        run = conn.execute(
+            "SELECT status, ended_at, claim_lock, claim_expires FROM task_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        assert run is not None and run["status"] == "running" and run["ended_at"] is None
+        assert run["claim_lock"] == claim_lock and run["claim_expires"] > 0
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
     monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
     return tid
 
@@ -329,7 +339,8 @@ def project_worker(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="project parent", assignee="test-worker", tenant="acme"
+            conn, title="project parent", assignee="test-worker",
+            created_by="test-worker", tenant="acme"
         )
         parent_wt = repo / ".worktrees" / tid
         parent_wt.mkdir()
@@ -339,12 +350,21 @@ def project_worker(monkeypatch, tmp_path):
                 "workspace_path = ?, branch_name = ? WHERE id = ?",
                 ("alpha", str(parent_wt), f"alpha/{tid}", tid),
             )
-        kb.claim_task(conn, tid)
-        run_id = kb.get_task(conn, tid).current_run_id
+        claimed = kb.claim_task(conn, tid, ttl_seconds=3600)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        claim_lock = claimed.claim_lock
+        run = conn.execute(
+            "SELECT status, ended_at, claim_lock, claim_expires FROM task_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        assert run is not None and run["status"] == "running" and run["ended_at"] is None
+        assert run["claim_lock"] == claim_lock and run["claim_expires"] > 0
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
     monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
     return tid, repo
 

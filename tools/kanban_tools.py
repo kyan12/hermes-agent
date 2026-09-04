@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -630,15 +631,16 @@ def _handle_list(args: dict, **kw) -> str:
             # Match CLI list: dependencies that cleared since the last
             # dispatcher tick should be visible to orchestrators immediately.
             promoted = kb.recompute_ready(conn)
-            # Fetch one extra row so model-facing output can report that
-            # a bounded listing was truncated without dumping the board.
+            # Blocked rows require authority projection before applying the
+            # model-facing limit: invisible machine/stale blocks must not
+            # consume slots and hide a later affirmed human gate.
             rows = kb.list_tasks(
                 conn,
                 assignee=assignee,
                 status=status,
                 tenant=tenant,
                 include_archived=include_archived,
-                limit=limit + 1,
+                limit=None if status == "blocked" else limit + 1,
             )
             if status == "blocked":
                 from hermes_cli import kanban_health as kh
@@ -1414,8 +1416,38 @@ def _inherited_parent_scope(kb, conn, parents) -> tuple[dict, Optional[str]]:
             f"authoritative current_run_id={parent.current_run_id!r}"
         )
 
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    run = conn.execute(
+        "SELECT task_id, profile, status, claim_lock, claim_expires, ended_at "
+        "FROM task_runs WHERE id=?",
+        (worker_run_id,),
+    ).fetchone()
+    now = int(time.time())
+    if (
+        parent.status != "running"
+        or run is None
+        or run["task_id"] != parent.id
+        or run["status"] != "running"
+        or run["ended_at"] is not None
+        or not claim_lock
+        or parent.claim_lock != claim_lock
+        or run["claim_lock"] != claim_lock
+        or parent.claim_expires is None
+        or run["claim_expires"] is None
+        or int(parent.claim_expires) <= now
+        or int(run["claim_expires"]) <= now
+    ):
+        return {}, (
+            "task-bound continuation requires a running parent, an active current "
+            "run, and matching unexpired claim authority"
+        )
+
     profile = (os.environ.get("HERMES_PROFILE") or "").strip()
-    if not profile or profile != (parent.assignee or ""):
+    if (
+        not profile
+        or profile != (parent.assignee or "")
+        or run["profile"] != parent.assignee
+    ):
         return {}, (
             "task-bound continuation executor does not match the authoritative "
             f"parent: HERMES_PROFILE={profile!r}, assignee={parent.assignee!r}"
@@ -1428,6 +1460,7 @@ def _inherited_parent_scope(kb, conn, parents) -> tuple[dict, Optional[str]]:
         "assignee",
         "workspace_kind",
         "workspace_path",
+        "created_by",
     )
     for parent_id in parent_ids:
         candidate = kb.get_task(conn, parent_id)
@@ -1452,7 +1485,7 @@ def _inherited_parent_scope(kb, conn, parents) -> tuple[dict, Optional[str]]:
         "assignee": parent.assignee,
         "workspace_kind": parent.workspace_kind,
         "workspace_path": parent.workspace_path,
-        "created_by": parent.created_by or parent.assignee,
+        "created_by": parent.created_by,
         "task_id": parent.id,
     }, None
 
@@ -1469,17 +1502,20 @@ def _board_authority_error(requested_board) -> Optional[str]:
     Orchestrator contexts (no ``HERMES_KANBAN_TASK``) keep the documented
     cross-board routing the multi-board agent surfaces depend on.
     """
-    if not requested_board:
-        return None
     if not os.environ.get("HERMES_KANBAN_TASK"):
         return None
     from hermes_cli import kanban_db as kb
 
+    raw_pinned = os.environ.get("HERMES_KANBAN_BOARD")
+    if not raw_pinned:
+        return "task-bound continuation has no pinned authoritative board"
     try:
-        pinned = kb.get_current_board()
+        pinned = kb._normalize_board_slug(raw_pinned)
         requested = kb._normalize_board_slug(requested_board)
-    except Exception:
-        return None
+    except ValueError as exc:
+        return str(exc)
+    if not pinned:
+        return "task-bound continuation has no valid pinned authoritative board"
     if requested and requested != pinned:
         return (
             f"board {requested!r} is outside this worker's pinned board "
@@ -1574,6 +1610,10 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     board = args.get("board")
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        # Force the dispatcher-pinned authority instead of honoring a stray
+        # HERMES_KANBAN_DB or process-global current-board override.
+        board = os.environ["HERMES_KANBAN_BOARD"]
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1636,38 +1676,47 @@ def _handle_create(args: dict, **kw) -> str:
                     tenant = os.environ.get("HERMES_TENANT")
                 if not session_explicit:
                     session_id = ambient_session_id
-            new_tid = kb.create_task(
-                conn,
-                title=str(title).strip(),
-                body=body,
-                assignee=str(assignee),
-                parents=tuple(parents),
-                tenant=tenant,
-                priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
-                workspace_path=workspace_path,
-                project_id=project_id,
-                project_source_task_id=project_source_task_id,
-                triage=triage,
-                idempotency_key=idempotency_key,
-                max_runtime_seconds=(
+            create_kwargs = {
+                "title": str(title).strip(),
+                "body": body,
+                "assignee": str(assignee),
+                "parents": tuple(parents),
+                "tenant": tenant,
+                "priority": int(priority) if priority is not None else 0,
+                "workspace_kind": str(workspace_kind),
+                "workspace_path": workspace_path,
+                "project_id": project_id,
+                "project_source_task_id": project_source_task_id,
+                "triage": triage,
+                "idempotency_key": idempotency_key,
+                "max_runtime_seconds": (
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
                 ),
-                skills=skills,
-                model_override=model_override,
-                provider_override=provider_override,
-                goal_mode=goal_mode,
-                goal_max_turns=(
+                "skills": skills,
+                "model_override": model_override,
+                "provider_override": provider_override,
+                "goal_mode": goal_mode,
+                "goal_max_turns": (
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
-                initial_status=str(initial_status),
-                created_by=(
+                "initial_status": str(initial_status),
+                "created_by": (
                     _scope.get("created_by") if _scope
                     else os.environ.get("HERMES_PROFILE") or "worker"
                 ),
-                session_id=session_id,
-            )
+                "session_id": session_id,
+            }
+            # Revalidate authority under the same IMMEDIATE transaction as the
+            # nested create_task savepoint. A completion, reclaim, expiry, or
+            # parent-scope edit cannot race between validation and insertion.
+            with kb.write_txn(conn):
+                fresh_scope, fresh_error = _inherited_parent_scope(kb, conn, parents)
+                if fresh_error:
+                    raise ValueError(fresh_error)
+                if fresh_scope != _scope:
+                    raise ValueError("authoritative parent scope changed during creation")
+                new_tid = kb.create_task(conn, **create_kwargs)
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(

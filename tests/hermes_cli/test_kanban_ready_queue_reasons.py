@@ -14,6 +14,7 @@ eligible, below-cap card past the grace window raises the alert.
 from __future__ import annotations
 
 import time
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -284,11 +285,125 @@ def test_gateway_passes_max_spawn_into_the_ready_census(monkeypatch, board):
         raising=False,
     )
 
+    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: 4)
+
     reports = kanban_watchers._ready_queue_reports_for_telemetry()
     assert reports
     assert seen["max_spawn"] == 2
+    assert seen["max_in_progress"] == 4
     assert seen["max_in_progress_per_profile"] == 1
     assert seen["include_other_boards"] is True
+
+
+@pytest.mark.parametrize(
+    ("raw_cap", "parsed_cap", "expected"),
+    [
+        (0, None, 3),
+        (-2, None, 3),
+        ("not-an-int", None, 3),
+        ("4", 4, 4),
+    ],
+)
+def test_gateway_census_uses_dispatcher_cap_parser(
+    monkeypatch, board, raw_cap, parsed_cap, expected
+):
+    """Telemetry must parse caps exactly like the dispatcher does."""
+    from gateway import kanban_watchers
+
+    seen = {}
+
+    def _fake_report(conn, **kwargs):
+        seen.update(kwargs)
+        return kh.ReadyQueueReport(board=kwargs.get("board"))
+
+    monkeypatch.setattr(kh, "ready_queue_report", _fake_report)
+    monkeypatch.setattr(
+        kanban_watchers,
+        "_load_config",
+        lambda: {"kanban": {"max_in_progress": raw_cap}},
+        raising=False,
+    )
+    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: parsed_cap)
+    monkeypatch.setattr(kb, "derive_default_max_in_progress", lambda: 3)
+
+    assert kanban_watchers._ready_queue_reports_for_telemetry()
+    assert seen["max_in_progress"] == expected
+
+
+def test_configured_census_matches_dispatch_with_other_board_occupancy(
+    board, real_profiles, monkeypatch
+):
+    """Production health uses the same host-global occupancy as dispatch."""
+    kb.create_board("second", name="Second")
+    with kb.connect(board="second") as other:
+        running = kb.create_task(other, title="other board busy", assignee="alice")
+        assert kb.claim_task(other, running) is not None
+    waiting = kb.create_task(board, title="host cap wait", assignee="bob")
+
+    monkeypatch.setattr(kh, "_configured_max_spawn", lambda: None)
+    monkeypatch.setattr(kh, "_configured_max_in_progress", lambda: 1)
+    monkeypatch.setattr(kh, "_configured_per_profile_cap", lambda: None)
+    monkeypatch.setattr(kh, "_configured_default_assignee", lambda: None)
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+
+    report = kh.configured_ready_census(board, board="default")
+    dispatched = kb.dispatch_once(
+        board,
+        board="default",
+        dry_run=True,
+        max_in_progress=1,
+        reconcile_orphans=False,
+    )
+    assert report.spawnable_ids == [item[0] for item in dispatched.spawned] == []
+    assert report.reason_for(waiting) == kh.READY_CAPACITY_GLOBAL
+
+
+def test_max_spawn_zero_matches_dispatch_and_reports_capacity(board, real_profiles, monkeypatch):
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+    waiting = kb.create_task(board, title="dispatch disabled", assignee="alice")
+
+    report = kh.ready_queue_report(board, max_spawn=0)
+    dispatched = kb.dispatch_once(
+        board, dry_run=True, max_spawn=0, reconcile_orphans=False
+    )
+
+    assert report.spawnable_ids == [item[0] for item in dispatched.spawned] == []
+    assert report.reason_for(waiting) == kh.READY_CAPACITY_MAX_SPAWN
+    assert report.at_spawn_cap is True
+
+
+@pytest.mark.parametrize("case", ["relative", "no_repo", "outside_worktrees"])
+def test_invalid_worktree_matches_dry_run_without_writes(
+    board, real_profiles, monkeypatch, tmp_path, case
+):
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    if case == "relative":
+        raw_path = "relative/worktree"
+        forbidden = None
+    elif case == "no_repo":
+        forbidden = tmp_path / "not-a-repo" / ".worktrees" / "candidate"
+        raw_path = str(forbidden)
+    else:
+        forbidden = repo / "not-canonical" / "candidate"
+        raw_path = str(forbidden)
+
+    tid = kb.create_task(
+        board,
+        title=f"invalid worktree {case}",
+        assignee="alice",
+        workspace_kind="worktree",
+        workspace_path=raw_path,
+    )
+    report = kh.ready_queue_report(board)
+    dispatched = kb.dispatch_once(board, dry_run=True, reconcile_orphans=False)
+
+    assert report.spawnable_ids == [item[0] for item in dispatched.spawned] == []
+    assert report.reason_for(tid) == kh.READY_INVALID_WORKSPACE
+    if forbidden is not None:
+        assert not forbidden.exists()
 
 
 # ---------------------------------------------------------------------------

@@ -1781,10 +1781,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+        payload = kh.project_task_serialization(conn, task, _task_to_dict(task))
     if getattr(args, "json", False):
-        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
-        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        print(
+            f"Created {task_id}  "
+            f"({payload['status']}, assignee={payload.get('assignee') or '-'})"
+        )
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are
@@ -3344,7 +3348,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                         board=kb.get_current_board(),
                         max_spawn=args.max,
                         max_in_progress=kb.resolve_max_in_progress(
-                            cfg.get("max_in_progress")
+                            kb.configured_max_in_progress()
                         ),
                         max_in_progress_per_profile=cfg.get(
                             "max_in_progress_per_profile"

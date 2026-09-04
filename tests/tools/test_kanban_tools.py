@@ -52,6 +52,7 @@ def worker_env(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
@@ -68,6 +69,9 @@ def worker_env(monkeypatch, tmp_path):
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    with kb.connect() as conn:
+        claim_lock = kb.get_task(conn, tid).claim_lock
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
     return tid
 
 
@@ -125,6 +129,62 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     })
     tenant_ids = [t["id"] for t in json.loads(tenant_out)["tasks"]]
     assert tenant_ids == [c]
+
+
+def test_list_blocked_limits_after_authority_projection(monkeypatch, worker_env):
+    """Machine blocks ahead of human gates must not consume the visible limit."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_health as kh
+
+    with kb.connect() as conn:
+        for index in range(3):
+            machine = kb.create_task(
+                conn,
+                title=f"machine block {index}",
+                assignee="worker",
+                priority=100 - index,
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='blocked', block_kind='transient' WHERE id=?",
+                    (machine,),
+                )
+                kb._append_event(
+                    conn,
+                    machine,
+                    "blocked",
+                    {"reason": "machine-only failure", "kind": "transient"},
+                )
+
+        visible = []
+        for index in range(2):
+            tid = kb.create_task(
+                conn,
+                title=f"affirmed gate {index}",
+                assignee="worker",
+                priority=10 - index,
+            )
+            kb.block_task(conn, tid, reason=f"human input {index}", kind="needs_input")
+            assert kh.affirm_human_gate(
+                conn,
+                tid,
+                evidence={
+                    "type": "human_decision",
+                    "action": f"Provide input {index}",
+                    "affirmed_by": "Kevin Yan",
+                    "affirmed_at": int(__import__("time").time()),
+                },
+                reason=f"human input {index}",
+            )
+            visible.append(tid)
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_list({"status": "blocked", "limit": 1}))
+    assert [task["id"] for task in result["tasks"]] == [visible[0]]
+    assert result["count"] == 1
+    assert result["truncated"] is True
 
 
 def test_complete_happy_path(worker_env):
@@ -428,8 +488,66 @@ def test_create_happy_path(worker_env):
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
         assert child.assignee == "test-worker"
+        assert child.created_by is None
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("broken_authority", ["stale_status", "ended_run", "expired_claim"])
+def test_task_bound_create_rejects_inactive_run_authority(
+    worker_env, broken_authority
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn, kb.write_txn(conn):
+        parent = kb.get_task(conn, worker_env)
+        if broken_authority == "stale_status":
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (worker_env,))
+        elif broken_authority == "ended_run":
+            conn.execute(
+                "UPDATE task_runs SET status='done', ended_at=strftime('%s','now') "
+                "WHERE id=?",
+                (parent.current_run_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET claim_expires=0 WHERE id=?", (worker_env,)
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_expires=0 WHERE id=?",
+                (parent.current_run_id,),
+            )
+
+    result = json.loads(kt._handle_create({
+        "title": "must not exist",
+        "assignee": "test-worker",
+        "parents": [worker_env],
+    }))
+    assert "error" in result
+    with kb.connect() as conn:
+        assert not any(t.title == "must not exist" for t in kb.list_tasks(conn))
+
+
+def test_task_bound_create_rejects_foreign_creator_additional_parent(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        foreign = kb.create_task(
+            conn,
+            title="foreign creator",
+            assignee="test-worker",
+            created_by="foreign-principal",
+        )
+
+    result = json.loads(kt._handle_create({
+        "title": "mixed authority",
+        "assignee": "test-worker",
+        "parents": [worker_env, foreign],
+    }))
+    assert "error" in result
+    assert "created_by" in result["error"]
 
 
 def test_link_happy_path(worker_env):
