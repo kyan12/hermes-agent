@@ -399,7 +399,7 @@ def test_create_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "child task",
-        "assignee": "peer",
+        "assignee": "test-worker",
         "parents": [worker_env],
     })
     d = json.loads(out)
@@ -411,7 +411,7 @@ def test_create_happy_path(worker_env):
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
-        assert child.assignee == "peer"
+        assert child.assignee == "test-worker"
     finally:
         conn.close()
 
@@ -516,7 +516,7 @@ def test_worker_lifecycle_through_tools(worker_env):
     # 4. spawn a child task for follow-up
     child_out = json.loads(kt._handle_create({
         "title": "write integration test",
-        "assignee": "qa",
+        "assignee": "test-worker",
         "parents": [worker_env],
     }))
     assert child_out["ok"]
@@ -859,7 +859,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
 
     out = kt._handle_create({
         "title": "auto-sub gateway",
-        "assignee": "peer",
+        "assignee": "test-worker",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -893,7 +893,7 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
 
     out = kt._handle_create({
         "title": "auto-sub tui",
-        "assignee": "peer",
+        "assignee": "test-worker",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -919,7 +919,7 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
 
     out = kt._handle_create({
         "title": "no sub cli",
-        "assignee": "peer",
+        "assignee": "test-worker",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -975,7 +975,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
-        "assignee": "peer",
+        "assignee": "test-worker",
     })
     d = json.loads(out)
     assert d["ok"] is True, d

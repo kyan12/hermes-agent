@@ -289,6 +289,7 @@ PATH_NONE = "none"
 READY_SPAWNABLE = "spawnable"
 READY_UNASSIGNED = "unassigned"
 READY_CONTROL_PLANE_LANE = "control_plane_lane"
+READY_INVALID_EXECUTOR = "invalid_executor"
 READY_CAPACITY_GLOBAL = "capacity_global"
 READY_CAPACITY_PER_PROFILE = "capacity_per_profile"
 READY_INVALID_WORKSPACE = "invalid_workspace"
@@ -309,6 +310,7 @@ READY_REVIEW_DISABLED = "review_dispatch_disabled"
 READY_TERMINAL_NONSPAWNABLE = frozenset(
     {
         "unassigned",
+        "invalid_executor",
         "invalid_workspace",
         "review_dispatch_disabled",
     }
@@ -351,6 +353,28 @@ def reconcile_enabled() -> bool:
         )
     except Exception:
         return True
+
+
+def control_plane_assignees() -> frozenset[str]:
+    """Return explicitly configured, human-pulled executor lane names.
+
+    An unknown Hermes profile is not evidence that a name denotes a
+    control-plane lane: it is usually a typo. Operators must durably declare
+    such lanes in ``kanban.control_plane_assignees``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config() or {}).get("kanban", {}).get(
+            "control_plane_assignees", []
+        )
+    except Exception:
+        return frozenset()
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(str(name).strip() for name in raw if str(name).strip())
 
 
 # ---------------------------------------------------------------------------
@@ -1026,6 +1050,9 @@ class ForwardPath:
 
 _TERMINAL_NONSPAWNABLE_DETAIL = {
     READY_UNASSIGNED: "no assignee — the dispatcher will never spawn it",
+    READY_INVALID_EXECUTOR: (
+        "assignee is neither a Hermes profile nor a configured control-plane lane"
+    ),
     READY_INVALID_WORKSPACE: "workspace cannot resolve; every spawn will fail",
     READY_REVIEW_DISABLED: (
         "kanban.review_dispatch is disabled and the assignee is a Hermes "
@@ -1058,6 +1085,7 @@ def configured_ready_census(conn, *, board: Optional[str] = None) -> ReadyQueueR
         max_spawn=_configured_max_spawn(),
         max_in_progress=_configured_max_in_progress(),
         max_in_progress_per_profile=_configured_per_profile_cap(),
+        default_assignee=_configured_default_assignee(),
     )
 
 
@@ -1504,6 +1532,7 @@ def ready_queue_report(
     max_spawn: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    default_assignee: Optional[str] = None,
     include_other_boards: bool = False,
     memory_pressure: Optional[str] = None,
 ) -> ReadyQueueReport:
@@ -1582,6 +1611,8 @@ def ready_queue_report(
         from hermes_cli.profiles import profile_exists
     except Exception:
         profile_exists = None  # type: ignore[assignment]
+    configured_control_plane = control_plane_assignees()
+    fallback_assignee = (default_assignee or "").strip() or None
 
     review_enabled = True
     try:
@@ -1599,7 +1630,7 @@ def ready_queue_report(
         task = kb.get_task(conn, row["id"])
         if task is None:
             continue
-        assignee = task.assignee
+        assignee = task.assignee or fallback_assignee
         lane = "review" if row["status"] == "review" else "ready"
 
         if not assignee:
@@ -1608,9 +1639,16 @@ def ready_queue_report(
             )
             continue
         if profile_exists is not None and not profile_exists(assignee):
-            # A control-plane lane is pulled by a terminal via claim_task.
-            # Correctly idle, not a failure — and emphatically not a
-            # credential problem.
+            if assignee not in configured_control_plane:
+                report.entries.append(
+                    ReadyEntry(
+                        task.id, assignee, READY_INVALID_EXECUTOR,
+                        "assignee is not a Hermes profile or configured control-plane lane",
+                    )
+                )
+                continue
+            # An explicitly configured control-plane lane is pulled by a
+            # terminal via claim_task. Correctly idle, not a failure.
             report.entries.append(
                 ReadyEntry(
                     task.id, assignee, READY_CONTROL_PLANE_LANE,
@@ -1940,6 +1978,18 @@ def _configured_per_profile_cap() -> Optional[int]:
             "max_in_progress_per_profile"
         )
         return int(value) if value else None
+    except Exception:
+        return None
+
+
+def _configured_default_assignee() -> Optional[str]:
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get("default_assignee")
+        if value is None:
+            return None
+        return str(value).strip() or None
     except Exception:
         return None
 

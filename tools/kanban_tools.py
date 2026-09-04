@@ -492,7 +492,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
-    return {
+    result = {
         "id": task.id,
         "title": task.title,
         "assignee": task.assignee,
@@ -514,6 +514,17 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "parent_count": len(parents),
         "child_count": len(children),
     }
+    if task.status == "blocked":
+        from hermes_cli import kanban_health as kh
+        projection = kh.classify_block(conn, task)
+        result["block_projection"] = {
+            "visible": projection.visible,
+            "reason_code": projection.reason_code,
+            "action": projection.action,
+        }
+        if not projection.visible:
+            result["status"] = "triage"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +647,9 @@ def _handle_list(args: dict, **kw) -> str:
                 include_archived=include_archived,
                 limit=limit + 1,
             )
+            if status == "blocked":
+                from hermes_cli import kanban_health as kh
+                rows = [t for t in rows if kh.classify_block(conn, t).visible]
             truncated = len(rows) > limit
             tasks = rows[:limit]
             return json.dumps({
@@ -1370,12 +1384,8 @@ def _inherited_parent_scope(kb, conn) -> dict:
     card is bound to — and nothing downstream would notice, because an
     unscoped card looks exactly like a card that was never meant to be scoped.
 
-    Returns the inheritable dimensions only. ``assignee`` is deliberately NOT
-    inherited: the executor must be named explicitly so fan-out is a decision
-    rather than an accident. Workspace paths are not inherited either — the
-    child gets its own checkout (see ``create_task``); only the *project*
-    link, which resolves to a fresh per-task worktree in the same repo,
-    carries over.
+    Project-linked children receive a fresh checkout in the same repository.
+    Non-project continuations retain the parent's exact workspace authority.
     """
     self_tid = os.environ.get("HERMES_KANBAN_TASK")
     if not self_tid:
@@ -1390,6 +1400,10 @@ def _inherited_parent_scope(kb, conn) -> dict:
         "tenant": parent.tenant,
         "session_id": parent.session_id,
         "project_id": parent.project_id,
+        "assignee": parent.assignee,
+        "workspace_kind": parent.workspace_kind,
+        "workspace_path": parent.workspace_path,
+        "created_by": parent.created_by or parent.assignee,
         "task_id": parent.id,
     }
 
@@ -1544,11 +1558,28 @@ def _handle_create(args: dict, **kw) -> str:
                         "kanban_create: workspace cannot override a project-linked parent; "
                         "omit workspace fields to receive a fresh inherited-repository worktree"
                     )
+                inherited_assignee = _scope.get("assignee")
+                if assignee != inherited_assignee:
+                    return tool_error(
+                        "kanban_create: assignee conflicts with the authoritative parent executor; "
+                        "cross-executor delegation requires a separate grant"
+                    )
                 tenant = inherited_tenant
                 session_id = inherited_session
                 if inherited_project:
                     project_id = inherited_project
                     project_source_task_id = _scope["task_id"]
+                else:
+                    inherited_kind = _scope.get("workspace_kind") or "scratch"
+                    inherited_path = _scope.get("workspace_path")
+                    if workspace_explicit and (
+                        workspace_kind != inherited_kind or workspace_path != inherited_path
+                    ):
+                        return tool_error(
+                            "kanban_create: workspace conflicts with the authoritative parent scope"
+                        )
+                    workspace_kind = inherited_kind
+                    workspace_path = inherited_path
             else:
                 if not tenant_explicit:
                     tenant = os.environ.get("HERMES_TENANT")
@@ -1580,7 +1611,10 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=(
+                    _scope.get("created_by") if _scope
+                    else os.environ.get("HERMES_PROFILE") or "worker"
+                ),
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)

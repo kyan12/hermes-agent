@@ -153,7 +153,12 @@ def test_board_health_cli_exits_nonzero_on_an_unhealthy_board(board, capsys):
     assert kh.REASON_LEGACY_UNTYPED in out
 
 
-def test_board_health_cli_exits_zero_on_a_healthy_board(board, capsys):
+def test_board_health_cli_exits_zero_on_a_healthy_board(
+    board, capsys, monkeypatch
+):
+    monkeypatch.setattr(
+        kh, "control_plane_assignees", lambda: frozenset({"alice"})
+    )
     kb.create_task(board, title="ordinary ready card", assignee="alice")
     assert _run_cli(["kanban", "board-health"]) == 0
     assert "OK" in capsys.readouterr().out

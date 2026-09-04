@@ -61,11 +61,31 @@ def test_unassigned_ready_card_reports_unassigned_not_credentials(board, real_pr
     assert report.spawnable_ids == []
 
 
-def test_control_plane_lane_reports_its_own_reason(board, real_profiles):
+def test_registered_control_plane_lane_reports_its_own_reason(board, real_profiles, monkeypatch):
+    monkeypatch.setattr(kh, "control_plane_assignees", lambda: frozenset({"orion-cc"}))
     tid = kb.create_task(board, title="human lane work", assignee="orion-cc")
     report = kh.ready_queue_report(board)
     assert _reasons(report)[tid] == kh.READY_CONTROL_PLANE_LANE
     assert report.spawnable_ids == []
+
+
+def test_unknown_profile_is_invalid_not_a_healthy_human_lane(board, real_profiles):
+    tid = kb.create_task(board, title="typo", assignee="orion-cc")
+    report = kh.ready_queue_report(board)
+    assert _reasons(report)[tid] == kh.READY_INVALID_EXECUTOR
+    assert kh.board_health(board)["healthy"] is False
+
+
+def test_default_assignee_census_matches_dispatch_eligibility(board, real_profiles):
+    tid = kb.create_task(board, title="fallback", assignee=None)
+    report = kh.ready_queue_report(board, default_assignee="alice")
+    dispatched = kb.dispatch_once(
+        board, dry_run=True, spawn_fn=lambda *_a, **_k: 123,
+        default_assignee="alice",
+    )
+    assert _reasons(report)[tid] == kh.READY_SPAWNABLE
+    assert report.spawnable_ids == [tid]
+    assert [item[0] for item in dispatched.spawned] == [tid]
 
 
 def test_global_capacity_wait_is_a_capacity_reason(board, real_profiles):
@@ -281,9 +301,14 @@ def test_stuck_alert_message_does_not_blame_credentials_for_capacity(board, real
     assert summary["spawnable"] == 0
 
 
-def test_one_queue_reports_several_distinct_reasons_at_once(board, real_profiles):
+def test_one_queue_reports_several_distinct_reasons_at_once(
+    board, real_profiles, monkeypatch
+):
     """A real board mixes reasons. Each card must keep its own, rather than
     all of them collapsing into whatever the first check happened to be."""
+    monkeypatch.setattr(
+        kh, "control_plane_assignees", lambda: frozenset({"orion-cc"})
+    )
     busy = kb.create_task(board, title="alice busy", assignee="alice")
     kb.claim_task(board, busy)
 
@@ -312,9 +337,14 @@ def test_one_queue_reports_several_distinct_reasons_at_once(board, real_profiles
     assert report.spawnable_ids == [fine]
 
 
-def test_no_alert_at_all_when_every_reason_is_a_legitimate_wait(board, real_profiles):
+def test_no_alert_at_all_when_every_reason_is_a_legitimate_wait(
+    board, real_profiles, monkeypatch
+):
     """The regression that mattered most: these queues produced a
     'check venv, PATH, credentials' warning that never cleared."""
+    monkeypatch.setattr(
+        kh, "control_plane_assignees", lambda: frozenset({"orion-cc"})
+    )
     busy = kb.create_task(board, title="busy", assignee="alice")
     kb.claim_task(board, busy)
     kb.create_task(board, title="capped", assignee="alice")
@@ -335,11 +365,14 @@ def test_no_alert_at_all_when_every_reason_is_a_legitimate_wait(board, real_prof
 
 
 def test_stuck_alert_names_credentials_only_for_the_genuinely_stuck_card(
-    board, real_profiles
+    board, real_profiles, monkeypatch
 ):
     """When a card really is eligible and below cap, a broken profile IS the
     likely cause — so the credential hint belongs there, and only there. The
     other cards are reported by reason code as correctly waiting."""
+    monkeypatch.setattr(
+        kh, "control_plane_assignees", lambda: frozenset({"orion-cc"})
+    )
     stuck = kb.create_task(board, title="should have spawned", assignee="carol")
     guarded = kb.create_task(board, title="pr open", assignee="bob")
     kb.add_comment(board, guarded, "worker", "https://github.com/o/r/pull/3")

@@ -140,9 +140,10 @@ def test_worker_cannot_override_parent_principal(scoped_worker):
 # ---------------------------------------------------------------------------
 
 
-def test_child_carries_an_explicit_executor(scoped_worker):
-    child = _child_of(scoped_worker, assignee="other-profile")
-    assert _task(child).assignee == "other-profile"
+def test_child_rejects_cross_executor_delegation_without_a_grant(scoped_worker):
+    out = _create(title="delegate", assignee="other-profile", parents=[scoped_worker])
+    assert "error" in out
+    assert "assignee" in out["error"].lower() or "executor" in out["error"].lower()
 
 
 def test_child_without_an_executor_is_refused(scoped_worker):
@@ -157,6 +158,12 @@ def test_child_without_an_executor_is_refused(scoped_worker):
 
 
 def test_child_records_the_acting_profile_as_creator(scoped_worker):
+    child = _child_of(scoped_worker)
+    assert _task(child).created_by == "test-worker"
+
+
+def test_child_creator_authority_comes_from_parent_not_ambient(scoped_worker, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "ambient-impostor")
     child = _child_of(scoped_worker)
     assert _task(child).created_by == "test-worker"
 
@@ -312,3 +319,17 @@ def test_worker_cannot_override_parent_project_or_workspace(project_worker):
         assert any(
             word in out["error"].lower() for word in ("project", "workspace")
         )
+
+
+def test_non_project_parent_workspace_is_inherited_and_conflicts_rejected(scoped_worker, tmp_path):
+    parent_path = tmp_path / "authoritative-workspace"
+    parent_path.mkdir()
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+                         (str(parent_path), scoped_worker))
+    child = _child_of(scoped_worker)
+    assert (_task(child).workspace_kind, _task(child).workspace_path) == ("dir", str(parent_path))
+    out = _create(title="escape", assignee="test-worker", parents=[scoped_worker],
+                  workspace_kind="scratch")
+    assert "error" in out and "workspace" in out["error"].lower()

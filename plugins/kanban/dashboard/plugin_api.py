@@ -1157,7 +1157,8 @@ def affirm_task_gate(
 
 @router.post("/tasks/{task_id}/hold")
 def type_task_hold(
-    task_id: str, payload: TypedHoldBody, board: Optional[str] = Query(None)
+    request: Request, task_id: str, payload: TypedHoldBody,
+    board: Optional[str] = Query(None)
 ):
     """Atomically park a card with a machine-verifiable typed hold."""
     from hermes_cli import kanban_health as kh
@@ -1167,6 +1168,7 @@ def type_task_hold(
     try:
         evidence = None
         if payload.kind in kh.PARKED_HOLD_KINDS:
+            principal = _verified_human_principal(request, None)
             if not payload.action or not payload.evidence_type:
                 raise HTTPException(
                     status_code=400,
@@ -1175,7 +1177,7 @@ def type_task_hold(
             evidence = {
                 "type": payload.evidence_type,
                 "action": payload.action,
-                "affirmed_by": "operator:dashboard",
+                "affirmed_by": principal,
                 "affirmed_at": int(time.time()),
                 "source": "dashboard",
             }

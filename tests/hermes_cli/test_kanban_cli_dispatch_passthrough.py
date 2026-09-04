@@ -94,3 +94,22 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     )
 
 
+def test_daemon_stuck_census_receives_exact_effective_max(isolated_kanban_home, monkeypatch):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+    from hermes_cli import kanban_health
+    captured = []
+    monkeypatch.setattr(
+        kanban_health, "ready_queue_report",
+        lambda conn, **kw: (captured.append(kw), SimpleNamespace(spawnable_ids=[]))[1],
+    )
+    monkeypatch.setattr(
+        kanban_db, "run_daemon",
+        lambda **kw: kw["on_tick"](kanban_db.DispatchResult()),
+    )
+    args = argparse.Namespace(interval=1, max=2, failure_limit=2, verbose=False,
+                              pidfile=None, force=True)
+    kb_cli._cmd_daemon(args)
+    assert captured and captured[0]["max_spawn"] == 2
+
+

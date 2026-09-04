@@ -182,6 +182,35 @@ def test_affirm_gate_rejects_a_compound_action(client, monkeypatch):
     assert "atomic" in response.json()["detail"].lower()
 
 
+@pytest.mark.parametrize("kind", ["external", "physical", "roadmap"])
+def test_intentional_hold_uses_verified_human_principal(client, monkeypatch, kind):
+    monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "kevin")
+    task = client.post("/api/plugins/kanban/tasks", json={"title": f"{kind} hold"}).json()["task"]
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task['id']}/hold",
+        json={"kind": kind, "action": "Wait for the named milestone",
+              "evidence_type": "human_decision"},
+    )
+    assert response.status_code == 200, response.text
+    with kb.connect() as conn:
+        assert json.loads(kb.get_task(conn, task["id"]).gate_evidence)["affirmed_by"] == "kevin"
+
+
+def test_intentional_hold_rejects_transport_identity(client, monkeypatch):
+    from hermes_cli import kanban_health as kh
+    monkeypatch.delenv("HERMES_KANBAN_OPERATOR", raising=False)
+    monkeypatch.setattr(kh, "operator_principal", lambda: None)
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "unauth hold"}).json()["task"]
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task['id']}/hold",
+        json={"kind": "external", "action": "Wait for vendor",
+              "evidence_type": "external_party"},
+    )
+    assert response.status_code == 403
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task["id"]).status != "scheduled"
+
+
 def test_create_task_appears_on_board(client):
     r = client.post(
         "/api/plugins/kanban/tasks",

@@ -1846,8 +1846,29 @@ def _cmd_list(args: argparse.Namespace) -> int:
             workflow_template_id=args.workflow_template_id,
             current_step_key=args.current_step_key,
         )
+        projections = {}
+        if any(t.status == "blocked" for t in tasks):
+            from hermes_cli import kanban_health as kh
+            projections = {
+                t.id: kh.classify_block(conn, t) for t in tasks if t.status == "blocked"
+            }
+            if args.status == "blocked":
+                tasks = [t for t in tasks if projections[t.id].visible]
     if getattr(args, "json", False):
-        print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
+        payload = []
+        for t in tasks:
+            row = _task_to_dict(t)
+            projection = projections.get(t.id)
+            if projection is not None:
+                row["block_projection"] = {
+                    "visible": projection.visible,
+                    "reason_code": projection.reason_code,
+                    "action": projection.action,
+                }
+                if not projection.visible:
+                    row["status"] = "triage"
+            payload.append(row)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     # Passive discoverability: when the user has multiple boards, surface
     # which one they're looking at in the list header. Single-board users
@@ -1868,7 +1889,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
         print("(no matching tasks)")
         return 0
     for t in tasks:
-        print(_fmt_task_line(t))
+        projection = projections.get(t.id)
+        if projection is not None and not projection.visible:
+            print(_fmt_task_line(t).replace("blocked ", "triage  ", 1))
+        else:
+            print(_fmt_task_line(t))
     return 0
 
 
@@ -3320,11 +3345,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                     kh.ready_queue_report(
                         conn,
                         board=kb.get_current_board(),
+                        max_spawn=args.max,
                         max_in_progress=kb.resolve_max_in_progress(
                             cfg.get("max_in_progress")
                         ),
                         max_in_progress_per_profile=cfg.get(
                             "max_in_progress_per_profile"
+                        ),
+                        default_assignee=(
+                            (cfg.get("default_assignee") or "").strip() or None
                         ),
                         include_other_boards=True,
                     )

@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -233,7 +234,21 @@ def run_sentinel(
         board_row: dict = {"board": slug}
         conn = None
         try:
-            conn = kb.connect(board=slug)
+            if apply:
+                conn = kb.connect(board=slug)
+            else:
+                # Dry-run is observation, never implicit initialization or
+                # migration.  SQLite mode=ro fails closed for absent boards.
+                db_path = kb.kanban_db_path(slug)
+                if not db_path.is_file():
+                    raise FileNotFoundError(
+                        f"Kanban board database does not exist: {db_path}"
+                    )
+                conn = sqlite3.connect(
+                    f"file:{db_path.resolve()}?mode=ro", uri=True, timeout=5.0
+                )
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only=ON")
             checkpoint = kh.read_checkpoint(conn, kh.CHECKPOINT_RECONCILE)
             controller_live = bool(
                 checkpoint
@@ -291,6 +306,22 @@ def run_sentinel(
                             board_row["reason_code"] = REASON_CONTROLLER_ACTIVE
                 else:
                     _reconcile_if_still_down()
+
+            if not controller_live:
+                # Controller liveness is itself a verified contract.  An
+                # otherwise empty board must not hide a missing/stale/failed
+                # checkpoint from the sentinel's overall verdict.
+                unresolved.append(
+                    {
+                        "board": slug,
+                        "task_id": None,
+                        "reason_code": REASON_CONTROLLER_DOWN,
+                        "detail": (
+                            "native Kanban controller checkpoint is missing, "
+                            "stale, or failed"
+                        ),
+                    }
+                )
 
             health = kh.board_health(conn, now=ts, board=slug)
             board_row["healthy"] = health["healthy"]

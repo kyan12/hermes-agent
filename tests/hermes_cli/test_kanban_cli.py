@@ -57,6 +57,28 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_list_blocked_json_projects_only_current_affirmed_gates(kanban_home, monkeypatch):
+    from hermes_cli import kanban_health as kh
+    monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "kevin")
+    with kb.connect() as conn:
+        legacy = kb.create_task(conn, title="legacy", assignee="alice")
+        stale = kb.create_task(conn, title="stale", assignee="alice")
+        current = kb.create_task(conn, title="current", assignee="alice")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (legacy,))
+        import time
+        evidence = {"type": "human_decision", "action": "Sign the agreement",
+                    "affirmed_by": "kevin", "affirmed_at": int(time.time())}
+        assert kh.affirm_human_gate(conn, stale, evidence=evidence)
+        assert kb.unblock_task(conn, stale)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (stale,))
+        assert kh.affirm_human_gate(conn, current, evidence=evidence)
+    payload = json.loads(kc.run_slash("list --status blocked --json"))
+    assert [row["id"] for row in payload] == [current]
+    assert payload[0]["block_projection"]["visible"] is True
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")

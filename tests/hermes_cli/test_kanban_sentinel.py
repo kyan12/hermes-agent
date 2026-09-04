@@ -10,6 +10,7 @@ human action for the whole sweep — not one per card.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from pathlib import Path
 
@@ -209,8 +210,11 @@ def test_sentinel_dedupes_repeated_identical_alerts(home):
     assert later.alert_emitted is True
 
 
-def test_healthy_board_produces_no_action_and_no_repair(home):
+def test_healthy_board_produces_no_action_and_no_repair(home, monkeypatch):
     now = int(time.time())
+    monkeypatch.setattr(
+        kh, "control_plane_assignees", lambda: frozenset({"alice"})
+    )
     conn = kb.connect()
     try:
         kb.create_task(conn, title="ordinary ready card", assignee="alice")
@@ -321,3 +325,38 @@ def test_unresolved_evidence_is_deduplicated_across_failure_classes(home, monkey
     assert sorted(report.kevin_action["evidence"]["reason_codes"]) == sorted(
         [kh.READY_UNASSIGNED, kh.REASON_UNSCOPED_ACTIVE_WORK]
     )
+
+
+def test_dry_run_read_only_does_not_create_or_modify_board_files(tmp_path, monkeypatch):
+    home = tmp_path / "fresh-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    missing = ks.run_sentinel(now=123, apply=False)
+    assert missing.ok is False
+    assert not home.exists()
+    home.mkdir()
+    kb.init_db()
+    db = kb.kanban_db_path()
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    report = ks.run_sentinel(now=124, apply=False)
+    after = hashlib.sha256(db.read_bytes()).hexdigest()
+    assert report.ok is False
+    assert before == after
+
+
+@pytest.mark.parametrize("checkpoint", [None, "stale", "failed"])
+def test_controller_failure_pages_once_even_on_empty_healthy_board(home, checkpoint):
+    now = int(time.time())
+    if checkpoint is not None:
+        with kb.connect() as conn:
+            kh.record_checkpoint(
+                conn, kh.CHECKPOINT_RECONCILE,
+                status="failed" if checkpoint == "failed" else "ok",
+                now=now if checkpoint == "failed" else now - kh.WAKE_CHECKPOINT_MAX_AGE_SECONDS - 1,
+            )
+    report = ks.run_sentinel(now=now, apply=False)
+    assert report.ok is False
+    assert report.kevin_action is not None
+    assert report.kevin_action["evidence"]["reason_codes"] == [ks.REASON_CONTROLLER_DOWN]
+    assert report.repairs == []
