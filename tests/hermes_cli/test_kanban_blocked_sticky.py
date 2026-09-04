@@ -49,13 +49,12 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Worker-initiated kanban_block must be sticky
+# Worker-initiated recovery requests must be sticky
 # ---------------------------------------------------------------------------
 
 
 def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path) -> None:
-    """A standalone task that a worker explicitly blocks for review
-    must stay blocked across an arbitrary number of dispatcher ticks.
+    """A worker recovery request must stay in triage across dispatcher ticks.
     Before #28712's fix, ``recompute_ready`` would silently flip it
     back to ``ready`` on the very next tick."""
     with kb.connect() as conn:
@@ -66,14 +65,14 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             reason="review-required: please verify ACL change",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).status == "triage"
 
         # Hammer the promotion code — exactly the dispatcher loop's
         # behaviour, just compressed in time.
         for _ in range(5):
             promoted = kb.recompute_ready(conn)
-            assert promoted == 0, "worker-blocked task must not auto-promote"
-            assert kb.get_task(conn, tid).status == "blocked"
+            assert promoted == 0, "worker recovery task must not auto-promote"
+            assert kb.get_task(conn, tid).status == "triage"
 
 
 
@@ -97,7 +96,7 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
 
 def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
     """Reproduces the exact #28712 loop and asserts the dispatcher
-    leaves the task blocked instead of cycling.
+    leaves the task in recovery instead of cycling.
 
     Loop shape from the issue:
 
@@ -123,11 +122,11 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
             reason="review-required: human eyes please",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).status == "triage"
 
         # First dispatcher tick — must NOT promote.
         assert kb.recompute_ready(conn) == 0
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).status == "triage"
 
         # Simulate the (hypothetical) protocol_violation + gave_up
         # entries that the dispatcher would have written if the bug
@@ -152,7 +151,7 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
         for _ in range(3):
             promoted = kb.recompute_ready(conn)
             assert promoted == 0
-            assert kb.get_task(conn, tid).status == "blocked"
+            assert kb.get_task(conn, tid).status == "triage"
 
 
 # ---------------------------------------------------------------------------

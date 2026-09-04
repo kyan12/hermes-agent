@@ -671,6 +671,7 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `POST` | `/links` | Add a dependency (`parent_id` → `child_id`) |
 | `DELETE` | `/links?parent_id=…&child_id=…` | Remove a dependency |
 | `POST` | `/dispatch?max=…&dry_run=…` | Nudge the dispatcher — skip the 60 s wait |
+| `GET` | `/board-health?board=…&all_boards=…&reconcile=…&ready_queue=…` | Lifecycle health: affirmed human gates vs. machine holds routed to automation recovery, typed scheduled holds, cards with no forward path, and the durable wake subsystem's state. Same payload as `hermes kanban board-health --json` |
 | `GET` | `/config` | Read `dashboard.kanban` preferences from `config.yaml` — `default_tenant`, `lane_by_profile`, `include_archived_by_default`, `render_markdown` |
 | `WS` | `/events?since=<event_id>` | Live stream of `task_events` rows |
 
@@ -815,6 +816,46 @@ hermes kanban create "nightly backup audit" \
 ### Respawn guard
 
 The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 error on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
+
+### Board health and scheduled-wake diagnostics
+
+A board can look healthy while being completely stuck: a crashed worker's
+block sitting in the human column, a `scheduled` card nothing will ever wake,
+or a "dispatcher stuck" warning blaming credentials for what is really a
+capacity wait. The native health control loop reconciles these on every
+dispatcher tick, and three commands report on it:
+
+```bash
+hermes kanban board-health                 # exit 1 when the board is unhealthy
+hermes kanban board-health --ready-queue   # + why each ready card did not spawn
+hermes kanban scheduled-wake --reconcile   # resume every authorized hold
+hermes kanban sentinel --dry-run           # deterministic verification sweep
+```
+
+**Blocked means one human action.** A card only appears as a human gate when
+it carries a `needs_input`/`capability` block *and* affirmed typed evidence
+naming one atomic action. Untyped blocks (what a crash leaves behind) and
+unaffirmed claims route to automation recovery instead.
+
+**Park scheduled cards with a type**, so the controller knows whether it may
+resume them:
+
+```bash
+hermes kanban schedule t_abc "vendor replies by the 14th" --kind external
+hermes kanban schedule t_def "retry after the window"     --kind wake --wake-at +7200
+```
+
+`dependency` and `wake` holds resume automatically. `external`, `physical` and
+`roadmap` stay parked and are healthy that way. An untyped hold is reported as
+`legacy_untyped` and is never auto-resumed — classify it explicitly.
+
+**Dispatcher-stuck** now fires only for cards the dispatcher would actually
+have spawned. Capacity waits, respawn guards, invalid workspaces and
+control-plane lanes each get their own reason code instead of a credential
+warning that never clears.
+
+Full operations guide, including the sentinel and the update capability
+canary: see `docs/kanban/health-control-loop.md` in the repository.
 
 ### Drag-to-delete and bulk delete (dashboard)
 

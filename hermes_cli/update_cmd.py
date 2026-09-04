@@ -926,6 +926,118 @@ def _validate_critical_modules_import(
         return False, module, failures[module][1]
     return True, None, None
 
+def _run_capability_canary(root, *, label: str) -> bool:
+    """Pre-activation Kanban lifecycle capability canary (see
+    :mod:`hermes_cli.kanban_capabilities`).
+
+    Probes the freshly-updated tree out-of-process for every lifecycle
+    capability the install requires. This catches the failure the import
+    check cannot: a tree that imports perfectly but no longer contains the
+    board control loop, because the update pulled a lineage that never had
+    it. Without this, such an update reports success and the board silently
+    stops waking scheduled work.
+
+    Returns True only when every required capability survived. Probe failure
+    is absence of safety evidence and therefore fails activation closed.
+    """
+    try:
+        from hermes_cli.kanban_capabilities import preactivation_canary
+
+        report = preactivation_canary(root)
+    except Exception as exc:
+        print(f"  ✗ capability canary could not run ({label}): {exc}")
+        return False
+    if not report.probed:
+        # An unprobeable candidate has not demonstrated that required
+        # lifecycle invariants survive activation. Fail closed.
+        print(f"  ✗ capability canary could not probe the tree ({label}).")
+        return False
+    try:
+        from hermes_cli.update_receipt import record_step
+
+        record_step(
+            "capability_canary",
+            report.ok,
+            detail=(
+                f"{len(report.present)} verified"
+                if report.ok
+                else f"missing: {', '.join(report.missing)}"
+            ),
+        )
+    except Exception:
+        pass
+    if report.ok:
+        print(
+            f"  ✓ Kanban lifecycle capabilities verified "
+            f"({len(report.present)} checked)"
+        )
+        return True
+    print()
+    print("  ✗ Pre-activation capability canary FAILED:")
+    for name in report.missing:
+        print(f"      missing: {name}")
+    print()
+    print("    The updated tree no longer provides Kanban lifecycle")
+    print("    capability this install depends on. This is what a silent")
+    print("    invariant drop looks like — most often the update pulled a")
+    print("    branch that never carried it.")
+    print("    Set the lineage you actually run:")
+    print("      hermes config set update.branch <your-maintained-branch>")
+    print("    then re-run `hermes update`.")
+    return False
+
+
+def _installed_capability_manifest_present(root) -> bool:
+    """Return whether this install already opted into the lifecycle contract."""
+    return (Path(root) / "hermes_cli" / "kanban_capabilities.py").is_file()
+
+
+def _preflight_git_capability_candidate(git_cmd, root, branch: str) -> bool:
+    """Probe ``origin/<branch>`` before mutating the live checkout.
+
+    The verifier is imported from the still-running installation. Therefore a
+    candidate cannot certify itself by deleting both a capability and its own
+    manifest entry. Installs predating the manifest bootstrap on their first
+    update; every later candidate is fail-closed.
+    """
+    root = Path(root)
+    if not _installed_capability_manifest_present(root):
+        return True
+    import tempfile
+
+    candidate = Path(tempfile.mkdtemp(prefix="hermes-capability-candidate-"))
+    added = False
+    try:
+        add = subprocess.run(
+            list(git_cmd)
+            + ["worktree", "add", "--detach", str(candidate), f"origin/{branch}"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if add.returncode != 0:
+            print("  ✗ capability canary could not stage the fetched candidate.")
+            if add.stderr.strip():
+                print(f"    {add.stderr.strip().splitlines()[0]}")
+            return False
+        added = True
+        return _run_capability_canary(candidate, label=f"origin/{branch}")
+    except Exception as exc:
+        print(f"  ✗ capability canary could not stage the fetched candidate: {exc}")
+        return False
+    finally:
+        if added:
+            subprocess.run(
+                list(git_cmd) + ["worktree", "remove", "--force", str(candidate)],
+                cwd=root,
+                capture_output=True,
+                check=False,
+            )
+        shutil.rmtree(candidate, ignore_errors=True)
+
+
 def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
     """File-based IPC prompt for gateway mode.
 
@@ -2270,6 +2382,12 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
                 if os.path.isdir(candidate) and d != "__MACOSX":
                     extracted = candidate
                     break
+
+        # The ZIP path already has a complete extracted candidate. Probe it
+        # before staging or swapping any live entry.
+        if _installed_capability_manifest_present(_m().PROJECT_ROOT):
+            if not _run_capability_canary(Path(extracted), label="zip candidate"):
+                _m().sys.exit(1)
 
         # Copy updated files over existing installation, preserving venv/node_modules/.git
         preserve = _ZIP_PRESERVED_TOP_LEVEL
@@ -9073,6 +9191,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Shallow checkout, exact count unrecoverable (offline/rate-limited
             # compare API) — the tips differ, so there IS an update.
             print("→ Updates available (commit count unknown on this shallow checkout)")
+
+        # Fetch is complete, but the live checkout and dependencies are still
+        # untouched. Probe the detached candidate now; activation must not be
+        # the first time we discover a dropped lifecycle invariant.
+        if not _preflight_git_capability_candidate(
+            git_cmd, _m().PROJECT_ROOT, branch
+        ):
+            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            sys.exit(1)
 
         print("→ Pulling updates...")
         update_succeeded = False

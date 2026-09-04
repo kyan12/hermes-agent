@@ -884,6 +884,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                author=(task.assignee if task and task.assignee else "worker"),
             )
             if not ok:
                 return tool_error(
@@ -1360,6 +1361,71 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+def _inherited_parent_scope(kb, conn) -> dict:
+    """Scope a continuation must carry forward from the card that spawned it.
+
+    Read from the parent task ROW, not from the ambient environment. A worker
+    that lost ``HERMES_TENANT`` across a restart, a re-exec or a nested spawn
+    would otherwise create children outside the legal/entity scope its own
+    card is bound to — and nothing downstream would notice, because an
+    unscoped card looks exactly like a card that was never meant to be scoped.
+
+    Returns the inheritable dimensions only. ``assignee`` is deliberately NOT
+    inherited: the executor must be named explicitly so fan-out is a decision
+    rather than an accident. Workspace paths are not inherited either — the
+    child gets its own checkout (see ``create_task``); only the *project*
+    link, which resolves to a fresh per-task worktree in the same repo,
+    carries over.
+    """
+    self_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not self_tid:
+        return {}
+    try:
+        parent = kb.get_task(conn, self_tid)
+    except Exception:
+        return {}
+    if parent is None:
+        return {}
+    return {
+        "tenant": parent.tenant,
+        "session_id": parent.session_id,
+        "project_id": parent.project_id,
+        "task_id": parent.id,
+    }
+
+
+def _board_authority_error(requested_board) -> Optional[str]:
+    """Refuse a cross-board continuation from a dispatcher-spawned worker.
+
+    The board is the hard isolation boundary: workers are spawned with
+    ``HERMES_KANBAN_BOARD`` pinned precisely so they cannot see or touch
+    another board. Honouring a ``board`` argument from inside a worker would
+    hand that worker an authority its principal never granted — a card
+    landing where nobody authorized work.
+
+    Orchestrator contexts (no ``HERMES_KANBAN_TASK``) keep the documented
+    cross-board routing the multi-board agent surfaces depend on.
+    """
+    if not requested_board:
+        return None
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    from hermes_cli import kanban_db as kb
+
+    try:
+        pinned = kb.get_current_board()
+        requested = kb._normalize_board_slug(requested_board)
+    except Exception:
+        return None
+    if requested and requested != pinned:
+        return (
+            f"board {requested!r} is outside this worker's pinned board "
+            f"{pinned!r} — a continuation cannot be routed off the board its "
+            f"parent was authorized for"
+        )
+    return None
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -1369,6 +1435,9 @@ def _handle_create(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
         return delegated_err
+    board_err = _board_authority_error(args.get("board"))
+    if board_err:
+        return tool_error(f"kanban_create: {board_err}")
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1381,6 +1450,7 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
+    tenant_explicit = tenant is not None
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -1395,6 +1465,7 @@ def _handle_create(args: dict, **kw) -> str:
         or _current_origin_session_id()
         or os.environ.get("HERMES_SESSION_ID")
     )
+    session_explicit = session_id is not None
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
     # mean a fresh scratch workspace, even when a dispatcher-spawned worker
@@ -1446,13 +1517,16 @@ def _handle_create(args: dict, **kw) -> str:
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
-            if _inherit_project and project_id is None:
-                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
-                if _self_tid:
-                    _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.project_id:
-                        project_id = _self_task.project_id
-                        project_source_task_id = _self_task.id
+            _scope = _inherited_parent_scope(kb, conn)
+            if _inherit_project and project_id is None and _scope.get("project_id"):
+                project_id = _scope["project_id"]
+                project_source_task_id = _scope["task_id"]
+            # Legal/entity scope and the originating principal follow the
+            # parent row whenever the caller did not name them explicitly.
+            if not tenant_explicit and not tenant:
+                tenant = _scope.get("tenant")
+            if not session_explicit and not session_id:
+                session_id = _scope.get("session_id")
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),

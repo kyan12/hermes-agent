@@ -82,14 +82,16 @@ def _patch_gateway_discovery():
     The restart phase used to swallow every exception at debug level, so these
     end-to-end tests never noticed it touching real gateway discovery. Since
     the phase is surfaced (#78574: an aborted restart now fails the update),
-    an unmocked ``find_gateway_pids`` on a box with a live gateway reaches the
+    unmocked PID or launchd discovery on a box with a live gateway reaches the
     conftest live-system guard and turns into a spurious ``sys.exit(1)``.
-    Discovery returning nothing makes the phase a clean no-op for every test
-    in this module (none of them assert on gateway restarts).
+    These tests do not assert restart behavior, so keep both discovery paths
+    hermetic; dedicated restart suites exercise them separately.
     """
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.is_macos", return_value=False), \
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.update_cmd._restart_macos_launchd_gateways"):
         yield
 
 

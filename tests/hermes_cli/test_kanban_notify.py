@@ -1,10 +1,23 @@
 import asyncio
+import time
 import pytest
 
 from pathlib import Path
 from types import SimpleNamespace
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
+
+
+def _affirm_gate(conn, task_id: str, reason: str) -> None:
+    from hermes_cli import kanban_health as kh
+
+    assert kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+    assert kh.affirm_human_gate(conn, task_id, evidence={
+        "type": "human_decision",
+        "action": reason,
+        "affirmed_by": "Kevin Yan",
+        "affirmed_at": int(time.time()),
+    }, reason=reason)
 
 
 # ---------------------------------------------------------------------------
@@ -219,8 +232,8 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
             conn, task_id=active_tid, platform="telegram", chat_id="chat1",
             delivery_mode="notify+wake",
         )
-        kb.block_task(conn, passive_tid, reason="passive block")
-        kb.block_task(conn, active_tid, reason="active block")
+        _affirm_gate(conn, passive_tid, "passive block")
+        _affirm_gate(conn, active_tid, "active block")
     finally:
         conn.close()
 
@@ -283,7 +296,7 @@ async def test_notifier_plain_notify_never_wakes_even_with_session_id(kanban_hom
             session_id="origin-session-id",
         )
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
-        kb.block_task(conn, tid, reason="plain notify block")
+        _affirm_gate(conn, tid, "plain notify block")
     finally:
         conn.close()
 
@@ -384,7 +397,7 @@ async def test_notifier_wake_forwards_persisted_chat_type_and_user_id(kanban_hom
             user_id="op-42", chat_type="group", delivery_mode="wake",
             notifier_profile="owner-profile",
         )
-        kb.block_task(conn, tid, reason="group block")
+        _affirm_gate(conn, tid, "group block")
     finally:
         conn.close()
 
@@ -438,7 +451,7 @@ async def test_notifier_wake_only_skips_send_and_advances_cursor(kanban_home):
             conn, task_id=tid, platform="telegram", chat_id="chat1",
             delivery_mode="wake",
         )
-        kb.block_task(conn, tid, reason="wake only block")
+        _affirm_gate(conn, tid, "wake only block")
     finally:
         conn.close()
 

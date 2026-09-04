@@ -1628,38 +1628,49 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+        def _ready_queue_reports() -> list:
+            """Census every board's ready queue with a reason code per card.
 
-            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
+            Replaces the old "is the ready queue non-empty?" boolean. That
+            probe could not tell a capacity wait, an active-PR guard, an
+            invalid workspace or a control-plane lane apart from a genuinely
+            stuck dispatcher, so every one of them produced the same
+            credential-flavoured warning — which then never cleared, because
+            nothing was actually wrong with the credentials.
+
+            Returns per-board :class:`kanban_health.ReadyQueueReport`s; only
+            cards the dispatcher itself would have spawned this tick land in
+            ``spawnable_ids``.
             """
-            # Only probe the review column when autonomous review dispatch is
-            # actually on. With ``review_dispatch`` off (the default — no
-            # sdlc-review agent), a task parked in 'review' is "correctly idle"
-            # waiting for a human, not a stuck dispatcher; probing it here would
-            # fire a false "dispatcher stuck" warning that never clears. Shares
-            # the exact gate the dispatcher uses so the two can't drift.
-            _review_probe = _kb.review_dispatch_enabled()
+            from hermes_cli import kanban_health as _kh
+
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            reports = []
+            _cap = None
+            _per_profile = None
+            try:
+                cfg = (_load_config() or {}).get("kanban", {})
+                _cap = _kb.resolve_max_in_progress(cfg.get("max_in_progress"))
+                _per_profile = cfg.get("max_in_progress_per_profile")
+            except Exception:
+                pass
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
-                        return True
+                    reports.append(
+                        _kh.ready_queue_report(
+                            conn,
+                            board=slug,
+                            max_in_progress=_cap,
+                            max_in_progress_per_profile=_per_profile,
+                            include_other_boards=True,
+                        )
+                    )
                 except Exception:
                     continue
                 finally:
@@ -1668,7 +1679,7 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                         except Exception:
                             pass
-            return False
+            return reports
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
@@ -1787,8 +1798,8 @@ class GatewayKanbanWatchersMixin:
                 # Global emergency stop (`hermes pause`): skip auto-decompose
                 # and dispatch entirely — no new workers while paused. Running
                 # workers finish naturally; zombie reaping above still runs.
+                queue_reports = []
                 if not _kanban_dispatch_allowed():
-                    ready_pending = False
                     bad_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live each tick so a user
@@ -1815,22 +1826,29 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
-                    # Health telemetry (aggregate across boards)
-                    ready_pending = await _to_thread_process_service(_ready_nonempty)
-                    if ready_pending and not any_spawned:
+                    # Health telemetry (aggregate across boards). Only
+                    # genuinely eligible, below-cap cards count toward the
+                    # stuck window; a queue full of capacity waits or guarded
+                    # cards is correctly idle, not stuck.
+                    queue_reports = await _to_thread_process_service(
+                        _ready_queue_reports
+                    )
+                    eligible = any(r.spawnable_ids for r in (queue_reports or []))
+                    if eligible and not any_spawned:
                         bad_ticks += 1
                     else:
                         bad_ticks = 0
                 if bad_ticks >= HEALTH_WINDOW:
+                    from hermes_cli import kanban_health as _kh
+
+                    alert = _kh.dispatcher_stuck_alert(
+                        queue_reports or [],
+                        consecutive_idle_ticks=bad_ticks,
+                        grace_ticks=HEALTH_WINDOW,
+                    )
                     now = int(time.time())
-                    if now - last_warn_at >= 300:
-                        logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned. Check "
-                            "profile health (venv, PATH, credentials) and "
-                            "`hermes kanban list --status ready`.",
-                            bad_ticks,
-                        )
+                    if alert is not None and now - last_warn_at >= 300:
+                        logger.warning("%s", alert.message)
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")

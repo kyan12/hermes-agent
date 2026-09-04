@@ -54,3 +54,27 @@ def _suppress_concurrent_hermes_gate(request, monkeypatch):
         lambda *_a, **_k: [],
         raising=False,
     )
+
+
+@pytest.fixture(autouse=True)
+def _suppress_update_capability_preflight(request, monkeypatch):
+    """Keep legacy updater unit doubles focused on their declared seam.
+
+    Hundreds of updater tests replace ``subprocess.run`` with a minimal fake
+    git transcript; those fakes cannot materialize the detached candidate
+    worktree now required by the production pre-activation gate. Tests marked
+    ``real_capability_preflight`` exercise that gate with a real temporary git
+    repository. All other tests retain their existing narrow contract.
+    """
+    if request.node.get_closest_marker("real_capability_preflight"):
+        return
+    try:
+        from hermes_cli import update_cmd
+    except Exception:
+        return
+    monkeypatch.setattr(
+        update_cmd,
+        "_preflight_git_capability_candidate",
+        lambda *_a, **_k: True,
+        raising=False,
+    )

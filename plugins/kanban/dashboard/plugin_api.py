@@ -637,6 +637,21 @@ def _build_board_payload(
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
             col = t.status if t.status in columns else "todo"
+            if t.status == "blocked":
+                # The visible attention column is an authority projection, not
+                # a raw status dump. Legacy/machine block rows remain durable
+                # but appear in automation triage unless they carry one current
+                # typed Kevin action.
+                from hermes_cli import kanban_health as kh
+
+                projection = kh.classify_block(t)
+                d["block_projection"] = {
+                    "visible": projection.visible,
+                    "reason_code": projection.reason_code,
+                    "action": projection.action,
+                }
+                if not projection.visible:
+                    col = "triage"
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -1010,6 +1025,93 @@ class UpdateTaskBody(BaseModel):
     clear_reasoning_effort: bool = False
 
 
+class AffirmGateBody(BaseModel):
+    action: str = Field(min_length=1, max_length=1000)
+    reason: Optional[str] = Field(default=None, max_length=2000)
+    evidence_type: str = "human_decision"
+    kind: str = "needs_input"
+
+
+class TypedHoldBody(BaseModel):
+    kind: str
+    wake_at: Optional[int] = None
+    reason: Optional[str] = Field(default=None, max_length=2000)
+    action: Optional[str] = Field(default=None, max_length=1000)
+    evidence_type: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/affirm-gate")
+def affirm_task_gate(
+    task_id: str, payload: AffirmGateBody, board: Optional[str] = Query(None)
+):
+    """Authenticated operator transition into the human-attention column."""
+    from hermes_cli import kanban_health as kh
+
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        evidence = {
+            "type": payload.evidence_type,
+            "action": payload.action,
+            "affirmed_by": "operator:dashboard",
+            "affirmed_at": int(time.time()),
+            "source": "dashboard",
+        }
+        if not kh.affirm_human_gate(
+            conn, task_id, evidence=evidence, kind=payload.kind,
+            reason=payload.reason, author="operator:dashboard",
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="gate could not be affirmed from the task's current state",
+            )
+        return {"ok": True, "task_id": task_id, "status": "blocked"}
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/hold")
+def type_task_hold(
+    task_id: str, payload: TypedHoldBody, board: Optional[str] = Query(None)
+):
+    """Atomically park a card with a machine-verifiable typed hold."""
+    from hermes_cli import kanban_health as kh
+
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        evidence = None
+        if payload.kind in kh.PARKED_HOLD_KINDS:
+            if not payload.action or not payload.evidence_type:
+                raise HTTPException(
+                    status_code=400,
+                    detail="intentional holds require action and evidence_type",
+                )
+            evidence = {
+                "type": payload.evidence_type,
+                "action": payload.action,
+                "affirmed_by": "operator:dashboard",
+                "affirmed_at": int(time.time()),
+                "source": "dashboard",
+            }
+        if payload.kind == "wake" and payload.wake_at is None:
+            raise HTTPException(status_code=400, detail="wake holds require wake_at")
+        if not kh.set_hold(
+            conn, task_id, kind=payload.kind, wake_at=payload.wake_at,
+            evidence=evidence, reason=payload.reason, apply=True,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="typed hold could not be applied from the task's current state",
+            )
+        return {
+            "ok": True, "task_id": task_id, "status": "scheduled",
+            "hold_kind": payload.kind,
+        }
+    finally:
+        conn.close()
+
+
 def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
     """Route a task leaving the ``review`` lane through ``reopen_review_task``
     (proper transition: stale-run recovery, parent re-gate, ``review_reopened``
@@ -1061,9 +1163,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
+                # Generic status moves are untrusted recovery requests; the DB
+                # boundary routes them away from the human-attention column.
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
-                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+                raise HTTPException(
+                    status_code=400,
+                    detail="scheduled requires POST /tasks/{id}/hold with a typed hold kind",
+                )
             elif s == "review":
                 # Manual "request review" from the board. Routes through
                 # request_review so it is NOT a
@@ -1533,7 +1640,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         results.append(entry)
                         continue
                     elif s == "scheduled":
-                        ok = kanban_db.schedule_task(conn, tid)
+                        entry.update({
+                            "ok": False,
+                            "error": "scheduled requires the per-task typed hold endpoint",
+                        })
+                        results.append(entry)
+                        continue
                     elif s in {"todo", "triage"}:
                         # Fetch lazily: only review->todo needs reopen.
                         cur = kanban_db.get_task(conn, tid) if s == "todo" else None
@@ -1616,6 +1728,86 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
 # spawn failures, stuck-blocked). See hermes_cli.kanban_diagnostics for
 # the rule engine.
 # ---------------------------------------------------------------------------
+
+@router.get("/board-health")
+def get_board_health(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    all_boards: bool = Query(False, description="Report every non-archived board"),
+    ready_queue: bool = Query(
+        False, description="Include the ready-queue census with reason codes"
+    ),
+):
+    """Lifecycle health for a board (or every board).
+
+    The same payload ``hermes kanban board-health --json`` prints and the
+    sentinel verifies, produced by the same functions — the CLI, the
+    dashboard and the sentinel cannot drift into disagreeing about whether a
+    card is a human gate or a machine hold.
+
+    Deliberately NOT folded into ``GET /board``: that endpoint is on the hot
+    path (refetched on every task WebSocket event) and is cached against a
+    cheap version probe. Health is comparatively expensive and is requested
+    on demand, so mixing them would either poison that cache or slow the
+    board render.
+    """
+    from hermes_cli import kanban_health as kh
+
+    slugs = kh.all_board_slugs() if all_boards else [_resolve_board(board)]
+    payloads = []
+    for slug in slugs:
+        conn = _conn(board=slug)
+        try:
+            payloads.append(
+                kh.board_health(
+                    conn, board=slug, include_ready_queue=bool(ready_queue)
+                )
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return {
+        "boards": payloads,
+        "healthy": all(p["healthy"] for p in payloads),
+        "schema_version": kh.HEALTH_SCHEMA_VERSION,
+        "control_loop_version": kh.CONTROL_LOOP_VERSION,
+    }
+
+
+class BoardHealthReconcileBody(BaseModel):
+    board: Optional[str] = None
+    all_boards: bool = False
+    ready_queue: bool = False
+
+
+@router.post("/board-health/reconcile")
+def reconcile_board_health(payload: BoardHealthReconcileBody):
+    """Explicit authenticated mutation counterpart to read-only health GET."""
+    from hermes_cli import kanban_health as kh
+
+    slugs = kh.all_board_slugs() if payload.all_boards else [_resolve_board(payload.board)]
+    boards = []
+    reports = []
+    for slug in slugs:
+        conn = _conn(board=slug)
+        try:
+            reports.append({"board": slug, **kh.reconcile_board(conn).to_dict()})
+            boards.append(
+                kh.board_health(
+                    conn, board=slug, include_ready_queue=payload.ready_queue
+                )
+            )
+        finally:
+            conn.close()
+    return {
+        "boards": boards,
+        "reconciliation": reports,
+        "healthy": all(item["healthy"] for item in boards),
+        "schema_version": kh.HEALTH_SCHEMA_VERSION,
+        "control_loop_version": kh.CONTROL_LOOP_VERSION,
+    }
+
 
 @router.get("/diagnostics")
 def list_diagnostics(

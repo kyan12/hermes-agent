@@ -344,6 +344,8 @@ def _fire_dispatch_tick_hook(
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
+            result.health_resumed,
+            result.health_needs_attention,
         )):
             outcome = "idle"
         invoke_hook(
@@ -1141,6 +1143,17 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Typed classification of a ``scheduled`` hold (one of
+    # ``kanban_health.VALID_HOLD_KINDS``) or None for a legacy prose-only
+    # hold. See ``hermes_cli.kanban_health`` for the control loop that reads
+    # these three columns.
+    hold_kind: Optional[str] = None
+    # Epoch second at which a ``wake`` hold becomes due. NULL on every other
+    # hold kind; NULL on a ``wake`` hold means the wake was never armed.
+    hold_wake_at: Optional[int] = None
+    # JSON typed evidence backing a human gate or an intentional hold.
+    # Parsed/validated by ``kanban_health``; stored raw here.
+    gate_evidence: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1247,19 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            hold_kind=(
+                row["hold_kind"] if "hold_kind" in keys and row["hold_kind"] else None
+            ),
+            hold_wake_at=(
+                int(row["hold_wake_at"])
+                if "hold_wake_at" in keys and row["hold_wake_at"] is not None
+                else None
+            ),
+            gate_evidence=(
+                row["gate_evidence"]
+                if "gate_evidence" in keys and row["gate_evidence"]
+                else None
             ),
         )
 
@@ -1422,7 +1448,31 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Typed classification of a ``scheduled`` hold, set by
+    -- ``kanban_health.set_hold`` (one of its VALID_HOLD_KINDS). NULL on a
+    -- legacy prose-only scheduled card, which the control loop reports as
+    -- ``legacy_untyped`` and never auto-resumes.
+    hold_kind            TEXT,
+    -- Epoch second a ``wake`` hold becomes due. NULL on other hold kinds;
+    -- NULL on a ``wake`` hold means the durable wake was never armed, which
+    -- the control loop reports as ``wake_missing``.
+    hold_wake_at         INTEGER,
+    -- JSON typed evidence backing a human gate (``blocked``) or an
+    -- intentional external/physical/roadmap hold. A ``blocked`` card is only
+    -- projected as a human gate when this parses to an affirmed record.
+    gate_evidence        TEXT
+);
+
+-- Durable control-loop checkpoints, one row per named routine. The
+-- scheduled-wake contract depends on being able to prove that *something*
+-- is actually running the reconciler: a hold whose checkpoint is absent,
+-- stale, or failed has no forward path no matter how well-formed it is.
+CREATE TABLE IF NOT EXISTS board_health_checkpoints (
+    name       TEXT PRIMARY KEY,
+    status     TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    detail     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2689,6 +2739,31 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+
+    if "hold_kind" not in cols:
+        # Typed scheduled-hold classification. Legacy scheduled rows get NULL,
+        # which the control loop surfaces as ``legacy_untyped`` — visibly
+        # unhealthy and never auto-resumed, rather than silently healthy.
+        _add_column_if_missing(conn, "tasks", "hold_kind", "hold_kind TEXT")
+
+    if "hold_wake_at" not in cols:
+        _add_column_if_missing(conn, "tasks", "hold_wake_at", "hold_wake_at INTEGER")
+
+    if "gate_evidence" not in cols:
+        _add_column_if_missing(conn, "tasks", "gate_evidence", "gate_evidence TEXT")
+
+    # Control-loop checkpoint table. In SCHEMA_SQL for fresh DBs; created
+    # here too so an existing board gains it on the next open.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS board_health_checkpoints (
+            name       TEXT PRIMARY KEY,
+            status     TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            detail     TEXT
+        )
+        """
+    )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -4329,7 +4404,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
@@ -4339,11 +4414,15 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    event_id = cur.lastrowid
+    if event_id is None:  # pragma: no cover - sqlite always supplies ROWID
+        raise RuntimeError("task event insert did not return an id")
+    return int(event_id)
 
 
 def _end_run(
@@ -5475,6 +5554,9 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
+                       hold_kind    = NULL,
+                       hold_wake_at = NULL,
+                       gate_evidence = NULL,
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
@@ -5492,6 +5574,9 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
+                       hold_kind    = NULL,
+                       hold_wake_at = NULL,
+                       gate_evidence = NULL,
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
@@ -6275,6 +6360,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    author: Optional[str] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6288,20 +6374,15 @@ def block_task(
       promotes it automatically once its parents finish. No human, no cron, no
       retry storm. This is Dale's "Type 2 — dependency blocked".
 
-    * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
-      "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
-      is re-blocked for the SAME kind after having been unblocked, the
-      unblock-loop counter (``block_recurrences``) increments. When it reaches
-      :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
-      of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
-      forcing a human-in-the-loop triage decision.
+    * ``needs_input`` / ``capability`` / ``transient`` / ``None`` — a worker
+      or machine assertion is not enough authority to create a visible human
+      gate. The request is preserved in ``triage`` for deterministic
+      classification or explicit operator affirmation. Only
+      :func:`hermes_cli.kanban_health.affirm_human_gate` may create the
+      occurrence-bound ``blocked`` state.
 
-    * ``transient`` — treated like a generic block for routing, but a worker
-      can use it to signal "this might clear on its own"; it still participates
-      in the loop breaker so a forever-flaky task eventually escalates.
-
-    Returns True on any successful transition (to ``blocked``, ``todo``, or
-    ``triage``), False when the task wasn't in a blockable state.
+    Returns True on a successful transition to ``todo`` or ``triage``. The
+    separate trusted affirmation boundary owns transitions to ``blocked``.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
@@ -6340,6 +6421,9 @@ def block_task(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
+                       hold_kind     = NULL,
+                       hold_wake_at  = NULL,
+                       gate_evidence = NULL,
                        block_kind    = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -6376,124 +6460,61 @@ def block_task(
                 run_id=run_id,
                 reason=reason,
             )
+            if reason and author:
+                add_comment(conn, task_id, author, f"BLOCKED: {reason}")
             return True
 
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
+        # A worker/machine assertion is not authority to create a visible
+        # human gate.  Preserve the request and end its run atomically, but
+        # route it to the recovery/triage lane until an operator explicitly
+        # affirms one typed action via kanban_health.affirm_human_gate().
+        # This boundary also catches legacy ``kind=None`` and transient or
+        # capability failures emitted by dispatcher/runtime paths.
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
-
+        cur = conn.execute(
+            "UPDATE tasks SET status='triage', claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, hold_kind=NULL, "
+            "hold_wake_at=NULL, gate_evidence=NULL, block_kind=?, "
+            "block_recurrences=? WHERE id=? AND status IN ('running','ready')"
+            + ("" if expected_run_id is None else " AND current_run_id=?"),
+            (kind, recurrences, task_id)
+            if expected_run_id is None
+            else (kind, recurrences, task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id, outcome="blocked", status="triage", summary=reason
+        )
+        if run_id is None and reason:
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="blocked", summary=reason
+            )
+        _append_event(
+            conn,
+            task_id,
+            "automation_recovery_requested",
+            {
+                "reason": reason,
+                "kind": kind,
+                "recurrences": recurrences,
+                "source_status": source_status,
+                "requires_affirmation": kind in ("needs_input", "capability"),
+            },
+            run_id=run_id,
+        )
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'triage',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?,
-                       block_recurrences = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
-            )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
-                )
             _append_event(
-                conn, task_id, "block_loop_detected",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                    "source_status": source_status,
-                },
+                conn,
+                task_id,
+                "block_loop_detected",
+                {"kind": kind, "recurrences": recurrences, "reason": reason},
                 run_id=run_id,
             )
-        else:
-            if expected_run_id is None:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                    """,
-                    (kind, recurrences, task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                       AND current_run_id = ?
-                    """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
-                )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id,
-                    outcome="blocked",
-                    summary=reason,
-                )
-            _append_event(
-                conn, task_id, "blocked",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "source_status": source_status,
-                },
-                run_id=run_id,
-            )
-        _blocked_task = get_task(conn, task_id)
-    _fire_kanban_lifecycle_hook(
-        "kanban_task_blocked",
-        task_id,
-        board=get_current_board(),
-        assignee=_blocked_task.assignee if _blocked_task else None,
-        run_id=run_id,
-        reason=reason,
-    )
-    return True
+        if reason and author:
+            add_comment(conn, task_id, author, f"BLOCKED: {reason}")
+        return True
 
 
 
@@ -6956,7 +6977,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "hold_kind = NULL, hold_wake_at = NULL, gate_evidence = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
@@ -7539,7 +7561,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "    hold_kind = NULL, hold_wake_at = NULL, gate_evidence = NULL "
             "WHERE id = ? AND status != 'archived'",
             (task_id,),
         )
@@ -8100,6 +8123,18 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    health_resumed: list[str] = field(default_factory=list)
+    """Task ids resumed this tick by the native health control loop
+    (:func:`kanban_health.reconcile_board`) — typed scheduled holds whose
+    dependency completed or whose wake time came due. Exposed so telemetry
+    can distinguish "the controller moved work" from "nothing happened",
+    and so a board whose holds never resume is visibly diagnosable."""
+    health_needs_attention: list[str] = field(default_factory=list)
+    """Task ids the control loop refused to resume because their hold is
+    unclassified or its wake is missing/disabled/failed. Never auto-resumed;
+    surfaced for ``hermes kanban board-health``."""
+    health_reconciliation: dict[str, Any] = field(default_factory=dict)
+    """Complete reconciliation report, including parked rows and errors."""
     memory_pressure: Optional[str] = None
     """System memory pressure observed at spawn time when the memory guard
     restricted this tick (OOF-30/OOF-77): ``"critical"`` — no new workers
@@ -9994,6 +10029,44 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+
+    # Native health control loop. Runs BEFORE promotion so a hold that came
+    # due this tick is promoted and spawned in the same pass rather than
+    # waiting a full interval. It is the durable wake mechanism: the
+    # checkpoint it stamps here is what makes a ``wake`` hold provably
+    # wakeable, and its absence is what makes an unattended board
+    # diagnosable instead of silently frozen. Never fatal to a tick —
+    # dispatch must keep working even if reconciliation cannot.
+    if not dry_run:
+        try:
+            from hermes_cli import kanban_health as _kh
+
+            _health = _kh.reconcile_board(conn)
+            result.health_reconciliation = _health.to_dict()
+            result.health_resumed = [r["task_id"] for r in _health.resumed]
+            result.health_needs_attention = [
+                r["task_id"] for r in _health.diagnosed
+            ]
+        except Exception as exc:
+            result.health_reconciliation = {
+                "resumed": [], "parked": [], "diagnosed": [],
+                "errors": [{"task_id": None, "error": str(exc)}], "applied": True,
+            }
+            try:
+                from hermes_cli import kanban_health as _failed_kh
+
+                _failed_kh.record_checkpoint(
+                    conn,
+                    _failed_kh.CHECKPOINT_RECONCILE,
+                    status="failed",
+                    detail=str(exc),
+                )
+            except Exception:
+                _log.debug(
+                    "kanban health failed-checkpoint write failed", exc_info=True
+                )
+            _log.debug("kanban health reconciliation failed", exc_info=True)
+
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather

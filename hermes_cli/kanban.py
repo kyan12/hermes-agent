@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_health as kh
 from hermes_cli import kanban_swarm as ks
 
 
@@ -675,12 +676,89 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "triage to break unblock loops. Omit for a generic block."
         ),
     )
+    p_block.add_argument(
+        "--action", default=None,
+        help="One atomic Kevin action; required for needs_input/capability human gates.",
+    )
+    p_block.add_argument(
+        "--evidence-type", default="human_decision",
+        choices=sorted(kh.VALID_EVIDENCE_TYPES),
+        help="Typed evidence backing an operator-affirmed human gate.",
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
+
+    p_schedule.add_argument(
+        "--kind",
+        required=True,
+        choices=sorted(kh.VALID_HOLD_KINDS),
+        help=(
+            "Typed hold classification. 'dependency'/'wake' are resumed "
+            "automatically by the control loop; "
+            "'external'/'physical'/'roadmap' stay parked until a human moves "
+            "them. Untyped holds are reported as legacy_untyped and are never "
+            "auto-resumed."
+        ),
+    )
+    p_schedule.add_argument(
+        "--wake-at",
+        default=None,
+        metavar="<epoch|+SECONDS>",
+        help="For --kind wake: when the hold becomes due (epoch seconds, or +N for N seconds from now).",
+    )
+
+    # --- board-health / scheduled-wake / sentinel diagnostics ---
+    p_health = sub.add_parser(
+        "board-health",
+        help="Report board lifecycle health (human gates, holds, forward paths)",
+        description=(
+            "Machine-checkable board health. Reports which blocked cards are "
+            "affirmed human gates (versus machine holds routed to automation "
+            "recovery), whether every nonterminal card has a forward path, "
+            "and whether the scheduled-wake subsystem is actually running."
+        ),
+    )
+    p_health.add_argument("--json", action="store_true", help="Emit the raw payload")
+    p_health.add_argument("--all-boards", action="store_true",
+                          help="Report every non-archived board")
+    p_health.add_argument("--reconcile", action="store_true",
+                          help="Run one reconciliation pass before reporting")
+    p_health.add_argument("--ready-queue", action="store_true",
+                          help="Include the ready-queue census with per-card reason codes")
+
+    p_wake = sub.add_parser(
+        "scheduled-wake",
+        help="Report (and optionally reconcile) typed scheduled holds",
+        description=(
+            "Scheduled-hold diagnostics: which holds are armed, due, parked "
+            "intentionally, or unclassified, and whether the durable wake "
+            "checkpoint is healthy. Legacy prose-only holds are reported as "
+            "needing classification and are never bulk-resumed."
+        ),
+    )
+    p_wake.add_argument("--json", action="store_true", help="Emit the raw payload")
+    p_wake.add_argument("--all-boards", action="store_true",
+                        help="Report every non-archived board")
+    p_wake.add_argument("--reconcile", action="store_true",
+                        help="Resume every hold that state already authorizes")
+
+    p_sentinel = sub.add_parser(
+        "sentinel",
+        help="Run one deterministic sentinel sweep over every board",
+        description=(
+            "Model-free verifier of last resort. Stands down on controller "
+            "version drift, stays read-only while the native controller is "
+            "live, and performs only the one reversible repair class board "
+            "state authorizes. Emits a single human action per sweep."
+        ),
+    )
+    p_sentinel.add_argument("--json", action="store_true", help="Emit the raw payload")
+    p_sentinel.add_argument("--dry-run", action="store_true",
+                            help="Analyse and report without writing anything")
 
     p_unblock = sub.add_parser(
         "unblock",
@@ -1167,6 +1245,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
+            "board-health": _cmd_board_health,
+            "scheduled-wake": _cmd_scheduled_wake,
+            "sentinel": _cmd_sentinel,
             "unblock":  _cmd_unblock,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
@@ -2452,60 +2533,265 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
+    action = (getattr(args, "action", None) or "").strip()
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    human_gate = kind in kh.HUMAN_GATE_BLOCK_KINDS
+    if human_gate and not action:
+        print("--action is required for needs_input/capability human gates", file=sys.stderr)
+        return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            if human_gate:
+                ok = kh.affirm_human_gate(
+                    conn,
+                    tid,
+                    evidence={
+                        "type": getattr(args, "evidence_type", "human_decision"),
+                        "action": action,
+                        "affirmed_by": "operator:cli",
+                        "affirmed_at": int(time.time()),
+                        "source": "cli",
+                    },
+                    kind=kind,
+                    reason=reason,
+                    author=author,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            else:
+                ok = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id_for(tid),
+                    author=author,
+                )
+            if not ok:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
+                continue
+            landed = kb.get_task(conn, tid)
+            where = landed.status if landed else "unknown"
+            suffix = f": {reason}" if reason else ""
+            if where == "blocked":
+                print(f"Blocked {tid} [affirmed gate: {action}]{suffix}")
+            elif where == "todo":
+                print(f"{tid} → todo (dependency wait){suffix}")
             else:
-                # Report where the task actually landed — dependency blocks go
-                # to todo, and a tripped unblock-loop breaker routes to triage.
-                landed = kb.get_task(conn, tid)
-                where = landed.status if landed else "blocked"
-                suffix = f": {reason}" if reason else ""
-                if where == "todo":
-                    print(f"{tid} → todo (dependency wait){suffix}")
-                elif where == "triage":
-                    print(
-                        f"{tid} → triage (unblock loop detected — needs a "
-                        f"human decision){suffix}"
-                    )
-                else:
-                    print(f"Blocked {tid}{suffix}")
+                print(f"{tid} → {where} (automation recovery){suffix}")
     return 0 if not failed else 1
+
+
+
+def _parse_wake_at(raw: Optional[str]) -> Optional[int]:
+    """Accept an absolute epoch or a ``+SECONDS`` relative offset."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.startswith("+"):
+        return int(time.time()) + int(text[1:])
+    return int(text)
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    kind = args.kind
+    try:
+        wake_at = _parse_wake_at(getattr(args, "wake_at", None))
+    except ValueError:
+        print("--wake-at must be an epoch second or +SECONDS", file=sys.stderr)
+        return 2
+    if wake_at is not None and kind != "wake":
+        print("--wake-at requires --kind wake", file=sys.stderr)
+        return 2
+    if kind == "wake" and wake_at is None:
+        print("--kind wake requires --wake-at", file=sys.stderr)
+        return 2
+    if kind in kh.PARKED_HOLD_KINDS:
+        print(
+            "intentional external/physical/roadmap holds require the typed "
+            "dashboard/API evidence path",
+            file=sys.stderr,
+        )
+        return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
-            if not kb.schedule_task(
-                conn,
-                tid,
-                reason=reason,
-                expected_run_id=_worker_run_id_for(tid),
+            if not kh.set_hold(
+                conn, tid, kind=kind, wake_at=wake_at,
+                reason=reason, apply=True, author=author,
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
-            else:
-                print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
+                continue
+            print(f"Scheduled {tid} [{kind}]" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+
+# ---------------------------------------------------------------------------
+# Board-health / scheduled-wake / sentinel diagnostics
+# ---------------------------------------------------------------------------
+
+def _health_board_slugs(args: argparse.Namespace) -> list[str]:
+    if getattr(args, "all_boards", False):
+        return kh.all_board_slugs()
+    return [kb.get_current_board()]
+
+
+def _cmd_board_health(args: argparse.Namespace) -> int:
+    payloads = []
+    unhealthy = False
+    for slug in _health_board_slugs(args):
+        with kb.connect_closing(board=slug) as conn:
+            if getattr(args, "reconcile", False):
+                kh.reconcile_board(conn)
+            payload = kh.board_health(
+                conn, board=slug,
+                include_ready_queue=bool(getattr(args, "ready_queue", False)),
+            )
+        payloads.append(payload)
+        if not payload["healthy"]:
+            unhealthy = True
+
+    if getattr(args, "json", False):
+        print(json.dumps(payloads if len(payloads) > 1 else payloads[0], indent=2))
+        return 1 if unhealthy else 0
+
+    for payload in payloads:
+        _print_board_health(payload)
+    return 1 if unhealthy else 0
+
+
+def _print_board_health(payload: dict) -> None:
+    mark = "OK" if payload["healthy"] else "UNHEALTHY"
+    print(f"[{mark}] board {payload['board']}")
+    wake = payload["wake"]
+    if wake["healthy"]:
+        print("  wake subsystem: healthy")
+    else:
+        print(f"  wake subsystem: {wake['reason_code']} (enabled={wake['enabled']})")
+
+    gates = payload["kevin_blocked"]
+    print(f"  human gates ({len(gates)}):")
+    for row in gates:
+        print(f"    {row['task_id']}  {row['action']}  "
+              f"[{row['evidence_type']} affirmed by {row['affirmed_by']}]")
+    recovery = payload["automation_recovery"]
+    if recovery:
+        print(f"  automation recovery ({len(recovery)}) — not human gates:")
+        for row in recovery:
+            print(f"    {row['task_id']}  {row['reason_code']}  {row['title'][:60]}")
+    holds = payload["holds"]
+    if holds:
+        print(f"  scheduled holds ({len(holds)}):")
+        for row in holds:
+            flag = " " if row["healthy"] else "!"
+            print(f"   {flag} {row['task_id']}  {row['hold_kind'] or 'untyped'}  "
+                  f"{row['reason_code']}")
+    stranded = payload["no_forward_path"]
+    if stranded:
+        print(f"  NO FORWARD PATH ({len(stranded)}):")
+        for row in stranded:
+            print(f"    {row['task_id']}  {row['status']}  {row['reason_code']}"
+                  + (f"  — {row['detail']}" if row.get("detail") else ""))
+    for row in payload.get("scope", []):
+        print(f"  unscoped active work: {row['task_id']} "
+              f"(canonical project {row['canonical_project_id']})")
+    if payload.get("ready_queue"):
+        rq = payload["ready_queue"]
+        print(f"  ready queue: {len(rq['spawnable'])} spawnable")
+        for entry in rq["entries"]:
+            if entry["reason_code"] != kh.READY_SPAWNABLE:
+                print(f"    {entry['task_id']}  {entry['reason_code']}"
+                      + (f"  — {entry['detail']}" if entry.get("detail") else ""))
+    print()
+
+
+def _cmd_scheduled_wake(args: argparse.Namespace) -> int:
+    payloads = []
+    unhealthy = False
+    for slug in _health_board_slugs(args):
+        with kb.connect_closing(board=slug) as conn:
+            reconcile = None
+            if getattr(args, "reconcile", False):
+                reconcile = kh.reconcile_board(conn).to_dict()
+            health = kh.board_health(conn, board=slug)
+        payload = {
+            "board": slug,
+            "wake": health["wake"],
+            "holds": health["holds"],
+            "reconcile": reconcile,
+        }
+        payloads.append(payload)
+        if not health["wake"]["healthy"] or any(
+            not h["healthy"] for h in health["holds"]
+        ):
+            unhealthy = True
+
+    if getattr(args, "json", False):
+        print(json.dumps(payloads if len(payloads) > 1 else payloads[0], indent=2))
+        return 1 if unhealthy else 0
+
+    for payload in payloads:
+        wake = payload["wake"]
+        state = "healthy" if wake["healthy"] else wake["reason_code"]
+        print(f"board {payload['board']}: wake subsystem {state}")
+        cp = wake.get("checkpoint")
+        if cp:
+            age = int(time.time()) - int(cp["updated_at"])
+            print(f"  last reconcile: {cp['status']}, {age}s ago")
+        else:
+            print("  last reconcile: never")
+        if payload["reconcile"]:
+            r = payload["reconcile"]
+            print(f"  reconciled: {len(r['resumed'])} resumed, "
+                  f"{len(r['parked'])} parked, {len(r['diagnosed'])} need attention")
+        for row in payload["holds"]:
+            flag = " " if row["healthy"] else "!"
+            extra = "  NEEDS CLASSIFICATION" if row["needs_classification"] else ""
+            print(f"   {flag} {row['task_id']}  {row['hold_kind'] or 'untyped'}  "
+                  f"{row['reason_code']}{extra}")
+        print()
+    return 1 if unhealthy else 0
+
+
+def _cmd_sentinel(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_sentinel as ks
+
+    report = ks.run_sentinel(apply=not getattr(args, "dry_run", False))
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=2))
+        return 0 if report.ok else 1
+
+    print(f"kanban sentinel v{report.version}: "
+          f"{'OK' if report.ok else 'ATTENTION'}")
+    if report.drift:
+        print(f"  STOOD DOWN — {report.drift['code']}: {report.drift['detail']}")
+    for board in report.boards:
+        print(f"  board {board['board']}: {board.get('reason_code')}"
+              + ("" if board.get("healthy", True) else "  (unhealthy)"))
+    for row in report.repairs:
+        print(f"  repaired {row['task_id']} ({row['reason_code']})")
+    for row in report.would_repair:
+        print(f"  would repair {row['task_id']} ({row['reason_code']})")
+    if report.kevin_action:
+        action = report.kevin_action
+        print()
+        print(f"  ACTION REQUIRED: {action['title']}")
+        print(f"    {action['action']}")
+        ids = action["evidence"].get("task_ids") or []
+        if ids:
+            print(f"    cards: {', '.join(ids)}")
+        if not report.alert_emitted:
+            print(f"    (already alerted; suppressed until {report.suppressed_until})")
+    return 0 if report.ok else 1
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
@@ -2919,26 +3205,26 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
+        reports = _ready_queue_reports()
+        eligible = any(r.spawnable_ids for r in reports)
         spawned_any = bool(res.spawned)
-        if ready_pending and not spawned_any:
+        if eligible and not spawned_any:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
         # Emit a warning once per HEALTH_WINDOW bad ticks (not every tick)
         # so log volume stays bounded while the problem persists.
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
+            alert = kh.dispatcher_stuck_alert(
+                reports,
+                consecutive_idle_ticks=health_state["bad_ticks"],
+                grace_ticks=HEALTH_WINDOW,
+            )
             now = int(time.time())
             # Rate-limit repeats: at most one warning per 5 minutes.
-            if now - health_state["last_warn_at"] >= 300:
+            if alert is not None and now - health_state["last_warn_at"] >= 300:
                 print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: "
-                    f"ready queue non-empty for {health_state['bad_ticks']} "
-                    f"consecutive ticks but 0 workers spawned successfully. "
-                    f"Check profile health (venv, PATH, credentials) and "
-                    f"`hermes kanban list --status ready` / "
-                    f"`hermes kanban list --status blocked` for recent "
-                    f"spawn_failed tasks.",
+                    f"[{_fmt_ts(now)}] WARN {alert.message}",
                     file=sys.stderr, flush=True,
                 )
                 health_state["last_warn_at"] = now
@@ -2958,21 +3244,40 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 flush=True,
             )
 
-    def _ready_queue_nonempty() -> bool:
-        """Cheap probe — is there at least one ready+assigned+unclaimed
-        task whose assignee maps to a real Hermes profile (i.e. one the
-        dispatcher would actually try to spawn for)?
+    def _ready_queue_reports() -> list:
+        """Census the ready queue with a reason code per card.
 
-        Filters out tasks assigned to control-plane lanes
-        (e.g. ``orion-cc``, ``orion-research``) that are pulled by
-        terminals via ``claim_task`` directly — those are correctly idle
-        from the dispatcher's perspective, not stuck.
+        The standalone daemon shares the gateway dispatcher's telemetry
+        contract: only cards this tick would actually have spawned count
+        toward the stuck window. A capacity wait, an active-PR guard, an
+        invalid workspace or a control-plane lane is correctly idle, and
+        reporting any of them as a credential problem produces a warning
+        that can never clear.
         """
         try:
+            cfg = {}
+            try:
+                from hermes_cli.config import load_config
+
+                cfg = (load_config() or {}).get("kanban", {})
+            except Exception:
+                pass
             with kb.connect_closing() as conn:
-                return kb.has_spawnable_ready(conn)
+                return [
+                    kh.ready_queue_report(
+                        conn,
+                        board=kb.get_current_board(),
+                        max_in_progress=kb.resolve_max_in_progress(
+                            cfg.get("max_in_progress")
+                        ),
+                        max_in_progress_per_profile=cfg.get(
+                            "max_in_progress_per_profile"
+                        ),
+                        include_other_boards=True,
+                    )
+                ]
         except Exception:
-            return False
+            return []
 
     try:
         kb.run_daemon(

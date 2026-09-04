@@ -86,6 +86,44 @@ def test_board_empty(client):
 # ---------------------------------------------------------------------------
 
 
+def test_board_projects_unaffirmed_block_into_automation_triage(client):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="legacy machine block", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind=NULL, gate_evidence=NULL "
+                "WHERE id=?",
+                (tid,),
+            )
+
+    data = client.get("/api/plugins/kanban/board").json()
+    columns = {column["name"]: column["tasks"] for column in data["columns"]}
+    assert tid not in {task["id"] for task in columns["blocked"]}
+    triaged = {task["id"]: task for task in columns["triage"]}
+    assert triaged[tid]["block_projection"]["visible"] is False
+
+
+def test_board_shows_only_affirmed_gate_in_blocked(client):
+    created = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "signature gate"}
+    ).json()["task"]
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{created['id']}/affirm-gate",
+        json={
+            "action": "Sign the named agreement",
+            "reason": "signature required",
+            "kind": "capability",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    data = client.get("/api/plugins/kanban/board").json()
+    columns = {column["name"]: column["tasks"] for column in data["columns"]}
+    blocked = {task["id"]: task for task in columns["blocked"]}
+    assert blocked[created["id"]]["block_projection"]["visible"] is True
+    assert blocked[created["id"]]["block_projection"]["action"] == "Sign the named agreement"
+
+
 def test_create_task_appears_on_board(client):
     r = client.post(
         "/api/plugins/kanban/tasks",

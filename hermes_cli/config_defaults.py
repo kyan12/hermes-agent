@@ -2984,6 +2984,29 @@ DEFAULT_CONFIG = {
         # so stale rows don't accumulate and get scanned on every notifier
         # tick forever. Set 0 to disable the sweep.
         "done_sub_retention_days": 30,
+        # Native health control loop (hermes_cli/kanban_health.py). Each
+        # dispatcher tick reconciles typed scheduled holds: resumes the ones
+        # whose dependency completed or whose wake came due, parks intentional
+        # external/physical/roadmap waits, and diagnoses (never resumes)
+        # legacy untyped holds. It is also the durable wake mechanism — with
+        # it off, every ``wake`` hold reports ``wake_disabled`` in
+        # `hermes kanban board-health` rather than silently never firing.
+        "health_reconcile": True,
+    },
+
+    # `hermes update` behaviour.
+    "update": {
+        # Branch the updater pulls when `--branch` is not passed.
+        #
+        # An install can legitimately track a maintained lineage rather than
+        # upstream ``main`` — e.g. a branch carrying lifecycle capability
+        # upstream has not taken. Before this setting the updater always
+        # resolved to ``main``, so such an install was fast-forwarded onto a
+        # tree without its capability and the update still reported success.
+        # Paired with the pre-activation capability canary
+        # (hermes_cli/kanban_capabilities.py), which fails the update if a
+        # required lifecycle capability disappeared regardless of branch.
+        "branch": "main",
     },
 
     # Bot Mode cross-connection relay (tools/bot_relay.py). Envelopes queued

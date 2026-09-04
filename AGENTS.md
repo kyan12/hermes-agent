@@ -1263,7 +1263,35 @@ Isolation model:
   same task (default: 2), the dispatcher auto-blocks it to prevent spin
   loops.
 
+Health control loop (`hermes_cli/kanban_health.py`) — runs on every
+dispatcher tick:
+- **Visible `blocked` = one affirmed, typed, atomic human action.** A gate
+  needs `block_kind` in {`needs_input`, `capability`} PLUS a `gate_evidence`
+  record naming one action and the principal who affirmed it. Untyped blocks
+  (what a crashed worker leaves) and unaffirmed claims route to automation
+  recovery, never the human column.
+- **Typed scheduled holds.** `hold_kind` classifies every `scheduled` card;
+  `dependency`/`wake` resume exactly once, `external`/`physical`/`roadmap`
+  stay parked and healthy, and a legacy untyped hold is reported
+  `legacy_untyped` and NEVER auto-resumed. `scheduled` previously had no wake
+  mechanism at all — do not "simplify" the checkpoint away.
+- **Ready-queue reason codes.** Dispatcher-stuck telemetry fires only for
+  cards that are genuinely spawnable and below cap. Capacity waits, respawn
+  guards, invalid workspaces and control-plane lanes have their own codes;
+  do not collapse them back into one boolean.
+- **Update capability guard.** `update.branch` (config.yaml) picks the
+  maintained lineage, and a pre-activation canary
+  (`hermes_cli/kanban_capabilities.py`) probes the updated tree
+  out-of-process and fails the update when a lifecycle capability
+  disappeared. Its required list is read from the RUNNING install — reading
+  it from the staged tree would make the check vacuous.
+- **Sentinel** (`hermes_cli/kanban_sentinel.py`) — deterministic, model-free
+  verifier behind `hermes kanban sentinel`. Ships inactive; stands down on
+  controller version drift; read-only while the controller checkpoint is
+  fresh.
+
 Full user-facing docs: `website/docs/user-guide/features/kanban.md`.
+Operations guide: `docs/kanban/health-control-loop.md`.
 
 ---
 
@@ -1278,6 +1306,10 @@ guards:
 plan → snapshot → apply → restart-per-kind → verify → report
 ```
 
+- **Branch**: `--branch` → `update.branch` in `config.yaml` → `main`. An
+  install can track a maintained lineage rather than upstream `main`; before
+  this setting the updater always resolved to `main` and silently
+  fast-forwarded such installs onto a tree without their capability.
 - **Plan** (`hermes_cli/update_inventory.py`, `hermes update --plan`):
   read-only inventory — install kind, all profiles, every live gateway
   with supervisor + running code version. Deployment kinds are
@@ -1299,6 +1331,11 @@ plan → snapshot → apply → restart-per-kind → verify → report
   (`-uall`, plus a pre-swap TOCTOU re-check), and grafts the live
   `apps/desktop/release/` into the staged swap (the GitHub source ZIP
   has no built desktop app; without the graft the swap deletes it).
+- **Capability canary**: after the code swap + dependency install and
+  BEFORE the fleet restart, probe the updated tree out-of-process for every
+  capability in `hermes_cli/kanban_capabilities.py`. A missing or broken
+  lifecycle capability fails the update (exit 1) with a `capability_canary`
+  receipt step. "The tree imports" does not prove the tree still works.
 - **Restart-per-kind**: systemd and launchd restarts are FLEET-WIDE
   (every `hermes-gateway*` unit / `ai.hermes.gateway*` LaunchAgent),
   drain-first (SIGUSR1) with per-unit/per-label failure isolation.

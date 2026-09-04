@@ -1,0 +1,261 @@
+"""Dispatcher-stuck telemetry must name the real reason a card did not spawn.
+
+The pre-control-loop probe answered one boolean — "is there a ready+assigned
+card whose assignee is a real profile?" — and the gateway turned a false
+positive into a *credential* warning ("check venv, PATH, credentials").
+Every nonspawnable-but-legitimate ready state (global capacity, per-profile
+capacity, an active PR, a recent success, an invalid workspace, a
+control-plane lane) produced that same wrong warning, which never cleared.
+
+These tests pin the distinct reason codes and pin that only a genuinely
+eligible, below-cap card past the grace window raises the alert.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_health as kh
+
+
+@pytest.fixture
+def board(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def real_profiles(monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name != "orion-cc")
+
+
+def _reasons(report):
+    return {e.task_id: e.reason_code for e in report.entries}
+
+
+def test_eligible_ready_card_is_spawnable(board, real_profiles):
+    tid = kb.create_task(board, title="do the thing", assignee="alice")
+    report = kh.ready_queue_report(board)
+    assert _reasons(report)[tid] == kh.READY_SPAWNABLE
+    assert report.spawnable_ids == [tid]
+
+
+def test_unassigned_ready_card_reports_unassigned_not_credentials(board, real_profiles):
+    tid = kb.create_task(board, title="nobody owns this", assignee=None)
+    report = kh.ready_queue_report(board)
+    assert _reasons(report)[tid] == kh.READY_UNASSIGNED
+    assert report.spawnable_ids == []
+
+
+def test_control_plane_lane_reports_its_own_reason(board, real_profiles):
+    tid = kb.create_task(board, title="human lane work", assignee="orion-cc")
+    report = kh.ready_queue_report(board)
+    assert _reasons(report)[tid] == kh.READY_CONTROL_PLANE_LANE
+    assert report.spawnable_ids == []
+
+
+def test_global_capacity_wait_is_a_capacity_reason(board, real_profiles):
+    running = kb.create_task(board, title="already running", assignee="alice")
+    kb.claim_task(board, running)
+    waiting = kb.create_task(board, title="waiting for a slot", assignee="bob")
+
+    report = kh.ready_queue_report(board, max_in_progress=1)
+    assert _reasons(report)[waiting] == kh.READY_CAPACITY_GLOBAL
+    assert report.spawnable_ids == []
+    assert report.at_global_cap is True
+
+
+def test_per_profile_capacity_wait_is_distinct_from_global(board, real_profiles):
+    running = kb.create_task(board, title="alice busy", assignee="alice")
+    kb.claim_task(board, running)
+    waiting = kb.create_task(board, title="alice queued", assignee="alice")
+    other = kb.create_task(board, title="bob free", assignee="bob")
+
+    report = kh.ready_queue_report(board, max_in_progress_per_profile=1)
+    reasons = _reasons(report)
+    assert reasons[waiting] == kh.READY_CAPACITY_PER_PROFILE
+    assert reasons[other] == kh.READY_SPAWNABLE
+    assert report.spawnable_ids == [other]
+
+
+def test_active_pr_guard_is_its_own_reason(board, real_profiles):
+    tid = kb.create_task(board, title="pr already open", assignee="alice")
+    kb.add_comment(board, tid, "worker", "opened https://github.com/o/r/pull/12")
+    report = kh.ready_queue_report(board)
+    assert _reasons(report)[tid] == kh.READY_GUARD_ACTIVE_PR
+    assert report.spawnable_ids == []
+
+
+def test_invalid_workspace_is_its_own_reason(board, real_profiles):
+    tid = kb.create_task(
+        board,
+        title="broken workspace",
+        assignee="alice",
+        workspace_kind="dir",
+        workspace_path="relative/not/absolute",
+    )
+    report = kh.ready_queue_report(board)
+    assert _reasons(report)[tid] == kh.READY_INVALID_WORKSPACE
+
+
+def test_claimed_card_is_not_counted_as_waiting_work(board, real_profiles):
+    tid = kb.create_task(board, title="in flight", assignee="alice")
+    kb.claim_task(board, tid)
+    report = kh.ready_queue_report(board)
+    assert tid not in _reasons(report)
+    assert report.spawnable_ids == []
+
+
+# ---------------------------------------------------------------------------
+# The alert decision itself
+# ---------------------------------------------------------------------------
+
+
+def test_capacity_and_guarded_queues_never_raise_dispatcher_stuck(board, real_profiles):
+    running = kb.create_task(board, title="busy", assignee="alice")
+    kb.claim_task(board, running)
+    kb.create_task(board, title="capacity wait", assignee="bob")
+    guarded = kb.create_task(board, title="guarded", assignee="bob")
+    kb.add_comment(board, guarded, "worker", "https://github.com/o/r/pull/9")
+    kb.create_task(board, title="lane work", assignee="orion-cc")
+
+    report = kh.ready_queue_report(board, max_in_progress=1)
+    alert = kh.dispatcher_stuck_alert(
+        [report], consecutive_idle_ticks=99, grace_ticks=3
+    )
+    assert alert is None
+
+
+def test_truly_eligible_below_cap_work_raises_dispatcher_stuck(board, real_profiles):
+    tid = kb.create_task(board, title="should have spawned", assignee="alice")
+    report = kh.ready_queue_report(board, max_in_progress=8)
+
+    assert kh.dispatcher_stuck_alert([report], consecutive_idle_ticks=1, grace_ticks=3) is None
+
+    alert = kh.dispatcher_stuck_alert(
+        [report], consecutive_idle_ticks=3, grace_ticks=3
+    )
+    assert alert is not None
+    assert tid in alert.task_ids
+    assert alert.reason_code == kh.READY_SPAWNABLE
+
+
+def test_stuck_alert_message_does_not_blame_credentials_for_capacity(board, real_profiles):
+    running = kb.create_task(board, title="busy", assignee="alice")
+    kb.claim_task(board, running)
+    kb.create_task(board, title="waiting", assignee="alice")
+    report = kh.ready_queue_report(board, max_in_progress=1)
+    summary = kh.ready_queue_summary([report])
+    assert summary["nonspawnable"][kh.READY_CAPACITY_GLOBAL] == 1
+    assert summary["spawnable"] == 0
+
+
+def test_one_queue_reports_several_distinct_reasons_at_once(board, real_profiles):
+    """A real board mixes reasons. Each card must keep its own, rather than
+    all of them collapsing into whatever the first check happened to be."""
+    busy = kb.create_task(board, title="alice busy", assignee="alice")
+    kb.claim_task(board, busy)
+
+    capped = kb.create_task(board, title="alice queued", assignee="alice")
+    guarded = kb.create_task(board, title="pr open", assignee="bob")
+    kb.add_comment(board, guarded, "worker", "https://github.com/o/r/pull/3")
+    lane = kb.create_task(board, title="human lane", assignee="orion-cc")
+    unassigned = kb.create_task(board, title="unrouted", assignee=None)
+    broken = kb.create_task(
+        board, title="bad workspace", assignee="bob",
+        workspace_kind="dir", workspace_path="not/absolute",
+    )
+    fine = kb.create_task(board, title="genuinely ready", assignee="carol")
+
+    report = kh.ready_queue_report(board, max_in_progress_per_profile=1)
+    reasons = _reasons(report)
+
+    assert reasons[capped] == kh.READY_CAPACITY_PER_PROFILE
+    assert reasons[guarded] == kh.READY_GUARD_ACTIVE_PR
+    assert reasons[lane] == kh.READY_CONTROL_PLANE_LANE
+    assert reasons[unassigned] == kh.READY_UNASSIGNED
+    assert reasons[broken] == kh.READY_INVALID_WORKSPACE
+    assert reasons[fine] == kh.READY_SPAWNABLE
+    # Six cards, six different verdicts — not one bucket.
+    assert len(set(reasons.values())) == 6
+    assert report.spawnable_ids == [fine]
+
+
+def test_no_alert_at_all_when_every_reason_is_a_legitimate_wait(board, real_profiles):
+    """The regression that mattered most: these queues produced a
+    'check venv, PATH, credentials' warning that never cleared."""
+    busy = kb.create_task(board, title="busy", assignee="alice")
+    kb.claim_task(board, busy)
+    kb.create_task(board, title="capped", assignee="alice")
+    guarded = kb.create_task(board, title="pr open", assignee="bob")
+    kb.add_comment(board, guarded, "worker", "https://github.com/o/r/pull/3")
+    kb.create_task(board, title="lane", assignee="orion-cc")
+    kb.create_task(
+        board, title="bad ws", assignee="bob",
+        workspace_kind="dir", workspace_path="not/absolute",
+    )
+
+    report = kh.ready_queue_report(board, max_in_progress_per_profile=1)
+    assert report.spawnable_ids == []
+    for ticks in (3, 10, 500):
+        assert kh.dispatcher_stuck_alert(
+            [report], consecutive_idle_ticks=ticks, grace_ticks=3
+        ) is None
+
+
+def test_stuck_alert_names_credentials_only_for_the_genuinely_stuck_card(
+    board, real_profiles
+):
+    """When a card really is eligible and below cap, a broken profile IS the
+    likely cause — so the credential hint belongs there, and only there. The
+    other cards are reported by reason code as correctly waiting."""
+    stuck = kb.create_task(board, title="should have spawned", assignee="carol")
+    guarded = kb.create_task(board, title="pr open", assignee="bob")
+    kb.add_comment(board, guarded, "worker", "https://github.com/o/r/pull/3")
+    kb.create_task(board, title="lane", assignee="orion-cc")
+
+    report = kh.ready_queue_report(board)
+    alert = kh.dispatcher_stuck_alert(
+        [report], consecutive_idle_ticks=6, grace_ticks=6
+    )
+    assert alert is not None
+    assert alert.task_ids == [stuck]
+    assert "credentials" in alert.message
+    # The waiting cards are accounted for, not silently folded into the stall.
+    assert kh.READY_GUARD_ACTIVE_PR in alert.message
+    assert kh.READY_CONTROL_PLANE_LANE in alert.message
+    assert guarded not in alert.task_ids
+
+
+def test_alert_aggregates_across_boards(board, real_profiles, tmp_path):
+    kb.create_board("second", name="Second")
+    kb.create_task(board, title="board one", assignee="alice")
+    conn2 = kb.connect(board="second")
+    try:
+        other = kb.create_task(conn2, title="board two", assignee="bob")
+        reports = [
+            kh.ready_queue_report(board, board="default"),
+            kh.ready_queue_report(conn2, board="second"),
+        ]
+    finally:
+        conn2.close()
+    alert = kh.dispatcher_stuck_alert(
+        reports, consecutive_idle_ticks=6, grace_ticks=6
+    )
+    assert alert is not None
+    assert other in alert.task_ids
+    assert len(alert.task_ids) == 2

@@ -223,7 +223,7 @@ def test_block_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, worker_env).status == "blocked"
+        assert kb.get_task(conn, worker_env).status == "triage"
     finally:
         conn.close()
 
@@ -436,7 +436,14 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="blocked", assignee="worker")
-        kb.block_task(conn, tid, reason="waiting")
+        kb.block_task(conn, tid, reason="waiting", kind="needs_input")
+        from hermes_cli import kanban_health as kh
+        assert kh.affirm_human_gate(conn, tid, evidence={
+            "type": "human_decision",
+            "action": "Provide the requested input",
+            "affirmed_by": "Kevin Yan",
+            "affirmed_at": int(__import__("time").time()),
+        }, reason="waiting")
     finally:
         conn.close()
 
@@ -683,7 +690,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
 
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, other).status == "blocked"
+        assert kb.get_task(conn, other).status == "triage"
     finally:
         conn.close()
 

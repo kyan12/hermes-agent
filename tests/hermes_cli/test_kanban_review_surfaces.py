@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+
+
+def _affirm_gate(conn, task_id: str, reason: str) -> None:
+    from hermes_cli import kanban_health as kh
+
+    assert kh.affirm_human_gate(conn, task_id, evidence={
+        "type": "human_decision",
+        "action": reason,
+        "affirmed_by": "Kevin Yan",
+        "affirmed_at": int(time.time()),
+    }, reason=reason)
 
 
 @pytest.fixture
@@ -412,6 +424,7 @@ def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(
             reason="review-required: ready",
             expected_run_id=parent.current_run_id,
         )
+        _affirm_gate(conn, parent_id, "review-required: ready")
 
     payload = json.loads(kc.run_slash(f"diagnostics --task {parent_id} --json"))
     assert any(

@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import time
 from pathlib import Path
 
 
@@ -10,6 +11,18 @@ from gateway.kanban_watchers import (
 )
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+
+
+def _affirm_gate(conn, task_id: str, reason: str) -> None:
+    from hermes_cli import kanban_health as kh
+
+    assert kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+    assert kh.affirm_human_gate(conn, task_id, evidence={
+        "type": "human_decision",
+        "action": reason,
+        "affirmed_by": "Kevin Yan",
+        "affirmed_at": int(time.time()),
+    }, reason=reason)
 
 
 class RecordingAdapter:
@@ -152,7 +165,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
             chat_id="chat-1",
             notifier_profile="main",
         )
-        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        _affirm_gate(conn, tid, reason)
     finally:
         conn.close()
 

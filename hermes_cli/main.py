@@ -10999,15 +10999,42 @@ def _finalize_update_output(state):
             pass
 
 
+def _configured_update_branch() -> Optional[str]:
+    """The maintained branch this install tracks, from ``update.branch``.
+
+    An install can legitimately run a lineage that is not upstream ``main``
+    — a maintained branch carrying lifecycle capability that upstream has
+    not taken. Before this setting existed the updater always resolved to
+    ``main``, so such an install was fast-forwarded onto a tree without its
+    capability and the update still reported success. Config (not an env
+    var) because this is behavioural, not a secret.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("update", {}).get("branch")
+    except Exception:
+        return None
+    if not value:
+        return None
+    return str(value).strip() or None
+
+
 def _resolve_update_branch(args) -> str:
     """Normalize ``args.branch`` into a non-empty branch name.
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    Centralizes the "default to the maintained branch, accept --branch
+    override, treat empty or whitespace-only values as the default" parsing
+    so every consumer of ``--branch`` (check path, git-update path,
+    ZIP-fallback path) agrees on the same answer.
+
+    Resolution order: explicit ``--branch`` → ``update.branch`` in
+    config.yaml → ``main``.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    explicit = (getattr(args, "branch", None) or "").strip()
+    if explicit:
+        return explicit
+    return (_configured_update_branch() or "main").strip() or "main"
 
 
 def _size_delta_label(saved_mb: float) -> str:

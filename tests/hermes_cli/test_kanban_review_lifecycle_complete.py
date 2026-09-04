@@ -20,6 +20,17 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_diagnostics as kd
 
 
+def _affirm_gate(conn, task_id: str, reason: str) -> None:
+    from hermes_cli import kanban_health as kh
+
+    assert kh.affirm_human_gate(conn, task_id, evidence={
+        "type": "human_decision",
+        "action": reason,
+        "affirmed_by": "Kevin Yan",
+        "affirmed_at": int(time.time()),
+    }, reason=reason)
+
+
 @pytest.fixture
 def conn(tmp_path: Path):
     db = kb.connect(tmp_path / "kanban.db")
@@ -407,9 +418,12 @@ def test_review_escalation_unblocks_back_to_review(conn) -> None:
         kind="needs_input",
         expected_run_id=review.current_run_id,
     )
-    blocked_event = _event(kb.list_events(conn, task_id), "blocked")
-    assert blocked_event.payload is not None
-    assert blocked_event.payload["source_status"] == "review"
+    recovery_event = _event(
+        kb.list_events(conn, task_id), "automation_recovery_requested"
+    )
+    assert recovery_event.payload is not None
+    assert recovery_event.payload["source_status"] == "review"
+    _affirm_gate(conn, task_id, "Maintainer decision required")
     assert kb.unblock_task(conn, task_id)
     resumed = kb.get_task(conn, task_id)
     assert resumed is not None
@@ -577,6 +591,11 @@ def test_legacy_review_child_deadlock_is_reported_immediately(conn):
         implementation_id,
         reason="review-required: implementation ready for independent review",
         expected_run_id=implementation.current_run_id,
+    )
+    _affirm_gate(
+        conn,
+        implementation_id,
+        "review-required: implementation ready for independent review",
     )
     reviewer_task = kb.get_task(conn, reviewer_id)
     assert reviewer_task is not None
