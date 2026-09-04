@@ -6451,15 +6451,6 @@ def block_task(
                 },
                 run_id=run_id,
             )
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
             if reason and author:
                 add_comment(conn, task_id, author, f"BLOCKED: {reason}")
             return True

@@ -297,6 +297,11 @@ def run_sentinel(
             board_row["counts"] = health["counts"]
             for row in health["no_forward_path"]:
                 unresolved.append({**row, "board": slug})
+            # Scope failures are independently actionable even when a card also
+            # lacks a forward path. Preserve both reason codes; evidence below
+            # deduplicates task ids so Kevin receives one atomic page.
+            for row in health.get("scope", []):
+                unresolved.append({**row, "board": slug})
         except Exception as exc:
             board_row["reason_code"] = REASON_BOARD_UNREADABLE
             board_row["error"] = str(exc)
@@ -351,6 +356,13 @@ def _maybe_emit(report: SentinelReport, now: int, *, apply: bool) -> bool:
     fingerprint = _fingerprint(
         {"title": action["title"], "evidence": action["evidence"]}
     )
+    # A dry run must be observationally pure. ``kb.connect()`` initializes and
+    # migrates a board, and the dedupe table below is itself durable state, so
+    # even opening it would violate ``--dry-run``. Report that this action
+    # would be newly emitted without claiming the dedupe interval.
+    if not apply:
+        return True
+
     from hermes_cli import kanban_db as kb
 
     conn = kb.connect()
@@ -369,8 +381,6 @@ def _maybe_emit(report: SentinelReport, now: int, *, apply: bool) -> bool:
             if previous is not None and now - last < ALERT_DEDUPE_SECONDS:
                 report.suppressed_until = last + ALERT_DEDUPE_SECONDS
                 return False
-            if not apply:
-                return True
             # The read and conditional upsert share BEGIN IMMEDIATE. Exactly
             # one concurrent sentinel can claim this alert interval.
             conn.execute(

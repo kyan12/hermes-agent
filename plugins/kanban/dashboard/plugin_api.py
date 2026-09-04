@@ -46,7 +46,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -644,7 +644,7 @@ def _build_board_payload(
                 # typed Kevin action.
                 from hermes_cli import kanban_health as kh
 
-                projection = kh.classify_block(t)
+                projection = kh.classify_block(conn, t)
                 d["block_projection"] = {
                     "visible": projection.visible,
                     "reason_code": projection.reason_code,
@@ -1030,6 +1030,78 @@ class AffirmGateBody(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=2000)
     evidence_type: str = "human_decision"
     kind: str = "needs_input"
+    # Optional claim. It is checked against the principal this request can
+    # actually prove — it never becomes one on its own.
+    affirmed_by: Optional[str] = Field(default=None, max_length=200)
+
+
+def _verified_human_principal(request, claimed: Optional[str]) -> str:
+    """The verified human behind this request, or raise 403.
+
+    A dashboard session token is a *transport* credential: it proves the
+    caller reached this host and read the printed URL, not that the caller is
+    Kevin. Manufacturing ``affirmed_by="operator:dashboard"`` therefore made
+    every dashboard-authorized caller able to project a card into the human
+    column. Resolution order:
+
+    1. An interactive login session verified by the auth provider — a real
+       identity, checked against ``kanban.human_gate_principals``.
+    2. Otherwise the principal the install bound in advance
+       (``kanban.operator_principal``). Token-only local dashboards have no
+       identity of their own, so the operator must name one deliberately.
+
+    Non-interactive bearer/service principals are machines and never qualify.
+    """
+    from hermes_cli import kanban_health as kh
+
+    state = getattr(request, "state", None)
+    if getattr(state, "token_principal", None) is not None and not getattr(
+        state, "session", None
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "a service token is a machine principal and cannot affirm a "
+                "human gate"
+            ),
+        )
+    session = getattr(state, "session", None)
+    principal = None
+    if session is not None:
+        for attr in ("email", "user_id", "display_name"):
+            candidate = (getattr(session, attr, None) or "").strip()
+            if candidate and kh.is_verified_human_principal(candidate):
+                principal = candidate
+                break
+        if principal is None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "the logged-in identity is not a verified human principal "
+                    "for this board (kanban.human_gate_principals)"
+                ),
+            )
+    else:
+        principal = kh.operator_principal()
+    if not principal:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "no verified human principal is bound to this dashboard — set "
+                "kanban.operator_principal to an identity listed in "
+                "kanban.human_gate_principals; a session token alone is a "
+                "transport, not an identity"
+            ),
+        )
+    if claimed and claimed.strip().casefold() != principal.casefold():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"this request can only affirm as {principal!r}, not "
+                f"{claimed.strip()!r}"
+            ),
+        )
+    return principal
 
 
 class TypedHoldBody(BaseModel):
@@ -1042,24 +1114,37 @@ class TypedHoldBody(BaseModel):
 
 @router.post("/tasks/{task_id}/affirm-gate")
 def affirm_task_gate(
-    task_id: str, payload: AffirmGateBody, board: Optional[str] = Query(None)
+    request: Request,
+    task_id: str,
+    payload: AffirmGateBody,
+    board: Optional[str] = Query(None),
 ):
-    """Authenticated operator transition into the human-attention column."""
+    """Verified-human transition into the human-attention column."""
     from hermes_cli import kanban_health as kh
 
+    principal = _verified_human_principal(request, payload.affirmed_by)
+    atomic = kh.parse_atomic_action(payload.action)
+    if atomic is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "action must be exactly one atomic action (one verb, one "
+                "object, one ask) — a compound ask hides what was approved"
+            ),
+        )
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
         evidence = {
             "type": payload.evidence_type,
-            "action": payload.action,
-            "affirmed_by": "operator:dashboard",
+            "action": atomic,
+            "affirmed_by": principal,
             "affirmed_at": int(time.time()),
             "source": "dashboard",
         }
         if not kh.affirm_human_gate(
             conn, task_id, evidence=evidence, kind=payload.kind,
-            reason=payload.reason, author="operator:dashboard",
+            reason=payload.reason, author=f"operator:{principal}",
         ):
             raise HTTPException(
                 status_code=409,

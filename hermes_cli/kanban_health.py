@@ -34,10 +34,12 @@ Design notes
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
+import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
@@ -93,6 +95,151 @@ VALID_EVIDENCE_TYPES = frozenset(
 # Terminal statuses: no forward path is required or expected.
 TERMINAL_STATUSES = frozenset({"done", "archived"})
 
+
+# ---------------------------------------------------------------------------
+# Human principals
+# ---------------------------------------------------------------------------
+
+# Identities that describe HOW a request arrived, not WHO sent it. A CLI
+# process and a dashboard session token are transports: both are reachable by
+# anything that can run a command on this host or read the printed dashboard
+# URL. Treating them as Kevin is what let any dashboard-authorized caller
+# project a card into the human-attention column. They are rejected
+# unconditionally — an operator cannot re-admit one via config.
+TRANSPORT_IDENTITIES = frozenset(
+    {
+        "operator",
+        "operator:cli",
+        "operator:dashboard",
+        "operator:api",
+        "cli",
+        "dashboard",
+        "api",
+        "worker",
+        "agent",
+        "system",
+        "hermes",
+    }
+)
+
+# Verified human identities allowed to affirm a gate when the install has not
+# configured its own list. Replaced (not extended) by
+# ``kanban.human_gate_principals``.
+DEFAULT_HUMAN_GATE_PRINCIPALS = ("kevin", "kevin yan", "operator:kevin")
+
+
+@functools.lru_cache(maxsize=1)
+def human_gate_principals() -> frozenset:
+    """Casefolded identities that may affirm a human gate.
+
+    ``kanban.human_gate_principals`` in ``config.yaml`` (a list of names or
+    emails). Transport identities are filtered out here too, so a
+    misconfiguration cannot reopen the hole this exists to close.
+    """
+    values: Iterable[Any] = DEFAULT_HUMAN_GATE_PRINCIPALS
+    try:
+        from hermes_cli.config import load_config
+
+        configured = (
+            (load_config() or {}).get("kanban", {}).get("human_gate_principals")
+        )
+        if isinstance(configured, (list, tuple)) and configured:
+            values = configured
+    except Exception:
+        pass
+    return frozenset(
+        ident
+        for ident in (str(v or "").strip().casefold() for v in values)
+        if ident and ident not in TRANSPORT_IDENTITIES
+    )
+
+
+def is_verified_human_principal(raw: Any) -> bool:
+    """Whether *raw* names a verified human, rather than a transport."""
+    ident = str(raw or "").strip().casefold()
+    if not ident or ident in TRANSPORT_IDENTITIES:
+        return False
+    return ident in human_gate_principals()
+
+
+def operator_principal() -> Optional[str]:
+    """The verified human identity this install's local surfaces may claim.
+
+    ``kanban.operator_principal`` in ``config.yaml`` (or ``HERMES_KANBAN_OPERATOR``).
+    Unset means the CLI and a token-only dashboard have *no* human identity to
+    bind an affirmation to, and both refuse rather than manufacture one.
+    """
+    import os
+
+    raw = (os.environ.get("HERMES_KANBAN_OPERATOR") or "").strip()
+    if not raw:
+        try:
+            from hermes_cli.config import load_config
+
+            raw = str(
+                (load_config() or {}).get("kanban", {}).get("operator_principal")
+                or ""
+            ).strip()
+        except Exception:
+            raw = ""
+    if not raw or not is_verified_human_principal(raw):
+        return None
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# Atomic actions
+# ---------------------------------------------------------------------------
+
+# One record must carry ONE ask. These are the shapes a second ask arrives in.
+_COMPOUND_ACTION_MARKERS = (
+    ";",
+    "\n",
+    "\r",
+    "\t",
+    " and ",
+    " then ",
+    " & ",
+    " plus ",
+    " also ",
+    " followed by ",
+)
+_ENUMERATED_ACTION = re.compile(r"(^|\s)(\d+[.)]|[-*\u2022])\s")
+MAX_ACTION_CHARS = 200
+
+
+def parse_atomic_action(raw: Any) -> Optional[dict]:
+    """Normalise *raw* into exactly ONE structured atomic action.
+
+    Accepts ``{"verb": ..., "object": ...}`` or the equivalent single-clause
+    string. Returns ``None`` for anything that is not one action: a bare verb
+    with no object, a list, or a clause carrying a second ask. Structure is
+    what makes "atomic" checkable — the previous "nonempty string" rule let a
+    single affirmation stand in for several unrelated decisions.
+    """
+    if isinstance(raw, dict):
+        verb = str(raw.get("verb") or "").strip()
+        obj = str(raw.get("object") or "").strip()
+    elif isinstance(raw, str):
+        parts = raw.strip().split(None, 1)
+        verb = parts[0].strip() if parts else ""
+        obj = parts[1].strip() if len(parts) > 1 else ""
+    else:
+        return None
+    if not verb or not obj:
+        return None
+    text = f"{verb} {obj}"
+    if len(text) > MAX_ACTION_CHARS:
+        return None
+    haystack = f" {text.casefold()} "
+    if any(marker in haystack for marker in _COMPOUND_ACTION_MARKERS):
+        return None
+    if _ENUMERATED_ACTION.search(text):
+        return None
+    return {"verb": verb, "object": obj}
+
+
+
 # ---------------------------------------------------------------------------
 # Reason codes
 # ---------------------------------------------------------------------------
@@ -134,6 +281,7 @@ PATH_SCHEDULED_HOLD = "scheduled_hold"
 PATH_HUMAN_GATE = "human_gate"
 PATH_AUTOMATION_RECOVERY = "automation_recovery"
 PATH_TRIAGE = "triage"
+PATH_HUMAN_LANE = "human_lane"
 PATH_NONE = "none"
 
 # Ready-queue reason codes (dispatcher telemetry). Distinct codes exist so a
@@ -148,6 +296,23 @@ READY_GUARD_ACTIVE_PR = "guard_active_pr"
 READY_GUARD_RECENT_SUCCESS = "guard_recent_success"
 READY_GUARD_BLOCKER_AUTH = "guard_blocker_auth"
 READY_GUARD_RATE_LIMIT = "guard_rate_limit_cooldown"
+READY_CAPACITY_MAX_SPAWN = "capacity_max_spawn"
+READY_MEMORY_PRESSURE_CRITICAL = "memory_pressure_critical"
+READY_MEMORY_PRESSURE_ELEVATED = "memory_pressure_elevated"
+READY_REVIEW_DISABLED = "review_dispatch_disabled"
+
+# Nonspawnable states nothing in the system will ever clear on its own. A
+# capacity wait, a respawn guard or a memory-pressure deferral is a card that
+# WILL spawn on a later tick; these are cards that will not. Only these mean
+# "no forward path" — the distinction is what stops board-health from paging
+# about a queue that is simply waiting its turn.
+READY_TERMINAL_NONSPAWNABLE = frozenset(
+    {
+        "unassigned",
+        "invalid_workspace",
+        "review_dispatch_disabled",
+    }
+)
 
 _GUARD_REASON_CODES = {
     "active_pr": READY_GUARD_ACTIVE_PR,
@@ -204,11 +369,13 @@ class Evidence:
     source: Optional[str] = None
     task_id: Optional[str] = None
     occurrence_event_id: Optional[int] = None
+    atomic_action: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return {
             "type": self.type,
             "action": self.action,
+            "atomic_action": self.atomic_action,
             "affirmed_by": self.affirmed_by,
             "affirmed_at": self.affirmed_at,
             "source": self.source,
@@ -220,10 +387,11 @@ class Evidence:
 def parse_evidence(raw: Any) -> Optional[Evidence]:
     """Return an :class:`Evidence` when *raw* is an affirmed typed record.
 
-    ``None`` for anything else — malformed JSON, an unrecognised type, a
-    missing atomic action, or no affirming principal. Fail-closed by design:
-    the failure mode we are preventing is unaffirmed prose being projected
-    to a human as though someone had signed off on it.
+    ``None`` for anything else — malformed JSON, an unrecognised type, an
+    action that is not exactly one structured atomic ask, or an affirming
+    identity that is a transport rather than a verified human. Fail-closed by
+    design: the failure mode we are preventing is unaffirmed prose being
+    projected to a human as though someone had signed off on it.
     """
     if raw is None:
         return None
@@ -239,11 +407,12 @@ def parse_evidence(raw: Any) -> Optional[Evidence]:
     etype = str(data.get("type") or "").strip()
     if etype not in VALID_EVIDENCE_TYPES:
         return None
-    action = str(data.get("action") or "").strip()
-    if not action:
+    atomic = parse_atomic_action(data.get("action"))
+    if atomic is None:
         return None
+    action = f"{atomic['verb']} {atomic['object']}"
     affirmed_by = str(data.get("affirmed_by") or "").strip()
-    if affirmed_by not in {"Kevin Yan", "kevin", "operator:kevin", "operator:cli", "operator:dashboard"}:
+    if not is_verified_human_principal(affirmed_by):
         return None
     try:
         affirmed_at = int(data.get("affirmed_at") or 0)
@@ -264,6 +433,7 @@ def parse_evidence(raw: Any) -> Optional[Evidence]:
     return Evidence(
         type=etype,
         action=action,
+        atomic_action=atomic,
         affirmed_by=affirmed_by,
         affirmed_at=affirmed_at,
         source=str(source) if source else None,
@@ -293,14 +463,8 @@ def set_gate_evidence(conn, task_id: str, *, evidence: Any) -> bool:
         ).fetchone()
         if current is None or current["status"] != "blocked" or occurrence is None:
             return False
-        bound = Evidence(
-            type=parsed.type,
-            action=parsed.action,
-            affirmed_by=parsed.affirmed_by,
-            affirmed_at=parsed.affirmed_at,
-            source=parsed.source,
-            task_id=task_id,
-            occurrence_event_id=int(occurrence["id"]),
+        bound = replace(
+            parsed, task_id=task_id, occurrence_event_id=int(occurrence["id"])
         )
         cur = conn.execute(
             "UPDATE tasks SET gate_evidence = ? WHERE id = ?",
@@ -421,15 +585,7 @@ def affirm_human_gate(
             },
             run_id=run_id,
         )
-        bound = Evidence(
-            type=parsed.type,
-            action=parsed.action,
-            affirmed_by=parsed.affirmed_by,
-            affirmed_at=parsed.affirmed_at,
-            source=parsed.source,
-            task_id=task_id,
-            occurrence_event_id=event_id,
-        )
+        bound = replace(parsed, task_id=task_id, occurrence_event_id=event_id)
         conn.execute(
             "UPDATE tasks SET gate_evidence=? WHERE id=? AND status='blocked'",
             (json.dumps(bound.to_dict()), task_id),
@@ -447,6 +603,18 @@ def affirm_human_gate(
         )
         if reason:
             kb.add_comment(conn, task_id, author, f"BLOCKED: {reason}")
+    # Plugin code is arbitrary and may write through another connection. Fire
+    # only after BEGIN IMMEDIATE has committed, and only for the transition
+    # that actually landed in the human ``blocked`` state.
+    blocked_task = kb.get_task(conn, task_id)
+    kb._fire_kanban_lifecycle_hook(
+        "kanban_task_blocked",
+        task_id,
+        board=kb.get_current_board(),
+        assignee=blocked_task.assignee if blocked_task else None,
+        run_id=run_id,
+        reason=reason,
+    )
     return True
 
 
@@ -489,14 +657,7 @@ def set_hold(
     if task is None:
         return False
     if parsed is not None:
-        parsed = Evidence(
-            type=parsed.type,
-            action=parsed.action,
-            affirmed_by=parsed.affirmed_by,
-            affirmed_at=parsed.affirmed_at,
-            source=parsed.source,
-            task_id=task_id,
-        )
+        parsed = replace(parsed, task_id=task_id)
 
     # Status, typed fields, closing run, and both audit events are one commit.
     # A crash or constraint failure cannot leave a scheduled-but-untyped row.
@@ -668,12 +829,82 @@ class BlockProjection:
     evidence: Optional[Evidence] = None
 
 
-def classify_block(task) -> BlockProjection:
+def latest_block_occurrence(conn, task_id: str) -> Optional[int]:
+    """Event id of the ``blocked`` event that opened the CURRENT occurrence.
+
+    ``None`` when the event log cannot prove one: no ``blocked`` event, a
+    later event that took the card back out of ``blocked``, or a ``blocked``
+    event that was not written by the affirmation path (no ``affirmed`` flag
+    and no matching ``gate_evidence`` event committed with it).
+
+    The ``tasks`` row alone cannot answer this. ``block_kind`` and
+    ``gate_evidence`` are plain columns: a writer that predates them — or one
+    running an older version against the same shared DB — can unblock and
+    re-block a card while leaving both untouched, and a row-only reader would
+    then project the PREVIOUS occurrence's affirmation as current.
+    """
+    if conn is None:
+        return None
+    try:
+        blocked = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if blocked is None:
+            return None
+        event_id = int(blocked["id"])
+        left = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+            "AND kind IN ('unblocked','claimed','completed','archived',"
+            "'scheduled','promoted','promoted_manual','reclaimed',"
+            "'review_requested','review_reopened','changes_requested') LIMIT 1",
+            (task_id, event_id),
+        ).fetchone()
+        if left is not None:
+            return None
+        try:
+            payload = json.loads(blocked["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict) or payload.get("affirmed") is not True:
+            return None
+        # The affirmation writes status, evidence column and BOTH events in
+        # one BEGIN IMMEDIATE. Requiring the paired event means a writer that
+        # only copies the columns forward cannot mint a visible gate.
+        paired = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND id > ? "
+            "AND kind = 'gate_evidence' ORDER BY id DESC LIMIT 1",
+            (task_id, event_id - 1),
+        ).fetchone()
+        if paired is None:
+            return None
+        try:
+            paired_payload = json.loads(paired["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(paired_payload, dict):
+            return None
+        if int(paired_payload.get("occurrence_event_id") or 0) != event_id:
+            return None
+        return event_id
+    except Exception:
+        # An unreadable event log is not proof of a current affirmation.
+        return None
+
+
+def classify_block(conn, task) -> BlockProjection:
     """Decide whether a ``blocked`` card is a human gate or a machine hold.
 
-    Visible requires all of: a human-capable block kind, and an affirmed
-    typed evidence record naming ONE atomic action. Everything else routes
-    to automation recovery, where a controller (not a person) owns it.
+    Visible requires all of: a human-capable block kind, an affirmed typed
+    evidence record naming ONE atomic action by a verified human principal,
+    and an ``occurrence_event_id`` that equals the latest authoritative
+    ``blocked`` event for this card's current occurrence (see
+    :func:`latest_block_occurrence`). Everything else routes to automation
+    recovery, where a controller (not a person) owns it.
+
+    *conn* is required. A caller that cannot consult the event log has not
+    established that the affirmation is current, so it fails closed.
     """
     kind = getattr(task, "block_kind", None)
     evidence = parse_evidence(getattr(task, "gate_evidence", None))
@@ -689,6 +920,8 @@ def classify_block(task) -> BlockProjection:
         # A worker *claiming* it needs input is a claim, not evidence.
         return BlockProjection(False, REASON_UNAFFIRMED_GATE)
     if evidence.task_id != task.id or evidence.occurrence_event_id is None:
+        return BlockProjection(False, REASON_UNAFFIRMED_GATE)
+    if latest_block_occurrence(conn, task.id) != evidence.occurrence_event_id:
         return BlockProjection(False, REASON_UNAFFIRMED_GATE)
     return BlockProjection(
         True, REASON_AFFIRMED_GATE, action=evidence.action, evidence=evidence
@@ -791,8 +1024,60 @@ class ForwardPath:
     detail: Optional[str] = None
 
 
+_TERMINAL_NONSPAWNABLE_DETAIL = {
+    READY_UNASSIGNED: "no assignee — the dispatcher will never spawn it",
+    READY_INVALID_WORKSPACE: "workspace cannot resolve; every spawn will fail",
+    READY_REVIEW_DISABLED: (
+        "kanban.review_dispatch is disabled and the assignee is a Hermes "
+        "profile, so no reviewer will ever be spawned"
+    ),
+}
+
+
+def auto_decompose_enabled() -> bool:
+    """Whether the dispatcher auto-decomposes fresh triage cards.
+
+    ``kanban.auto_decompose`` (default true). With it off, a triage card has
+    no machine-verifiable forward path at all.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        return bool(
+            (load_config() or {}).get("kanban", {}).get("auto_decompose", True)
+        )
+    except Exception:
+        return True
+
+
+def configured_ready_census(conn, *, board: Optional[str] = None) -> ReadyQueueReport:
+    """The ready/review census under this install's production constraints."""
+    return ready_queue_report(
+        conn,
+        board=board if board is not None else _current_board_safe(),
+        max_spawn=_configured_max_spawn(),
+        max_in_progress=_configured_max_in_progress(),
+        max_in_progress_per_profile=_configured_per_profile_cap(),
+    )
+
+
+def spawnability_reason(conn, task, *, census: Optional[ReadyQueueReport] = None) -> str:
+    """The authoritative dispatcher reason code for one ready/review card.
+
+    Single-card projection of :func:`ready_queue_report` so the forward-path
+    audit and the ready-queue telemetry cannot drift apart: both go through
+    the same classifier, with the same ordering, against the same production
+    constraints. Callers auditing a whole board pass one *census* rather than
+    re-running it per card.
+    """
+    if census is None:
+        census = configured_ready_census(conn)
+    return census.reason_for(task.id) or READY_SPAWNABLE
+
+
 def forward_path(
-    conn, task, *, now: int, wake_health: dict
+    conn, task, *, now: int, wake_health: dict,
+    ready_census: Optional[ReadyQueueReport] = None,
 ) -> ForwardPath:
     status = task.status
 
@@ -813,15 +1098,42 @@ def forward_path(
         )
 
     if status == "triage":
-        return ForwardPath(task.id, PATH_TRIAGE, True, REASON_AWAITING_TRIAGE)
+        # Triage is two different states wearing one status. A card that got
+        # here from ``block_task`` carries a ``block_kind``: it is an
+        # automation-recovery request nothing moves until someone classifies
+        # it. A fresh intake card (no ``block_kind``) is waiting on the
+        # auto-decomposer, which is a real forward path only while the
+        # decomposer is actually enabled.
+        if getattr(task, "block_kind", None) is None and auto_decompose_enabled():
+            return ForwardPath(task.id, PATH_TRIAGE, True, REASON_AWAITING_TRIAGE)
+        return ForwardPath(
+            task.id, PATH_TRIAGE, False, REASON_AWAITING_TRIAGE,
+            detail="triage card awaiting classification; nothing moves it",
+        )
 
     if status in ("ready", "review"):
-        if not task.assignee:
+        # Reuse the authoritative spawnability census rather than assuming
+        # "assigned == eligible". A missing profile, an unresolvable
+        # workspace or a disabled review lane are permanent: the card is
+        # never spawned and nothing else will move it, so calling it an
+        # eligible ready slot is how a board reports healthy while the work
+        # is frozen.
+        reason = spawnability_reason(conn, task, census=ready_census)
+        if reason == READY_CONTROL_PLANE_LANE:
+            # Pulled by a human terminal via claim_task. Idle by design.
             return ForwardPath(
-                task.id, PATH_NONE, False, REASON_UNASSIGNED,
-                detail="no assignee — the dispatcher will never spawn it",
+                task.id, PATH_HUMAN_LANE, True, READY_CONTROL_PLANE_LANE,
+                detail="assignee is a control-plane lane pulled by a human",
             )
-        return ForwardPath(task.id, PATH_ELIGIBLE_READY, True, REASON_ELIGIBLE_READY)
+        if reason in READY_TERMINAL_NONSPAWNABLE:
+            return ForwardPath(
+                task.id, PATH_NONE, False, reason,
+                detail=_TERMINAL_NONSPAWNABLE_DETAIL.get(reason),
+            )
+        # Capacity waits, respawn guards and memory-pressure deferrals all
+        # clear on a later tick. Report the exact code, but they are a
+        # forward path.
+        return ForwardPath(task.id, PATH_ELIGIBLE_READY, True, reason)
 
     if status == "todo":
         rows = conn.execute(
@@ -847,7 +1159,7 @@ def forward_path(
         )
 
     if status == "blocked":
-        projection = classify_block(task)
+        projection = classify_block(conn, task)
         if projection.visible:
             return ForwardPath(
                 task.id, PATH_HUMAN_GATE, True, REASON_AFFIRMED_GATE,
@@ -867,11 +1179,16 @@ def forward_paths(conn, *, now: Optional[int] = None) -> list[ForwardPath]:
 
     ts = int(now if now is not None else time.time())
     wake = wake_subsystem_health(conn, now=ts)
+    census = configured_ready_census(conn)
     out = []
     for task in kb.list_tasks(conn, include_body=False):
         if task.status in TERMINAL_STATUSES:
             continue
-        out.append(forward_path(conn, task, now=ts, wake_health=wake))
+        out.append(
+            forward_path(
+                conn, task, now=ts, wake_health=wake, ready_census=census
+            )
+        )
     return out
 
 
@@ -1124,6 +1441,8 @@ class ReadyQueueReport:
     entries: list[ReadyEntry] = field(default_factory=list)
     spawnable_ids: list[str] = field(default_factory=list)
     at_global_cap: bool = False
+    at_spawn_cap: bool = False
+    memory_pressure: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -1131,7 +1450,15 @@ class ReadyQueueReport:
             "entries": [e.to_dict() for e in self.entries],
             "spawnable": self.spawnable_ids,
             "at_global_cap": self.at_global_cap,
+            "at_spawn_cap": self.at_spawn_cap,
+            "memory_pressure": self.memory_pressure,
         }
+
+    def reason_for(self, task_id: str) -> Optional[str]:
+        for entry in self.entries:
+            if entry.task_id == task_id:
+                return entry.reason_code
+        return None
 
 
 def workspace_precondition_error(task) -> Optional[str]:
@@ -1174,33 +1501,68 @@ def ready_queue_report(
     conn,
     *,
     board: Optional[str] = None,
+    max_spawn: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     max_in_progress_per_profile: Optional[int] = None,
     include_other_boards: bool = False,
+    memory_pressure: Optional[str] = None,
 ) -> ReadyQueueReport:
-    """Census every unclaimed ready card with the reason it is or is not spawnable.
+    """Census every unclaimed ready/review card with the reason it is or is not
+    spawnable.
 
     This is the telemetry counterpart of the dispatcher's own skip decisions
     and it applies the same rules in the same order, so a card can never be
     "spawnable" here and skipped there. Claimed cards are excluded entirely:
     work already in flight is not waiting work.
+
+    Every production spawn constraint has to be represented, not just the ones
+    that are convenient to read. ``max_spawn`` is a live concurrency cap the
+    dispatcher applies before it looks at a row, and the memory-pressure guard
+    can zero (critical) or clamp to one (elevated) the whole tick's budget.
+    Omitting either made ``dispatch_once`` correctly spawn nothing while this
+    census still called the waiting card spawnable — and the gateway then
+    paged about a dispatcher that was doing exactly what it was told.
     """
     from hermes_cli import kanban_db as kb
 
     report = ReadyQueueReport(board=board)
 
     running = kb.count_running_tasks(conn)
+    if isinstance(max_spawn, int) and max_spawn > 0 and running >= max_spawn:
+        report.at_spawn_cap = True
+
+    host_running = running
     if include_other_boards:
         try:
-            running += kb.count_running_tasks_other_boards(board)
+            host_running += kb.count_running_tasks_other_boards(board)
         except Exception:
             pass
     if (
         isinstance(max_in_progress, int)
         and max_in_progress > 0
-        and running >= max_in_progress
+        and host_running >= max_in_progress
     ):
         report.at_global_cap = True
+
+    # Convert both caps into one shared additional-spawns budget, exactly as
+    # ``_dispatch_once_locked`` does.
+    spawn_budget: Optional[int] = None
+    if isinstance(max_spawn, int) and max_spawn > 0:
+        spawn_budget = max(max_spawn - running, 0)
+    if isinstance(max_in_progress, int) and max_in_progress > 0:
+        remaining = max(max_in_progress - host_running, 0)
+        if spawn_budget is None or spawn_budget > remaining:
+            spawn_budget = remaining
+
+    if memory_pressure is None:
+        try:
+            memory_pressure = kb._memory_pressure_level()
+        except Exception:
+            memory_pressure = "unknown"
+    if memory_pressure in ("critical", "elevated"):
+        report.memory_pressure = memory_pressure
+    if memory_pressure == "elevated" and (spawn_budget is None or spawn_budget > 1):
+        spawn_budget = 1
 
     per_profile_cap = (
         max_in_progress_per_profile
@@ -1221,16 +1583,24 @@ def ready_queue_report(
     except Exception:
         profile_exists = None  # type: ignore[assignment]
 
+    review_enabled = True
+    try:
+        review_enabled = bool(kb.review_dispatch_enabled())
+    except Exception:
+        review_enabled = True
+
     rows = conn.execute(
-        "SELECT id FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "SELECT id, status FROM tasks WHERE status IN ('ready','review') "
+        "AND claim_lock IS NULL ORDER BY priority DESC, created_at ASC"
     ).fetchall()
 
+    spawned = 0
     for row in rows:
         task = kb.get_task(conn, row["id"])
         if task is None:
             continue
         assignee = task.assignee
+        lane = "review" if row["status"] == "review" else "ready"
 
         if not assignee:
             report.entries.append(
@@ -1248,6 +1618,17 @@ def ready_queue_report(
                 )
             )
             continue
+        if lane == "review" and not review_enabled:
+            # ``kanban.review_dispatch`` is off, so no reviewer will ever be
+            # spawned for this card and its assignee is a real profile, not a
+            # human lane. Nothing on this install will move it.
+            report.entries.append(
+                ReadyEntry(
+                    task.id, assignee, READY_REVIEW_DISABLED,
+                    "kanban.review_dispatch is disabled; no reviewer will spawn",
+                )
+            )
+            continue
 
         ws_error = workspace_precondition_error(task)
         if ws_error:
@@ -1256,11 +1637,27 @@ def ready_queue_report(
             )
             continue
 
+        if report.at_spawn_cap:
+            report.entries.append(
+                ReadyEntry(
+                    task.id, assignee, READY_CAPACITY_MAX_SPAWN,
+                    f"{running} running at max_spawn={max_spawn}",
+                )
+            )
+            continue
         if report.at_global_cap:
             report.entries.append(
                 ReadyEntry(
                     task.id, assignee, READY_CAPACITY_GLOBAL,
-                    f"{running} running at max_in_progress={max_in_progress}",
+                    f"{host_running} running at max_in_progress={max_in_progress}",
+                )
+            )
+            continue
+        if memory_pressure == "critical":
+            report.entries.append(
+                ReadyEntry(
+                    task.id, assignee, READY_MEMORY_PRESSURE_CRITICAL,
+                    "system memory pressure is critical; deferred, not dropped",
                 )
             )
             continue
@@ -1276,7 +1673,12 @@ def ready_queue_report(
                 continue
 
         try:
-            guard = kb.check_respawn_guard(conn, task.id)
+            guard = kb.check_respawn_guard(conn, task.id, lane=lane)
+        except TypeError:
+            try:
+                guard = kb.check_respawn_guard(conn, task.id)
+            except Exception:
+                guard = None
         except Exception:
             guard = None
         if guard is not None:
@@ -1289,8 +1691,28 @@ def ready_queue_report(
             )
             continue
 
+        # Everything card-specific passed. What is left is the tick's shared
+        # budget, which the dispatcher consumes in this same order.
+        if spawn_budget is not None and spawned >= spawn_budget:
+            reason = (
+                READY_MEMORY_PRESSURE_ELEVATED
+                if memory_pressure == "elevated"
+                else READY_CAPACITY_MAX_SPAWN
+                if isinstance(max_spawn, int) and max_spawn > 0
+                else READY_CAPACITY_GLOBAL
+            )
+            detail = (
+                "system memory pressure is elevated; at most 1 new worker "
+                "this tick"
+                if memory_pressure == "elevated"
+                else f"tick spawn budget exhausted ({spawn_budget})"
+            )
+            report.entries.append(ReadyEntry(task.id, assignee, reason, detail))
+            continue
+
         report.entries.append(ReadyEntry(task.id, assignee, READY_SPAWNABLE))
         report.spawnable_ids.append(task.id)
+        spawned += 1
         if per_profile_cap is not None:
             per_profile_running[assignee] = per_profile_running.get(assignee, 0) + 1
 
@@ -1379,6 +1801,7 @@ def board_health(
 
     ts = int(now if now is not None else time.time())
     wake = wake_subsystem_health(conn, now=ts)
+    ready_census = configured_ready_census(conn, board=board)
 
     kevin_blocked: list[dict] = []
     automation_recovery: list[dict] = []
@@ -1393,7 +1816,7 @@ def board_health(
             continue
 
         if task.status == "blocked":
-            projection = classify_block(task)
+            projection = classify_block(conn, task)
             row = {
                 "task_id": task.id,
                 "title": task.title,
@@ -1445,7 +1868,9 @@ def board_health(
                 }
             )
 
-        path = forward_path(conn, task, now=ts, wake_health=wake)
+        path = forward_path(
+            conn, task, now=ts, wake_health=wake, ready_census=ready_census
+        )
         if not path.ok:
             no_forward_path.append(
                 {
@@ -1475,12 +1900,7 @@ def board_health(
     }
     payload["healthy"] = not (no_forward_path or scope)
     if include_ready_queue:
-        payload["ready_queue"] = ready_queue_report(
-            conn,
-            board=payload["board"],
-            max_in_progress=_configured_max_in_progress(),
-            max_in_progress_per_profile=_configured_per_profile_cap(),
-        ).to_dict()
+        payload["ready_queue"] = ready_census.to_dict()
     return payload
 
 
@@ -1489,6 +1909,16 @@ def _current_board_safe() -> Optional[str]:
         from hermes_cli import kanban_db as kb
 
         return kb.get_current_board()
+    except Exception:
+        return None
+
+
+def _configured_max_spawn() -> Optional[int]:
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get("max_spawn")
+        return int(value) if value else None
     except Exception:
         return None
 

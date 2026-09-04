@@ -992,13 +992,22 @@ def _installed_capability_manifest_present(root) -> bool:
     return (Path(root) / "hermes_cli" / "kanban_capabilities.py").is_file()
 
 
-def _preflight_git_capability_candidate(git_cmd, root, branch: str) -> bool:
-    """Probe ``origin/<branch>`` before mutating the live checkout.
+def _preflight_git_capability_candidate(
+    git_cmd, root, branch: str, *, merge_in_place: bool = False
+) -> bool:
+    """Probe the exact candidate tree before mutating the live checkout.
 
     The verifier is imported from the still-running installation. Therefore a
     candidate cannot certify itself by deleting both a capability and its own
     manifest entry. Installs predating the manifest bootstrap on their first
     update; every later candidate is fail-closed.
+
+    A maintained custom branch is different from a normal branch switch: its
+    activation candidate is ``HEAD`` merged with ``origin/<branch>``. Probing
+    the bare upstream ref would necessarily omit the local lifecycle commits
+    that ``updates.parked_branch_strategy=update_in_place`` exists to preserve,
+    making the supported strategy fail every update. Materialize that merge in
+    the disposable worktree and certify the resulting files instead.
     """
     root = Path(root)
     if not _installed_capability_manifest_present(root):
@@ -1008,9 +1017,10 @@ def _preflight_git_capability_candidate(git_cmd, root, branch: str) -> bool:
     candidate = Path(tempfile.mkdtemp(prefix="hermes-capability-candidate-"))
     added = False
     try:
+        candidate_base = "HEAD" if merge_in_place else f"origin/{branch}"
         add = subprocess.run(
             list(git_cmd)
-            + ["worktree", "add", "--detach", str(candidate), f"origin/{branch}"],
+            + ["worktree", "add", "--detach", str(candidate), candidate_base],
             cwd=root,
             capture_output=True,
             text=True,
@@ -1023,7 +1033,27 @@ def _preflight_git_capability_candidate(git_cmd, root, branch: str) -> bool:
                 print(f"    {add.stderr.strip().splitlines()[0]}")
             return False
         added = True
-        return _run_capability_canary(candidate, label=f"origin/{branch}")
+        label = f"origin/{branch}"
+        if merge_in_place:
+            merge = subprocess.run(
+                list(git_cmd)
+                + ["merge", "--no-commit", "--no-ff", f"origin/{branch}"],
+                cwd=candidate,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if merge.returncode != 0:
+                print(
+                    "  ✗ capability canary could not materialize the "
+                    f"maintained-branch merge with origin/{branch}."
+                )
+                if merge.stderr.strip():
+                    print(f"    {merge.stderr.strip().splitlines()[0]}")
+                return False
+            label = f"HEAD merged with origin/{branch}"
+        return _run_capability_canary(candidate, label=label)
     except Exception as exc:
         print(f"  ✗ capability canary could not stage the fetched candidate: {exc}")
         return False
@@ -9196,7 +9226,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # untouched. Probe the detached candidate now; activation must not be
         # the first time we discover a dropped lifecycle invariant.
         if not _preflight_git_capability_candidate(
-            git_cmd, _m().PROJECT_ROOT, branch
+            git_cmd,
+            _m().PROJECT_ROOT,
+            branch,
+            merge_in_place=in_place_update,
         ):
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(1)

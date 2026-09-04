@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import threading
 import time
 from pathlib import Path
@@ -49,6 +50,87 @@ def test_evidence_rejects_untrusted_affirmer_and_missing_timestamp():
     assert kh.parse_evidence(evidence) is None
 
 
+def test_generic_transport_identities_are_never_a_verified_human_principal():
+    """``operator:cli`` / ``operator:dashboard`` describe HOW a request
+    arrived, not WHO sent it. Accepting them as Kevin lets anyone holding a
+    dashboard session token project a card into the human-attention column."""
+    for transport in ("operator", "operator:cli", "operator:dashboard", "cli",
+                      "dashboard", "worker", "system"):
+        assert kh.parse_evidence(_evidence(affirmed_by=transport)) is None, transport
+        assert kh.is_verified_human_principal(transport) is False, transport
+    assert kh.parse_evidence(_evidence(affirmed_by="Kevin Yan")) is not None
+    assert kh.is_verified_human_principal("kevin") is True
+
+
+def test_human_gate_principal_allowlist_is_configurable(monkeypatch):
+    from hermes_cli import config as hcfg
+
+    monkeypatch.setattr(
+        hcfg, "load_config",
+        lambda: {"kanban": {"human_gate_principals": ["kevin.yan@example.test"]}},
+    )
+    kh.human_gate_principals.cache_clear()
+    try:
+        assert kh.is_verified_human_principal("Kevin.Yan@example.test") is True
+        # An explicit allowlist replaces the default identities …
+        assert kh.is_verified_human_principal("kevin") is False
+        # … but can never re-admit a transport identity.
+        assert kh.is_verified_human_principal("operator:dashboard") is False
+    finally:
+        kh.human_gate_principals.cache_clear()
+
+
+def test_evidence_must_carry_exactly_one_structured_atomic_action():
+    """"Atomic" as a nonempty string lets one record smuggle several asks."""
+    for compound in (
+        "Sign the contract and wire the deposit",
+        "Sign the contract; file the addendum",
+        "Sign the contract\nFile the addendum",
+        "Sign the contract, then file it",
+        "1. Sign the contract 2. File it",
+    ):
+        assert kh.parse_evidence(_evidence(action=compound)) is None, compound
+    # A bare verb with no object is not an action either.
+    assert kh.parse_evidence(_evidence(action="Approve")) is None
+
+    parsed = kh.parse_evidence(_evidence(action="Sign the named contract"))
+    assert parsed.atomic_action == {"verb": "Sign", "object": "the named contract"}
+    structured = kh.parse_evidence(
+        _evidence(action={"verb": "Sign", "object": "the named contract"})
+    )
+    assert structured.action == "Sign the named contract"
+    assert structured.atomic_action == parsed.atomic_action
+
+
+def test_block_projection_fails_closed_on_a_stale_mixed_version_reblock(board):
+    """A writer that predates the typed columns can unblock and re-block a
+    card while leaving ``block_kind`` / ``gate_evidence`` untouched. Reading
+    the row alone would project the PREVIOUS occurrence's Kevin affirmation
+    as though it were current."""
+    tid = _mk(board)
+    assert kh.affirm_human_gate(board, tid, evidence=_evidence())
+    assert kh.classify_block(board, kb.get_task(board, tid)).visible is True
+
+    # The old writer's shape: a fresh ``blocked`` occurrence, same columns.
+    with kb.write_txn(board):
+        kb._append_event(board, tid, "unblocked", {"by": "legacy"})
+        kb._append_event(board, tid, "blocked", {"reason": "legacy re-block"})
+
+    task = kb.get_task(board, tid)
+    assert task.gate_evidence is not None  # the stale column survived …
+    projection = kh.classify_block(board, task)
+    assert projection.visible is False     # … and proves nothing.
+    assert projection.reason_code == kh.REASON_UNAFFIRMED_GATE
+
+
+def test_block_projection_without_a_connection_fails_closed(board):
+    """The occurrence check is not optional: a caller that cannot consult the
+    event log has not established that the affirmation is current."""
+    tid = _mk(board)
+    assert kh.affirm_human_gate(board, tid, evidence=_evidence())
+    assert kh.classify_block(None, kb.get_task(board, tid)).visible is False
+
+
 def test_gate_affirmation_binds_current_block_occurrence_and_reblock_clears_it(board):
     tid = _mk(board)
     # An untrusted/machine block request is recovery work, never a visible
@@ -73,7 +155,7 @@ def test_gate_affirmation_binds_current_block_occurrence_and_reblock_clears_it(b
     task = kb.get_task(board, tid)
     assert task.status == "triage"
     assert task.gate_evidence is None
-    assert kh.classify_block(task).visible is False
+    assert kh.classify_block(board, task).visible is False
 
 
 def test_gate_and_hold_fields_clear_on_complete_and_archive(board):
@@ -243,3 +325,114 @@ def test_dashboard_exposes_typed_gate_and_hold_mutation_routes():
     }
     assert ("/tasks/{task_id}/affirm-gate", ("POST",)) in routes
     assert ("/tasks/{task_id}/hold", ("POST",)) in routes
+
+
+def _block_args(tid, **overrides):
+    args = dict(
+        task_id=tid,
+        ids=[],
+        reason=["Kevin must decide"],
+        kind="needs_input",
+        action="Approve the named contract",
+        evidence_type="human_decision",
+        affirmed_by=None,
+    )
+    args.update(overrides)
+    return argparse.Namespace(**args)
+
+
+def test_worker_context_cannot_self_affirm_a_human_gate_via_cli(
+    board, monkeypatch
+):
+    from hermes_cli import kanban as kcli
+
+    tid = _mk(board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "kevin")
+
+    assert kcli._cmd_block(_block_args(tid)) == 2
+    assert kb.get_task(board, tid).status == "ready"
+
+
+def test_cli_refuses_to_affirm_without_a_bound_human_principal(board, monkeypatch):
+    """``operator:cli`` proved only that someone could run a command on this
+    host. With no verified principal bound, the CLI has no identity to affirm
+    with and must refuse rather than manufacture one."""
+    from hermes_cli import kanban as kcli
+
+    tid = _mk(board)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_OPERATOR", raising=False)
+    monkeypatch.setattr(kh, "operator_principal", lambda: None)
+
+    assert kcli._cmd_block(_block_args(tid)) == 2
+    assert kb.get_task(board, tid).status == "ready"
+
+
+def test_cli_affirmation_is_stamped_with_the_verified_principal(board, monkeypatch):
+    from hermes_cli import kanban as kcli
+
+    tid = _mk(board)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "Kevin Yan")
+
+    assert kcli._cmd_block(_block_args(tid)) == 0
+    task = kb.get_task(board, tid)
+    assert task.status == "blocked"
+    evidence = json.loads(task.gate_evidence)
+    assert evidence["affirmed_by"] == "Kevin Yan"
+    assert evidence["atomic_action"] == {
+        "verb": "Approve", "object": "the named contract"
+    }
+    assert kh.classify_block(board, task).visible is True
+
+
+def test_cli_rejects_an_affirmed_by_outside_the_verified_allowlist(
+    board, monkeypatch
+):
+    from hermes_cli import kanban as kcli
+
+    tid = _mk(board)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "Kevin Yan")
+
+    assert kcli._cmd_block(_block_args(tid, affirmed_by="mallory")) == 2
+    assert kb.get_task(board, tid).status == "ready"
+
+
+def test_cli_rejects_a_compound_action_before_touching_the_board(
+    board, monkeypatch
+):
+    from hermes_cli import kanban as kcli
+
+    tid = _mk(board)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "Kevin Yan")
+
+    args = _block_args(tid, action="Sign the contract and wire the deposit")
+    assert kcli._cmd_block(args) == 2
+    assert kb.get_task(board, tid).status == "ready"
+
+
+def test_blocked_hook_fires_only_for_affirmed_gate_after_commit(board, monkeypatch):
+    observed = []
+
+    def record(event, task_id, **fields):
+        observed.append((event, task_id, board.in_transaction, fields))
+
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", record)
+
+    dependency = _mk(board, "dependency")
+    assert kb.block_task(board, dependency, kind="dependency", reason="parent")
+    assert observed == []
+
+    gate = _mk(board, "gate")
+    assert kh.affirm_human_gate(
+        board, gate, evidence=_evidence(), reason="Kevin must decide"
+    )
+    assert len(observed) == 1
+    event, task_id, in_transaction, fields = observed[0]
+    assert event == "kanban_task_blocked"
+    assert task_id == gate
+    assert in_transaction is False
+    assert fields["reason"] == "Kevin must decide"

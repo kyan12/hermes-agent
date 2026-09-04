@@ -237,3 +237,87 @@ def test_dry_run_makes_no_state_change(home):
         assert kb.get_task(conn, tid).status == "scheduled"
     finally:
         conn.close()
+
+
+def test_dry_run_alert_dedupe_never_opens_or_initializes_a_board(home, monkeypatch):
+    report = ks.SentinelReport(
+        generated_at=123,
+        kevin_action={
+            "title": "Needs one action",
+            "action": "Classify it",
+            "evidence": {"task_ids": ["t_bad"]},
+        },
+    )
+    monkeypatch.setattr(
+        kb,
+        "connect",
+        lambda *_a, **_k: pytest.fail("dry-run opened a mutable board connection"),
+    )
+
+    assert ks._maybe_emit(report, 123, apply=False) is True
+
+
+def test_scope_diagnostics_reach_the_overall_verdict_and_evidence(home, monkeypatch):
+    """A board reported unhealthy for ``unscoped_active_work`` used to leave
+    the sweep ``ok=True`` with no action at all: the sentinel copied only
+    ``no_forward_path`` into ``unresolved``. A verifier that exits 0 on a
+    failure class it can see is worse than no verifier."""
+    now = int(time.time())
+    _fresh_controller(kb.DEFAULT_BOARD, now=now)
+
+    scope_row = {
+        "task_id": "t_unscoped",
+        "title": "no project",
+        "reason_code": kh.REASON_UNSCOPED_ACTIVE_WORK,
+        "canonical_project_id": "alpha",
+        "status": "ready",
+    }
+    real_board_health = kh.board_health
+
+    def _health_with_scope(conn, **kwargs):
+        payload = real_board_health(conn, **kwargs)
+        payload["scope"] = [scope_row]
+        payload["healthy"] = False
+        return payload
+
+    monkeypatch.setattr(kh, "board_health", _health_with_scope)
+
+    report = ks.run_sentinel(now=now, apply=False)
+
+    assert report.ok is False
+    codes = {row["reason_code"] for row in report.unresolved}
+    assert kh.REASON_UNSCOPED_ACTIVE_WORK in codes
+    assert report.kevin_action is not None
+    evidence = report.kevin_action["evidence"]
+    assert "t_unscoped" in evidence["task_ids"]
+    assert kh.REASON_UNSCOPED_ACTIVE_WORK in evidence["reason_codes"]
+
+
+def test_unresolved_evidence_is_deduplicated_across_failure_classes(home, monkeypatch):
+    """One card failing two classes is one page, not two."""
+    now = int(time.time())
+    _fresh_controller(kb.DEFAULT_BOARD, now=now)
+
+    row = {
+        "task_id": "t_dup",
+        "title": "both",
+        "reason_code": kh.REASON_UNSCOPED_ACTIVE_WORK,
+        "status": "ready",
+    }
+    real_board_health = kh.board_health
+
+    def _health(conn, **kwargs):
+        payload = real_board_health(conn, **kwargs)
+        payload["scope"] = [row, dict(row)]
+        payload["no_forward_path"] = [dict(row, reason_code=kh.READY_UNASSIGNED)]
+        payload["healthy"] = False
+        return payload
+
+    monkeypatch.setattr(kh, "board_health", _health)
+
+    report = ks.run_sentinel(now=now, apply=False)
+    assert report.ok is False
+    assert report.kevin_action["evidence"]["task_ids"] == ["t_dup"]
+    assert sorted(report.kevin_action["evidence"]["reason_codes"]) == sorted(
+        [kh.READY_UNASSIGNED, kh.REASON_UNSCOPED_ACTIVE_WORK]
+    )

@@ -313,7 +313,7 @@ def test_legacy_prose_only_scheduled_hold_is_unhealthy_and_never_bulk_resumed(bo
 # ---------------------------------------------------------------------------
 
 
-def test_every_nonterminal_card_reports_a_forward_path(board):
+def test_every_nonterminal_card_reports_a_forward_path(board, all_assignees_spawnable):
     ready = _mk(board, "eligible ready card")
     parent = _mk(board, "parent")
     child = kb.create_task(board, title="gated child", assignee="alice", parents=(parent,))

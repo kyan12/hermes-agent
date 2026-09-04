@@ -685,6 +685,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         choices=sorted(kh.VALID_EVIDENCE_TYPES),
         help="Typed evidence backing an operator-affirmed human gate.",
     )
+    p_block.add_argument(
+        "--affirmed-by", default=None,
+        help=(
+            "Verified human principal affirming the gate. Must be one of "
+            "kanban.human_gate_principals; defaults to "
+            "kanban.operator_principal (or $HERMES_KANBAN_OPERATOR)."
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -2537,9 +2545,54 @@ def _cmd_block(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     human_gate = kind in kh.HUMAN_GATE_BLOCK_KINDS
-    if human_gate and not action:
-        print("--action is required for needs_input/capability human gates", file=sys.stderr)
-        return 2
+    affirmed_by = None
+    if human_gate:
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            or os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT") == "1"
+        ):
+            print(
+                "worker/delegated contexts cannot affirm human gates; use the "
+                "kanban_block tool to request deterministic recovery/triage",
+                file=sys.stderr,
+            )
+            return 2
+        if not action:
+            print(
+                "--action is required for needs_input/capability human gates",
+                file=sys.stderr,
+            )
+            return 2
+        # The CLI is a transport. It can prove a command ran on this host; it
+        # cannot prove who ran it. Stamping ``operator:cli`` made every local
+        # caller Kevin-equivalent, so the affirmation now has to name a
+        # principal the install has bound in advance.
+        claimed = (getattr(args, "affirmed_by", None) or "").strip()
+        bound = kh.operator_principal()
+        if not bound:
+            print(
+                "no verified human principal is bound to this install — set "
+                "kanban.operator_principal (or $HERMES_KANBAN_OPERATOR) to an "
+                "identity listed in kanban.human_gate_principals before "
+                "affirming a human gate",
+                file=sys.stderr,
+            )
+            return 2
+        if claimed and claimed.casefold() != bound.casefold():
+            print(
+                f"--affirmed-by {claimed!r} is not the principal bound to this "
+                f"install ({bound!r}); the CLI cannot vouch for another identity",
+                file=sys.stderr,
+            )
+            return 2
+        affirmed_by = bound
+        if kh.parse_atomic_action(action) is None:
+            print(
+                f"--action {action!r} is not exactly one atomic action; affirm "
+                "one ask per gate (a compound ask hides what was approved)",
+                file=sys.stderr,
+            )
+            return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
@@ -2550,7 +2603,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                     evidence={
                         "type": getattr(args, "evidence_type", "human_decision"),
                         "action": action,
-                        "affirmed_by": "operator:cli",
+                        "affirmed_by": affirmed_by,
                         "affirmed_at": int(time.time()),
                         "source": "cli",
                     },

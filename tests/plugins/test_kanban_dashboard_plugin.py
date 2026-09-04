@@ -103,7 +103,8 @@ def test_board_projects_unaffirmed_block_into_automation_triage(client):
     assert triaged[tid]["block_projection"]["visible"] is False
 
 
-def test_board_shows_only_affirmed_gate_in_blocked(client):
+def test_board_shows_only_affirmed_gate_in_blocked(client, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "kevin")
     created = client.post(
         "/api/plugins/kanban/tasks", json={"title": "signature gate"}
     ).json()["task"]
@@ -122,6 +123,63 @@ def test_board_shows_only_affirmed_gate_in_blocked(client):
     blocked = {task["id"]: task for task in columns["blocked"]}
     assert blocked[created["id"]]["block_projection"]["visible"] is True
     assert blocked[created["id"]]["block_projection"]["action"] == "Sign the named agreement"
+
+
+def test_affirm_gate_refuses_a_transport_only_dashboard_session(client, monkeypatch):
+    """A dashboard session token proves the caller reached this host, not that
+    the caller is Kevin. With no verified principal bound to the install, the
+    endpoint must refuse instead of stamping ``operator:dashboard``."""
+    monkeypatch.delenv("HERMES_KANBAN_OPERATOR", raising=False)
+    from hermes_cli import kanban_health as kh
+
+    monkeypatch.setattr(kh, "operator_principal", lambda: None)
+
+    created = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "unbound gate"}
+    ).json()["task"]
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{created['id']}/affirm-gate",
+        json={"action": "Sign the named agreement", "kind": "capability"},
+    )
+    assert response.status_code == 403, response.text
+    assert "principal" in response.json()["detail"].lower()
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, created["id"]).status != "blocked"
+
+
+def test_affirm_gate_rejects_a_claimed_principal_the_session_cannot_prove(
+    client, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "kevin")
+    created = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "impersonation"}
+    ).json()["task"]
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{created['id']}/affirm-gate",
+        json={
+            "action": "Sign the named agreement",
+            "kind": "capability",
+            "affirmed_by": "mallory",
+        },
+    )
+    assert response.status_code == 403, response.text
+
+
+def test_affirm_gate_rejects_a_compound_action(client, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "kevin")
+    created = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "two asks"}
+    ).json()["task"]
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{created['id']}/affirm-gate",
+        json={
+            "action": "Sign the agreement and wire the deposit",
+            "kind": "capability",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "atomic" in response.json()["detail"].lower()
 
 
 def test_create_task_appears_on_board(client):

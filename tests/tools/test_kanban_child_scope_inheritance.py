@@ -95,9 +95,13 @@ def test_child_inherits_tenant_from_the_parent_row_not_the_environment(scoped_wo
     assert _task(child).tenant == "acme-legal-entity"
 
 
-def test_explicit_tenant_still_wins_over_inheritance(scoped_worker):
-    child = _child_of(scoped_worker, tenant="other-entity")
-    assert _task(child).tenant == "other-entity"
+def test_worker_cannot_override_parent_tenant(scoped_worker):
+    out = _create(
+        title="escape", assignee="test-worker", parents=[scoped_worker],
+        tenant="other-entity",
+    )
+    assert "error" in out
+    assert "tenant" in out["error"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +114,25 @@ def test_child_inherits_originating_session_principal(scoped_worker):
     assert _task(child).session_id == "sess-principal-1"
 
 
-def test_explicit_session_id_still_wins_over_inheritance(scoped_worker):
-    child = _child_of(scoped_worker, session_id="sess-other")
-    assert _task(child).session_id == "sess-other"
+def test_stale_ambient_scope_cannot_override_authoritative_parent(
+    scoped_worker, monkeypatch
+):
+    monkeypatch.setenv("HERMES_TENANT", "stale-ambient-tenant")
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-ambient-session")
+
+    child = _child_of(scoped_worker)
+
+    assert _task(child).tenant == "acme-legal-entity"
+    assert _task(child).session_id == "sess-principal-1"
+
+
+def test_worker_cannot_override_parent_principal(scoped_worker):
+    out = _create(
+        title="escape", assignee="test-worker", parents=[scoped_worker],
+        session_id="sess-other",
+    )
+    assert "error" in out
+    assert "session" in out["error"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -278,11 +298,17 @@ def test_child_inherits_project_alongside_tenant_and_principal(project_worker):
     )
 
 
-def test_explicit_workspace_request_suppresses_project_inheritance(project_worker):
-    """Workspace sharing stays explicit: naming a workspace opts out of the
-    implicit project link rather than silently mixing the two."""
-    parent, _repo = project_worker
-    child = _child_of(parent, workspace_kind="scratch")
-    kid = _task(child)
-    assert kid.workspace_kind == "scratch"
-    assert kid.project_id is None
+def test_worker_cannot_override_parent_project_or_workspace(project_worker):
+    parent, repo = project_worker
+    for override in (
+        {"project": "other-project"},
+        {"workspace_kind": "dir", "workspace_path": str(repo)},
+        {"workspace_kind": "scratch"},
+    ):
+        out = _create(
+            title="escape", assignee="test-worker", parents=[parent], **override
+        )
+        assert "error" in out, (override, out)
+        assert any(
+            word in out["error"].lower() for word in ("project", "workspace")
+        )

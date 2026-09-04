@@ -120,6 +120,123 @@ def test_claimed_card_is_not_counted_as_waiting_work(board, real_profiles):
     assert report.spawnable_ids == []
 
 
+def test_review_queue_uses_the_same_spawnability_census(
+    board, real_profiles, monkeypatch
+):
+    tid = kb.create_task(board, title="review me", assignee="alice")
+    assert kb.request_review(board, tid, summary="ready for review")
+
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: False)
+    disabled = kh.ready_queue_report(board)
+    assert _reasons(disabled)[tid] == kh.READY_REVIEW_DISABLED
+    assert disabled.spawnable_ids == []
+
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    enabled = kh.ready_queue_report(board)
+    assert _reasons(enabled)[tid] == kh.READY_SPAWNABLE
+    assert enabled.spawnable_ids == [tid]
+
+
+def test_forward_path_reuses_spawnability_and_triage_is_not_magically_healthy(
+    board, real_profiles
+):
+    broken = kb.create_task(
+        board,
+        title="bad workspace",
+        assignee="alice",
+        workspace_kind="dir",
+        workspace_path="relative/path",
+    )
+    triage = kb.create_task(board, title="machine recovery", assignee="alice")
+    assert kb.block_task(board, triage, kind="needs_input", reason="claim")
+
+    health = kh.board_health(board)
+    missing = {
+        row["task_id"]: row["reason_code"] for row in health["no_forward_path"]
+    }
+    assert missing[broken] == kh.READY_INVALID_WORKSPACE
+    assert missing[triage] == kh.REASON_AWAITING_TRIAGE
+
+
+def test_max_spawn_cap_is_its_own_wait_reason(board, real_profiles):
+    """``kanban.max_spawn`` is a live concurrency cap the dispatcher enforces
+    before it looks at a single ready row. Omitting it from the census made
+    ``dispatch_once`` correctly spawn nothing while telemetry called the same
+    card spawnable — and the gateway paged about a dispatcher that was
+    behaving exactly as configured."""
+    running = kb.create_task(board, title="already running", assignee="alice")
+    kb.claim_task(board, running)
+    waiting = kb.create_task(board, title="waiting on the cap", assignee="bob")
+
+    report = kh.ready_queue_report(board, max_spawn=1)
+    assert _reasons(report)[waiting] == kh.READY_CAPACITY_MAX_SPAWN
+    assert report.spawnable_ids == []
+    assert report.at_spawn_cap is True
+
+    assert kh.dispatcher_stuck_alert(
+        [report], consecutive_idle_ticks=99, grace_ticks=3
+    ) is None
+
+
+def test_max_spawn_headroom_still_spawns(board, real_profiles):
+    running = kb.create_task(board, title="already running", assignee="alice")
+    kb.claim_task(board, running)
+    waiting = kb.create_task(board, title="has headroom", assignee="bob")
+
+    report = kh.ready_queue_report(board, max_spawn=3)
+    assert _reasons(report)[waiting] == kh.READY_SPAWNABLE
+
+
+def test_critical_memory_pressure_defers_every_card(board, real_profiles, monkeypatch):
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "critical")
+    tid = kb.create_task(board, title="would spawn", assignee="alice")
+
+    report = kh.ready_queue_report(board)
+    assert _reasons(report)[tid] == kh.READY_MEMORY_PRESSURE_CRITICAL
+    assert report.spawnable_ids == []
+    assert report.memory_pressure == "critical"
+
+
+def test_elevated_memory_pressure_allows_exactly_one_worker(
+    board, real_profiles, monkeypatch
+):
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "elevated")
+    first = kb.create_task(board, title="first", assignee="alice", priority=5)
+    second = kb.create_task(board, title="second", assignee="bob")
+
+    report = kh.ready_queue_report(board)
+    reasons = _reasons(report)
+    assert reasons[first] == kh.READY_SPAWNABLE
+    assert reasons[second] == kh.READY_MEMORY_PRESSURE_ELEVATED
+    assert report.spawnable_ids == [first]
+
+
+def test_gateway_passes_max_spawn_into_the_ready_census(monkeypatch, board):
+    """The reason codes only help if the production caller supplies the
+    production constraints."""
+    from gateway import kanban_watchers
+
+    seen = {}
+
+    def _fake_report(conn, **kwargs):
+        seen.update(kwargs)
+        return kh.ReadyQueueReport(board=kwargs.get("board"))
+
+    monkeypatch.setattr(kh, "ready_queue_report", _fake_report)
+    monkeypatch.setattr(
+        kanban_watchers, "_load_config",
+        lambda: {"kanban": {"max_spawn": 2, "max_in_progress": 4,
+                            "max_in_progress_per_profile": 1}},
+        raising=False,
+    )
+
+    reports = kanban_watchers._ready_queue_reports_for_telemetry()
+    assert reports
+    assert seen["max_spawn"] == 2
+    assert seen["max_in_progress_per_profile"] == 1
+    assert seen["include_other_boards"] is True
+
+
 # ---------------------------------------------------------------------------
 # The alert decision itself
 # ---------------------------------------------------------------------------

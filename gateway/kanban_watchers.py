@@ -170,6 +170,83 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+
+def _load_config():
+    """Module-level seam for ``hermes_cli.config.load_config``.
+
+    Kept as a function (not a from-import at module scope) so importing this
+    watcher never drags config loading into import time, and so tests can
+    substitute it.
+    """
+    from hermes_cli.config import load_config
+
+    return load_config()
+
+
+def _ready_queue_reports_for_telemetry() -> list:
+    """Census every board's ready/review queue with a reason code per card.
+
+    Replaces the old "is the ready queue non-empty?" boolean. That probe
+    could not tell a capacity wait, an active-PR guard, an invalid workspace
+    or a control-plane lane apart from a genuinely stuck dispatcher, so every
+    one of them produced the same credential-flavoured warning — which then
+    never cleared, because nothing was actually wrong with the credentials.
+
+    Every constraint ``dispatch_once`` applies is passed in, not just the
+    host cap: ``kanban.max_spawn`` is a live per-board concurrency cap, and
+    the memory-pressure guard can zero or clamp the whole tick's budget. A
+    census that ignores either calls a card spawnable that the dispatcher
+    correctly refused to spawn, and the stuck alert then fires on a
+    dispatcher doing exactly what it was configured to do.
+
+    Returns per-board :class:`kanban_health.ReadyQueueReport`s; only cards
+    the dispatcher itself would have spawned this tick land in
+    ``spawnable_ids``.
+    """
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_health as _kh
+
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+    reports = []
+    _cap = None
+    _per_profile = None
+    _max_spawn = None
+    try:
+        cfg = (_load_config() or {}).get("kanban", {})
+        _cap = _kb.resolve_max_in_progress(cfg.get("max_in_progress"))
+        _per_profile = cfg.get("max_in_progress_per_profile")
+        _max_spawn = cfg.get("max_spawn")
+    except Exception:
+        pass
+    for b in boards:
+        slug = b.get("slug") or _kb.DEFAULT_BOARD
+        conn = None
+        try:
+            conn = _kb.connect(board=slug)
+            reports.append(
+                _kh.ready_queue_report(
+                    conn,
+                    board=slug,
+                    max_spawn=_max_spawn,
+                    max_in_progress=_cap,
+                    max_in_progress_per_profile=_per_profile,
+                    include_other_boards=True,
+                )
+            )
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return reports
+
+
 def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     """Return the tenant scope (Slack workspace) a subscription's wake keys to.
 
@@ -1629,57 +1706,8 @@ class GatewayKanbanWatchersMixin:
             return out
 
         def _ready_queue_reports() -> list:
-            """Census every board's ready queue with a reason code per card.
-
-            Replaces the old "is the ready queue non-empty?" boolean. That
-            probe could not tell a capacity wait, an active-PR guard, an
-            invalid workspace or a control-plane lane apart from a genuinely
-            stuck dispatcher, so every one of them produced the same
-            credential-flavoured warning — which then never cleared, because
-            nothing was actually wrong with the credentials.
-
-            Returns per-board :class:`kanban_health.ReadyQueueReport`s; only
-            cards the dispatcher itself would have spawned this tick land in
-            ``spawnable_ids``.
-            """
-            from hermes_cli import kanban_health as _kh
-
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            reports = []
-            _cap = None
-            _per_profile = None
-            try:
-                cfg = (_load_config() or {}).get("kanban", {})
-                _cap = _kb.resolve_max_in_progress(cfg.get("max_in_progress"))
-                _per_profile = cfg.get("max_in_progress_per_profile")
-            except Exception:
-                pass
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                conn = None
-                try:
-                    conn = _kb.connect(board=slug)
-                    reports.append(
-                        _kh.ready_queue_report(
-                            conn,
-                            board=slug,
-                            max_in_progress=_cap,
-                            max_in_progress_per_profile=_per_profile,
-                            include_other_boards=True,
-                        )
-                    )
-                except Exception:
-                    continue
-                finally:
-                    if conn is not None:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-            return reports
+            """Census every board's ready queue under the tick's real constraints."""
+            return _ready_queue_reports_for_telemetry()
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by

@@ -1449,8 +1449,8 @@ def _handle_create(args: dict, **kw) -> str:
         )
     body = args.get("body")
     parents = args.get("parents") or []
-    tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
-    tenant_explicit = tenant is not None
+    tenant_explicit = args.get("tenant") is not None
+    tenant = args.get("tenant")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -1460,12 +1460,11 @@ def _handle_create(args: dict, **kw) -> str:
     # would stamp — and later wake — the wrong session.
     from tools.async_delegation import _current_origin_session_id
 
-    session_id = (
-        args.get("session_id")
-        or _current_origin_session_id()
-        or os.environ.get("HERMES_SESSION_ID")
+    session_explicit = args.get("session_id") is not None
+    session_id = args.get("session_id")
+    ambient_session_id = (
+        _current_origin_session_id() or os.environ.get("HERMES_SESSION_ID")
     )
-    session_explicit = session_id is not None
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
     # mean a fresh scratch workspace, even when a dispatcher-spawned worker
@@ -1477,6 +1476,7 @@ def _handle_create(args: dict, **kw) -> str:
     # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    workspace_explicit = workspace_kind is not None or workspace_path is not None
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
@@ -1518,15 +1518,42 @@ def _handle_create(args: dict, **kw) -> str:
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
             _scope = _inherited_parent_scope(kb, conn)
-            if _inherit_project and project_id is None and _scope.get("project_id"):
-                project_id = _scope["project_id"]
-                project_source_task_id = _scope["task_id"]
-            # Legal/entity scope and the originating principal follow the
-            # parent row whenever the caller did not name them explicitly.
-            if not tenant_explicit and not tenant:
-                tenant = _scope.get("tenant")
-            if not session_explicit and not session_id:
-                session_id = _scope.get("session_id")
+            if _scope:
+                # A dispatcher-spawned worker cannot grant itself authority in
+                # another tenant/session/project/repository. Redundant exact
+                # values are accepted, but conflicts fail closed. The child
+                # checkout is then derived from the inherited project so it is
+                # fresh while remaining inside the authorized repository.
+                inherited_tenant = _scope.get("tenant")
+                if tenant_explicit and tenant != inherited_tenant:
+                    return tool_error(
+                        "kanban_create: tenant conflicts with the authoritative parent scope"
+                    )
+                inherited_session = _scope.get("session_id")
+                if session_explicit and session_id != inherited_session:
+                    return tool_error(
+                        "kanban_create: session_id conflicts with the authoritative parent principal"
+                    )
+                inherited_project = _scope.get("project_id")
+                if project_id is not None and project_id != inherited_project:
+                    return tool_error(
+                        "kanban_create: project conflicts with the authoritative parent scope"
+                    )
+                if inherited_project and workspace_explicit:
+                    return tool_error(
+                        "kanban_create: workspace cannot override a project-linked parent; "
+                        "omit workspace fields to receive a fresh inherited-repository worktree"
+                    )
+                tenant = inherited_tenant
+                session_id = inherited_session
+                if inherited_project:
+                    project_id = inherited_project
+                    project_source_task_id = _scope["task_id"]
+            else:
+                if not tenant_explicit:
+                    tenant = os.environ.get("HERMES_TENANT")
+                if not session_explicit:
+                    session_id = ambient_session_id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),

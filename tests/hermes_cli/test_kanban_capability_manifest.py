@@ -8,13 +8,19 @@ tree that never had it — and the update reports success. Two guards:
 1. A supported, config-backed maintained-branch strategy, so the update
    pulls the lineage the install actually runs.
 2. A pre-activation capability canary that probes the STAGED tree (not the
-   running process) against the running install's required manifest and
-   fails loudly when a required lifecycle capability disappeared.
+   running process) against the running install's required manifest — and
+   with the running install's own behavioural probes — failing loudly when a
+   required lifecycle capability disappeared.
+
+The candidate supplies the code under test. It must never supply the test:
+a tree shipping no-op probes, or a manifest that quietly forgot a
+capability, has to fail rather than certify itself.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import textwrap
 from pathlib import Path
@@ -66,38 +72,158 @@ def test_verify_fails_when_a_capability_is_present_but_broken():
 # ---------------------------------------------------------------------------
 
 
-def _staged_tree(root: Path, capabilities: dict) -> Path:
-    pkg = root / "hermes_cli"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "kanban_capabilities.py").write_text(
-        textwrap.dedent(
-            f"""
-            def probe_capabilities():
-                return {capabilities!r}
-            """
-        ),
-        encoding="utf-8",
-    )
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# A candidate that keeps every symbol of the sentinel callable and drops the
+# only thing the sentinel is for: reporting a board it cannot recover. This is
+# the exact shape a symbol-presence probe waves through.
+_NO_OP_SENTINEL = textwrap.dedent(
+    '''\
+    """Candidate sentinel: same symbols, no behaviour."""
+    from dataclasses import dataclass, field
+    from typing import Optional
+
+    SENTINEL_VERSION = 1
+    EXPECTED_CONTROL_LOOP_VERSION = 1
+    EXPECTED_HEALTH_SCHEMA_VERSION = 1
+    ALERT_DEDUPE_SECONDS = 6 * 60 * 60
+    CHECKPOINT_SENTINEL = "sentinel"
+    REASON_CONTROLLER_ACTIVE = "controller_active"
+    REASON_CONTROLLER_DOWN = "controller_down"
+    REASON_BOARD_UNREADABLE = "board_unreadable"
+
+
+    def detect_drift():
+        return None
+
+
+    @dataclass
+    class SentinelReport:
+        ok: bool = True
+        version: int = SENTINEL_VERSION
+        generated_at: int = 0
+        drift: Optional[dict] = None
+        boards: list = field(default_factory=list)
+        repairs: list = field(default_factory=list)
+        would_repair: list = field(default_factory=list)
+        unresolved: list = field(default_factory=list)
+        kevin_action: Optional[dict] = None
+        alert_emitted: bool = False
+        suppressed_until: Optional[int] = None
+
+        def to_dict(self):
+            return dict(self.__dict__)
+
+
+    def run_sentinel(*, now=None, apply=True):
+        return SentinelReport(generated_at=int(now or 0))
+    '''
+)
+
+_SKIP_MIRROR = {
+    ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".worktrees", "node_modules", ".venv", "venv", ".tox",
+}
+
+
+def _mirror_install(root: Path, patch: dict | None = None) -> Path:
+    """A staged tree that really is this install, with optional file swaps.
+
+    Files are symlinked so the mirror is cheap; any directory containing a
+    patched file is materialised for real so the swap is visible. The result
+    is a candidate whose behaviour the canary can genuinely exercise, which is
+    the only kind of candidate a behavioural probe can say anything about.
+    """
+    patch = patch or {}
+    # Always materialise the package the canary probes, so the staged tree is
+    # a real file tree rather than a single symlink to this checkout.
+    real_dirs = {"hermes_cli"}
+    for rel in patch:
+        parent = Path(rel).parent
+        while str(parent) not in (".", ""):
+            real_dirs.add(str(parent))
+            parent = parent.parent
+
+    def _mirror(rel: str) -> None:
+        src = REPO_ROOT / rel if rel else REPO_ROOT
+        dst = root / rel if rel else root
+        dst.mkdir(parents=True, exist_ok=True)
+        for child in src.iterdir():
+            if child.name in _SKIP_MIRROR:
+                continue
+            child_rel = f"{rel}/{child.name}" if rel else child.name
+            target = root / child_rel
+            if child_rel in patch:
+                target.write_text(patch[child_rel], encoding="utf-8")
+            elif child_rel in real_dirs and child.is_dir():
+                _mirror(child_rel)
+            else:
+                os.symlink(child, target)
+
+    _mirror("")
     return root
 
 
+def _self_certifying_manifest() -> str:
+    """A candidate manifest that declares every capability present."""
+    return textwrap.dedent(
+        f"""
+        REQUIRED_CAPABILITY_NAMES = {tuple(kc.REQUIRED_CAPABILITY_NAMES)!r}
+        MANIFEST_SCHEMA_VERSION = 99
+
+
+        def capability_manifest():
+            return {{
+                "schema_version": MANIFEST_SCHEMA_VERSION,
+                "required": list(REQUIRED_CAPABILITY_NAMES),
+                "descriptions": {{}},
+            }}
+
+
+        def probe_capabilities():
+            # "Everything is fine." The running install must not believe it.
+            return dict.fromkeys(REQUIRED_CAPABILITY_NAMES, True)
+        """
+    )
+
+
 def test_canary_passes_when_the_staged_tree_keeps_every_capability(tmp_path):
-    staged = _staged_tree(tmp_path / "staged", dict.fromkeys(kc.REQUIRED_CAPABILITY_NAMES, True))
+    staged = _mirror_install(tmp_path / "staged")
     result = kc.preactivation_canary(staged)
     assert result.ok, result.detail
     assert result.missing == []
 
 
-def test_canary_fails_when_the_staged_tree_dropped_a_capability(tmp_path):
-    caps = dict.fromkeys(kc.REQUIRED_CAPABILITY_NAMES, True)
-    dropped = sorted(caps)[0]
-    caps.pop(dropped)
-    staged = _staged_tree(tmp_path / "staged", caps)
+def test_candidate_cannot_self_certify_with_its_own_probes(tmp_path):
+    """The hole this closes: the staged tree used to supply BOTH the
+    implementation and the probe that judged it, so a candidate carrying no-op
+    lifecycle code and an all-green ``probe_capabilities`` passed."""
+    staged = _mirror_install(
+        tmp_path / "staged",
+        patch={
+            "hermes_cli/kanban_sentinel.py": _NO_OP_SENTINEL,
+            "hermes_cli/kanban_capabilities.py": _self_certifying_manifest(),
+        },
+    )
     result = kc.preactivation_canary(staged)
+    assert result.ok is False, result.detail
+    assert result.probed is True
+    assert result.missing == ["kanban.sentinel"], result.detail
+    assert "kanban.sentinel" in result.detail
+
+
+def test_canary_fails_a_candidate_that_keeps_symbols_but_no_ops_behaviour(tmp_path):
+    """``callable(run_sentinel)`` is not a capability. Only the behaviour is."""
+    staged = _mirror_install(
+        tmp_path / "staged",
+        patch={"hermes_cli/kanban_sentinel.py": _NO_OP_SENTINEL},
+    )
+    # The candidate's symbols are all still there and importable …
+    assert (staged / "hermes_cli" / "kanban_sentinel.py").is_file()
+    result = kc.preactivation_canary(staged)
+    # … and the canary fails anyway, because the behaviour is gone.
     assert result.ok is False
-    assert dropped in result.missing
-    assert dropped in result.detail
+    assert "kanban.sentinel" in result.missing
 
 
 def test_canary_fails_closed_when_the_staged_tree_cannot_be_probed(tmp_path):
@@ -110,13 +236,32 @@ def test_canary_fails_closed_when_the_staged_tree_cannot_be_probed(tmp_path):
     assert result.probed is False
 
 
+def test_a_stub_tree_is_unprobeable_rather_than_certified(tmp_path):
+    """A minimal tree that only defines ``probe_capabilities`` has no
+    implementation to exercise. It must read as absence of evidence, never as
+    a pass."""
+    stub = tmp_path / "stub" / "hermes_cli"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "kanban_capabilities.py").write_text(
+        _self_certifying_manifest(), encoding="utf-8"
+    )
+    result = kc.preactivation_canary(tmp_path / "stub")
+    assert result.ok is False
+    assert result.probed is False
+    assert result.missing == list(kc.REQUIRED_CAPABILITY_NAMES)
+
+
 def test_a_real_probe_is_distinguishable_from_an_unprobeable_tree(tmp_path):
     """The update driver responds differently to the two, so the report must
     keep them apart: a probe that ran and found a capability gone is proof of
     a dropped invariant; a probe that could not run is absence of evidence."""
-    caps = dict.fromkeys(kc.REQUIRED_CAPABILITY_NAMES, True)
-    caps.pop(sorted(caps)[0])
-    dropped = kc.preactivation_canary(_staged_tree(tmp_path / "dropped", caps))
+    dropped = kc.preactivation_canary(
+        _mirror_install(
+            tmp_path / "dropped",
+            patch={"hermes_cli/kanban_sentinel.py": _NO_OP_SENTINEL},
+        )
+    )
     unprobeable = kc.preactivation_canary(tmp_path / "missing-tree")
 
     assert dropped.ok is False and dropped.probed is True
@@ -131,14 +276,16 @@ def test_update_canary_fails_the_update_only_on_a_real_dropped_capability(
     deliberately only warns (stale bytecode is indistinguishable)."""
     from hermes_cli import update_cmd
 
-    caps = dict.fromkeys(kc.REQUIRED_CAPABILITY_NAMES, True)
     assert update_cmd._run_capability_canary(
-        _staged_tree(tmp_path / "complete", caps), label="test"
+        _mirror_install(tmp_path / "complete"), label="test"
     ) is True
 
-    caps.pop(sorted(caps)[0])
     assert update_cmd._run_capability_canary(
-        _staged_tree(tmp_path / "degraded", caps), label="test"
+        _mirror_install(
+            tmp_path / "degraded",
+            patch={"hermes_cli/kanban_sentinel.py": _NO_OP_SENTINEL},
+        ),
+        label="test",
     ) is False
     assert "canary FAILED" in capsys.readouterr().out
 
@@ -148,13 +295,13 @@ def test_update_canary_fails_the_update_only_on_a_real_dropped_capability(
     assert "could not probe" in capsys.readouterr().out
 
 
-def _candidate_repo(root: Path, capabilities: dict) -> Path:
+def _candidate_repo(root: Path, patch: dict | None = None) -> Path:
     root.mkdir()
     _git(root, "init", "-q", "-b", "main")
     _git(root, "config", "user.email", "test@example.com")
     _git(root, "config", "user.name", "Test")
-    _staged_tree(root, capabilities)
-    _git(root, "add", "-A")
+    _mirror_install(root, patch=patch)
+    _git(root, "add", "-A", "-f")
     _git(root, "commit", "-qm", "candidate")
     head = _git(root, "rev-parse", "HEAD").stdout.strip()
     _git(root, "update-ref", "refs/remotes/origin/main", head)
@@ -165,8 +312,7 @@ def _candidate_repo(root: Path, capabilities: dict) -> Path:
 def test_git_candidate_is_probed_without_moving_live_head(tmp_path):
     from hermes_cli import update_cmd
 
-    caps = dict.fromkeys(kc.REQUIRED_CAPABILITY_NAMES, True)
-    repo = _candidate_repo(tmp_path / "repo", caps)
+    repo = _candidate_repo(tmp_path / "repo")
     before = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
     assert update_cmd._preflight_git_capability_candidate(["git"], repo, "main")
@@ -177,10 +323,13 @@ def test_git_candidate_is_probed_without_moving_live_head(tmp_path):
 def test_git_candidate_cannot_self_certify_a_removed_capability(tmp_path):
     from hermes_cli import update_cmd
 
-    caps = dict.fromkeys(kc.REQUIRED_CAPABILITY_NAMES, True)
-    dropped = sorted(caps)[0]
-    caps.pop(dropped)
-    repo = _candidate_repo(tmp_path / "repo", caps)
+    repo = _candidate_repo(
+        tmp_path / "repo",
+        patch={
+            "hermes_cli/kanban_sentinel.py": _NO_OP_SENTINEL,
+            "hermes_cli/kanban_capabilities.py": _self_certifying_manifest(),
+        },
+    )
     before = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
     assert not update_cmd._preflight_git_capability_candidate(["git"], repo, "main")
@@ -191,8 +340,7 @@ def test_git_candidate_cannot_self_certify_a_removed_capability(tmp_path):
 def test_git_candidate_staging_failure_is_fail_closed_and_nonmutating(tmp_path):
     from hermes_cli import update_cmd
 
-    caps = dict.fromkeys(kc.REQUIRED_CAPABILITY_NAMES, True)
-    repo = _candidate_repo(tmp_path / "repo", caps)
+    repo = _candidate_repo(tmp_path / "repo")
     before = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
     assert not update_cmd._preflight_git_capability_candidate(
@@ -297,6 +445,47 @@ def test_synthetic_upstream_advance_on_the_maintained_branch_keeps_capability(
 
     assert (install / "lifecycle.txt").exists()
     assert (install / "core.txt").read_text(encoding="utf-8") == "v2\n"
+
+
+@pytest.mark.real_capability_preflight
+def test_update_capability_preflight_probes_post_merge_maintained_tree(
+    synthetic_fleet, monkeypatch
+):
+    """The in-place updater must certify HEAD + upstream, not bare upstream.
+
+    Kevin's maintained lifecycle commit is intentionally local to the custom
+    production branch.  Probing ``origin/main`` alone therefore reports the
+    capability missing and makes ``updates.parked_branch_strategy =
+    update_in_place`` impossible to use.  The candidate must be the exact
+    post-merge tree the updater is about to activate.
+    """
+    from hermes_cli import update_cmd
+
+    _upstream, install = synthetic_fleet
+    _git(install, "fetch", "-q", "origin")
+    monkeypatch.setattr(
+        update_cmd, "_installed_capability_manifest_present", lambda _root: True
+    )
+
+    observed = {}
+
+    def _probe(candidate, *, label):
+        candidate = Path(candidate)
+        observed["label"] = label
+        observed["lifecycle"] = (candidate / "lifecycle.txt").exists()
+        observed["core"] = (candidate / "core.txt").read_text(encoding="utf-8")
+        return observed["lifecycle"] and observed["core"] == "v2\n"
+
+    monkeypatch.setattr(update_cmd, "_run_capability_canary", _probe)
+
+    assert update_cmd._preflight_git_capability_candidate(
+        ["git"], install, "main", merge_in_place=True
+    )
+    assert observed == {
+        "label": "HEAD merged with origin/main",
+        "lifecycle": True,
+        "core": "v2\n",
+    }
 
 
 def test_synthetic_upstream_advance_onto_main_drops_capability(synthetic_fleet):
