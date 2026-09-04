@@ -10305,6 +10305,16 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
+            # Dry-run is the dispatcher's authoritative spawn census. Mirror
+            # the real path's workspace resolution refusal without creating a
+            # directory or claiming the task, so health telemetry can compare
+            # its report to this result instead of certifying a card the real
+            # dispatcher would immediately fail.
+            from hermes_cli import kanban_health as _kh
+
+            _task = get_task(conn, row["id"])
+            if _task is None or _kh.workspace_precondition_error(_task):
+                continue
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
             # Increment per-profile counter even in dry_run so the cap
@@ -10436,6 +10446,11 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
+            from hermes_cli import kanban_health as _kh
+
+            _task = get_task(conn, row["id"])
+            if _task is None or _kh.workspace_precondition_error(_task):
+                continue
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
             if _per_profile_cap is not None:
