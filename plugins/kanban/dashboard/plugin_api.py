@@ -156,6 +156,33 @@ BOARD_COLUMNS: list[str] = [
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
+# Rolling window for the board's Done column. A done task is rendered only
+# while its ``completed_at`` is STRICTLY newer than ``now - this``; at
+# exactly the boundary it drops off. Old rows are never touched — they stay
+# fully readable via ``GET /tasks/:id`` and keep satisfying dependency
+# truth, link counts and progress rollups. 48h keeps the column to "what
+# finished since the day before yesterday" instead of an unbounded archive.
+DONE_COLUMN_WINDOW_SECONDS = 48 * 60 * 60
+
+
+def _now_seconds() -> float:
+    """Server-side clock for the board payload and its cache.
+
+    A single indirection so a payload build and the cache decisions that
+    guard it agree on one captured ``now`` — and so tests can freeze it.
+    """
+    return time.time()
+
+
+def _done_window_cutoff(now: float) -> int:
+    """Epoch-second cutoff for the Done column at server-time ``now``.
+
+    Truncated to whole seconds so the comparison against the INTEGER
+    ``tasks.completed_at`` column has an exact boundary: a task completed
+    at ``c`` drops off precisely when ``now >= c + DONE_COLUMN_WINDOW_SECONDS``.
+    """
+    return int(now) - DONE_COLUMN_WINDOW_SECONDS
+
 
 def _task_dict(
     conn: sqlite3.Connection,
@@ -409,6 +436,12 @@ def get_board(
     excluded from the payload (they dominated it: >80% of bytes on large
     boards); cards never render them and the drawer fetches the full task
     via ``GET /tasks/:id``.
+
+    The ``done`` column is a rolling window, not an archive: it carries only
+    tasks completed within ``DONE_COLUMN_WINDOW_SECONDS`` of the server's
+    ``now``. Older done rows are untouched and stay reachable via
+    ``GET /tasks/:id``; they also keep counting toward dependency
+    satisfaction, link counts and progress rollups.
     """
     board = _resolve_board(board)
     # Key the cache by resolved DB path, not slug: the active-board
@@ -419,7 +452,7 @@ def get_board(
     wait_deadline = time.monotonic() + _BOARD_BUILD_WAIT_SECONDS
     while True:
         probe = _board_version_probe(db_path)
-        now = time.time()
+        now = _now_seconds()
         builder_event: Optional[threading.Event] = None
         am_builder = False
         with _board_cache_lock:
@@ -429,6 +462,15 @@ def get_board(
                 and probe is not None
                 and entry["version"] == probe[1]
                 and now - entry["built_at"] < _BOARD_CACHE_TTL_SECONDS
+                # Time-only expiry: the Done column ages out on the wall
+                # clock, with no task event and no version bump to notice.
+                # Serving past this second would show a card the cutoff
+                # already excludes, so the entry dies at its own boundary
+                # rather than waiting out the generic TTL.
+                and (
+                    entry["done_window_expires_at"] is None
+                    or int(now) < entry["done_window_expires_at"]
+                )
             ):
                 # Fresh cache hit: patch the live cursor/clock fields so
                 # the client's WebSocket cursor stays aligned, and serve.
@@ -463,12 +505,13 @@ def get_board(
         # this flight.
         pre_version = probe[1] if probe is not None else -1
         try:
-            payload = _build_board_payload(
+            payload, done_window_expires_at = _build_board_payload(
                 board=board,
                 tenant=tenant,
                 include_archived=include_archived,
                 workflow_template_id=workflow_template_id,
                 current_step_key=current_step_key,
+                now=now,
             )
         except Exception:
             if builder_event is not None:
@@ -483,8 +526,11 @@ def get_board(
                 _board_cache.clear()
             _board_cache[key] = {
                 "version": pre_version,
-                "built_at": time.time(),
+                # The captured build clock, not a fresh reading: the entry
+                # must describe the snapshot it actually rendered.
+                "built_at": now,
                 "payload": payload,
+                "done_window_expires_at": done_window_expires_at,
             }
             # Publish the entry BEFORE releasing the single-flight, so a
             # waking waiter always finds it and never starts a duplicate
@@ -492,7 +538,7 @@ def get_board(
             if builder_event is not None:
                 _board_builders.pop(key, None)
                 builder_event.set()
-        return {**payload, "latest_event_id": latest_event_id, "now": int(time.time())}
+        return {**payload, "latest_event_id": latest_event_id, "now": int(now)}
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +557,13 @@ def get_board(
 # fetched separately). A TTL backstop catches out-of-band writes that
 # emit no events (manual SQL, DB file swaps). Concurrent requests for the
 # same key share a single in-flight build via ``_board_builders``.
+#
+# One part of the payload also expires on the wall clock alone: the Done
+# column's rolling window (``DONE_COLUMN_WINDOW_SECONDS``). No task event
+# fires when a done card crosses the cutoff, so each entry additionally
+# carries ``done_window_expires_at`` — the second at which its OLDEST
+# included done card becomes ineligible — and is refused from that second
+# on, well before the generic TTL would notice.
 _BOARD_CACHE_TTL_SECONDS = 30.0
 _BOARD_BUILD_WAIT_SECONDS = 20.0
 _BOARD_CACHE_MAX_KEYS = 16
@@ -557,14 +610,32 @@ def _build_board_payload(
     include_archived: bool,
     workflow_template_id: Optional[str],
     current_step_key: Optional[str],
-) -> dict:
+    now: float,
+) -> tuple[dict, Optional[int]]:
     """Full board build — everything except ``latest_event_id``/``now``,
-    which the caller patches in at serve time."""
+    which the caller patches in at serve time.
+
+    ``now`` is the single server-side clock reading for this build; every
+    time-dependent decision in the payload derives from it.
+
+    Returns ``(payload, done_window_expires_at)``. The second element is
+    the epoch second at which the OLDEST included done card crosses the
+    rolling cutoff — i.e. the first moment this payload becomes wrong
+    purely through the passage of time, with no task event to invalidate
+    it. ``None`` when the payload contains no done cards and therefore
+    cannot age out. The caller uses it as a per-entry cache boundary.
+    """
     conn = _conn(board=board)
+    done_cutoff = _done_window_cutoff(now)
     try:
         # Task bodies are excluded at the SQL layer: they accounted for
         # >80% of the payload on large boards and no board-list consumer
         # renders them (the drawer fetches /tasks/:id for the full body).
+        #
+        # The Done column's rolling window is pushed into the same query:
+        # aged-out done rows must never reach the summary lookup, the
+        # diagnostics rollup or per-task serialization, all of which scale
+        # with the number of rows they are handed.
         tasks = kanban_db.list_tasks(
             conn,
             tenant=tenant,
@@ -572,7 +643,9 @@ def _build_board_payload(
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
             include_body=False,
+            done_completed_after=done_cutoff,
         )
+        visible_ids = [t.id for t in tasks]
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
         for row in conn.execute(
@@ -610,7 +683,10 @@ def _build_board_payload(
         # We get the full structured list per task AND a compact
         # summary for the card badge (so cards don't carry the detail
         # text; the drawer fetches that via /tasks/:id or /diagnostics).
-        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+        # Scoped to the visible set: an aged-out done card has nowhere to
+        # render its diagnostics, and the rollup is the most expensive
+        # part of the build (events + runs + graph per task).
+        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=visible_ids)
 
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
@@ -620,7 +696,7 @@ def _build_board_payload(
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        summary_map = kanban_db.latest_summaries(conn, visible_ids)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -667,13 +743,31 @@ def _build_board_payload(
             )
         ]
 
-        return {
+        # Oldest included completion decides when this payload starts
+        # showing a card that is no longer eligible.
+        done_completions: list[int] = []
+        for t in tasks:
+            if t.status != "done" or t.completed_at is None:
+                continue
+            try:
+                done_completions.append(int(t.completed_at))
+            except (TypeError, ValueError):  # matches the SQL cutoff's CAST
+                continue
+        oldest_done = min(done_completions, default=None)
+        done_window_expires_at = (
+            int(oldest_done) + DONE_COLUMN_WINDOW_SECONDS
+            if oldest_done is not None
+            else None
+        )
+
+        payload = {
             "columns": [
                 {"name": name, "tasks": columns[name]} for name in columns.keys()
             ],
             "tenants": tenants,
             "assignees": assignees,
         }
+        return payload, done_window_expires_at
     finally:
         conn.close()
 

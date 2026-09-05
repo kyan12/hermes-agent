@@ -3746,7 +3746,21 @@ def list_tasks(
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
     include_body: bool = True,
+    done_completed_after: Optional[int] = None,
 ) -> list[Task]:
+    """List tasks, newest-priority-first by default.
+
+    ``done_completed_after`` is an opt-in rolling window for the ``done``
+    status only: when set to an epoch-second cutoff, a ``done`` row is
+    returned only when ``completed_at`` is STRICTLY greater than the
+    cutoff. Done rows with a NULL ``completed_at`` are excluded, and every
+    other status is returned untouched. Defaults to ``None`` (no window),
+    so all existing callers keep their current result set.
+
+    The window is applied here — in SQL — rather than by the caller, so
+    consumers never have to load (or post-process) the long tail of old
+    done rows.
+    """
     if include_body:
         select_cols = "*"
     else:
@@ -3784,6 +3798,20 @@ def list_tasks(
         params.append(current_step_key)
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
+    if done_completed_after is not None:
+        # Strict boundary: a row completed exactly ON the cutoff is out.
+        # ``completed_at`` is stored as INTEGER epoch seconds, so compare
+        # against an int cutoff to keep the boundary exact.
+        # ``CAST`` fails closed on the legacy/hand-written rows ``_to_epoch``
+        # exists to tolerate: SQLite orders TEXT above every INTEGER, so a
+        # bare comparison would make an unparseable timestamp permanently
+        # visible. Real rows are INTEGER epoch seconds and cast to
+        # themselves; there is no index on ``completed_at`` to lose.
+        query += (
+            " AND (status != 'done' OR "
+            "(completed_at IS NOT NULL AND CAST(completed_at AS INTEGER) > ?))"
+        )
+        params.append(int(done_completed_after))
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:

@@ -27,8 +27,12 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py as a fresh module.
+
+    A fresh module object per call also means a fresh (empty) board response
+    cache, which the done-window cache tests depend on.
+    """
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -40,7 +44,12 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    return _load_plugin_module().router
 
 
 @pytest.fixture
@@ -59,6 +68,16 @@ def client(kanban_home):
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
     return TestClient(app)
+
+
+@pytest.fixture
+def board_plugin(kanban_home):
+    """(module, client) pair — for tests that need to reach module internals
+    (the done-window constant, the board cache, the server-side clock seam)."""
+    mod = _load_plugin_module()
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/kanban")
+    return mod, TestClient(app)
 
 
 # ---------------------------------------------------------------------------
@@ -1382,3 +1401,481 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# Done column rolling 48h window
+# ---------------------------------------------------------------------------
+
+_HOUR = 3600
+_WINDOW = 48 * _HOUR
+# Fixed server clock for the boundary tests: real wall-clock would make the
+# "exactly at the boundary" cases flake whenever a request straddles a second.
+_T0 = 1_800_000_000
+
+
+class _FrozenClock:
+    """Controllable stand-in for the board's server-side ``now``."""
+
+    def __init__(self, now: float) -> None:
+        self.now = float(now)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _freeze_board_clock(mod, monkeypatch, now: float = _T0) -> _FrozenClock:
+    clock = _FrozenClock(now)
+    monkeypatch.setattr(mod, "_now_seconds", clock)
+    return clock
+
+
+def _make_done_task(
+    *,
+    title: str,
+    completed_at,
+    tenant=None,
+    assignee=None,
+    parents=(),
+    board=None,
+) -> str:
+    """Create a task, complete it, then backdate ``completed_at`` in place.
+
+    Backdating via SQL (rather than freezing the clock for ``complete_task``)
+    keeps the rest of the row — events, runs, links — exactly as a real
+    completion writes it, which is what the board reads.
+    """
+    conn = kb.connect(board=board) if board else kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title=title, tenant=tenant, assignee=assignee,
+            parents=list(parents),
+        )
+        assert kb.complete_task(conn, tid, result=f"result::{title}",
+                                summary=f"summary::{title}")
+        if completed_at is None:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET completed_at = NULL WHERE id = ?", (tid,)
+                )
+        else:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET completed_at = ? WHERE id = ?",
+                    (int(completed_at), tid),
+                )
+        assert kb.get_task(conn, tid).status == "done"
+        return tid
+    finally:
+        conn.close()
+
+
+def _columns(response) -> dict[str, list[dict]]:
+    assert response.status_code == 200, response.text
+    return {c["name"]: c["tasks"] for c in response.json()["columns"]}
+
+
+def _done_ids(response) -> set[str]:
+    return {t["id"] for t in _columns(response)["done"]}
+
+
+def test_done_window_constant_is_exactly_48_hours(board_plugin):
+    mod, _ = board_plugin
+    assert mod.DONE_COLUMN_WINDOW_SECONDS == 48 * 60 * 60 == 172800
+
+
+def test_board_done_column_includes_completion_one_second_inside_window(
+    board_plugin, monkeypatch
+):
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    # 47h59m59s old — one second inside the rolling window.
+    tid = _make_done_task(title="just inside", completed_at=_T0 - (_WINDOW - 1))
+
+    assert _done_ids(client.get("/api/plugins/kanban/board")) == {tid}
+
+
+def test_board_done_column_excludes_completion_at_exactly_48_hours(
+    board_plugin, monkeypatch
+):
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    # Exactly 48h old — the boundary is strict, so this is excluded.
+    tid = _make_done_task(title="on the boundary", completed_at=_T0 - _WINDOW)
+
+    assert _done_ids(client.get("/api/plugins/kanban/board")) == set()
+    # The row itself is untouched and still done.
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_board_done_column_excludes_older_and_timestampless_completions(
+    board_plugin, monkeypatch
+):
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    fresh = _make_done_task(title="fresh", completed_at=_T0 - _HOUR)
+    _make_done_task(title="ancient", completed_at=_T0 - 30 * 24 * _HOUR)
+    _make_done_task(title="one second over", completed_at=_T0 - (_WINDOW + 1))
+    _make_done_task(title="no completion timestamp", completed_at=None)
+
+    assert _done_ids(client.get("/api/plugins/kanban/board")) == {fresh}
+
+
+def test_board_done_window_leaves_active_statuses_untouched(board_plugin, monkeypatch):
+    """Non-done statuses are never aged out, no matter how old the row is."""
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    ancient = _T0 - 90 * 24 * _HOUR
+    ids = {}
+    with kb.connect() as conn:
+        for status in ("triage", "todo", "scheduled", "ready", "running", "review"):
+            tid = kb.create_task(conn, title=f"old {status}")
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = ?, created_at = ?, completed_at = ? "
+                    "WHERE id = ?",
+                    (status, ancient, ancient, tid),
+                )
+            ids[status] = tid
+
+    columns = _columns(client.get("/api/plugins/kanban/board"))
+    for status, tid in ids.items():
+        assert tid in {t["id"] for t in columns[status]}, f"{status} card vanished"
+
+
+def test_board_done_window_filters_in_sql_before_downstream_work(
+    board_plugin, monkeypatch
+):
+    """Requirement: the cutoff is applied in the data fetch, so summary
+    lookup, diagnostics and serialization only ever see visible ids."""
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    visible = _make_done_task(title="visible", completed_at=_T0 - _HOUR)
+    hidden = _make_done_task(title="hidden", completed_at=_T0 - 10 * 24 * _HOUR)
+    with kb.connect() as conn:
+        active = kb.create_task(conn, title="visible active")
+        # Reproduce the live board's historical scale without emitting 1,140
+        # events or paying 1,140 transactions: these rows exercise the same
+        # SQL predicate that protects every downstream payload stage.
+        historical_ids = [f"t_perf_{i:04d}" for i in range(1_140)]
+        with kb.write_txn(conn):
+            conn.executemany(
+                "INSERT INTO tasks (id, title, status, created_at, completed_at) "
+                "VALUES (?, ?, 'done', ?, ?)",
+                [
+                    (tid, f"historical {i}", _T0 - 30 * 24 * _HOUR,
+                     _T0 - 30 * 24 * _HOUR)
+                    for i, tid in enumerate(historical_ids)
+                ],
+            )
+
+    seen = {"list_kwargs": [], "summaries": [], "diagnostics": [], "serialized": []}
+
+    real_list = mod.kanban_db.list_tasks
+    real_summaries = mod.kanban_db.latest_summaries
+    real_diags = mod._compute_task_diagnostics
+    real_task_dict = mod._task_dict
+
+    def spy_list(conn, **kwargs):
+        seen["list_kwargs"].append(kwargs)
+        return real_list(conn, **kwargs)
+
+    def spy_summaries(conn, task_ids):
+        ids = list(task_ids)
+        seen["summaries"].append(ids)
+        return real_summaries(conn, ids)
+
+    def spy_diags(conn, task_ids=None):
+        seen["diagnostics"].append(task_ids)
+        return real_diags(conn, task_ids)
+
+    def spy_task_dict(conn, task, **kwargs):
+        seen["serialized"].append(task.id)
+        return real_task_dict(conn, task, **kwargs)
+
+    monkeypatch.setattr(mod.kanban_db, "list_tasks", spy_list)
+    monkeypatch.setattr(mod.kanban_db, "latest_summaries", spy_summaries)
+    monkeypatch.setattr(mod, "_compute_task_diagnostics", spy_diags)
+    monkeypatch.setattr(mod, "_task_dict", spy_task_dict)
+
+    assert _done_ids(client.get("/api/plugins/kanban/board")) == {visible}
+
+    # The cutoff was pushed into the fetch, not applied afterwards.
+    assert seen["list_kwargs"], "list_tasks was not called"
+    kwargs = seen["list_kwargs"][0]
+    assert kwargs.get("done_completed_after") == _T0 - _WINDOW
+
+    # Nothing downstream ever saw any of the 1,141 aged-out tasks; the
+    # recent done card and nonterminal card both continue through the path.
+    expected_visible = {visible, active}
+    hidden_ids = {hidden, *historical_ids}
+    assert seen["summaries"] and set(seen["summaries"][0]) == expected_visible
+    assert hidden_ids.isdisjoint(seen["summaries"][0])
+    assert seen["diagnostics"], "diagnostics were not scoped"
+    diag_ids = seen["diagnostics"][0]
+    assert diag_ids is not None, "diagnostics still run over every task"
+    assert set(diag_ids) == expected_visible
+    assert hidden_ids.isdisjoint(diag_ids)
+    assert set(seen["serialized"]) == expected_visible
+    assert hidden_ids.isdisjoint(seen["serialized"])
+
+
+def test_board_cache_ages_out_a_done_card_without_any_task_event(
+    board_plugin, monkeypatch
+):
+    """A cached done card must disappear on the first request after it
+    crosses the cutoff — no task event, and before the generic TTL."""
+    mod, client = board_plugin
+    clock = _freeze_board_clock(mod, monkeypatch)
+    tid = _make_done_task(title="about to age out", completed_at=_T0 - (_WINDOW - 1))
+
+    assert _done_ids(client.get("/api/plugins/kanban/board")) == {tid}
+
+    def _event_max():
+        with kb.connect() as conn:
+            return conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+            ).fetchone()["m"]
+
+    before_events = _event_max()
+    # One second later the card is exactly 48h old. The version probe is
+    # unchanged and the 30s TTL has not lapsed, so only a per-entry time
+    # boundary can evict it.
+    clock.advance(1)
+    assert mod._BOARD_CACHE_TTL_SECONDS > 1
+
+    assert _done_ids(client.get("/api/plugins/kanban/board")) == set()
+    assert _event_max() == before_events, "board read emitted a task event"
+
+
+def test_board_cache_still_serves_within_window_and_ttl(board_plugin, monkeypatch):
+    """The done boundary must not defeat the existing versioned cache: a
+    second request well inside both the window and the TTL is a cache hit."""
+    mod, client = board_plugin
+    clock = _freeze_board_clock(mod, monkeypatch)
+    tid = _make_done_task(title="fresh enough", completed_at=_T0 - _HOUR)
+
+    assert _done_ids(client.get("/api/plugins/kanban/board")) == {tid}
+
+    builds = []
+    real_build = mod._build_board_payload
+
+    def spy_build(**kwargs):
+        builds.append(kwargs)
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(mod, "_build_board_payload", spy_build)
+    clock.advance(1)
+    assert _done_ids(client.get("/api/plugins/kanban/board")) == {tid}
+    assert builds == [], "cache was needlessly invalidated"
+
+
+def test_old_done_parent_still_satisfies_dependencies_and_link_topology(
+    board_plugin, monkeypatch
+):
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    parent = _make_done_task(title="ancient parent", completed_at=_T0 - 20 * 24 * _HOUR)
+
+    # Dependency truth: a child of an already-done parent is immediately ready.
+    with kb.connect() as conn:
+        child = kb.create_task(conn, title="child of ancient", parents=[parent])
+        assert kb.get_task(conn, child).status == "ready"
+
+    columns = _columns(client.get("/api/plugins/kanban/board"))
+    assert parent not in {t["id"] for t in columns["done"]}
+    child_card = next(t for t in columns["ready"] if t["id"] == child)
+    # Link counts still describe the real graph even though the parent card
+    # is not on the board.
+    assert child_card["link_counts"] == {"parents": 1, "children": 0}
+
+    # The drawer's direct fetch still resolves both directions of the link.
+    detail = client.get(f"/api/plugins/kanban/tasks/{child}").json()
+    assert detail["links"]["parents"] == [parent]
+    parent_detail = client.get(f"/api/plugins/kanban/tasks/{parent}").json()
+    assert parent_detail["links"]["children"] == [child]
+    assert parent_detail["child_results"][0]["id"] == child
+
+
+def test_board_progress_and_link_counts_include_aged_out_children(
+    board_plugin, monkeypatch
+):
+    """A visible card's link counts and "N/M" rollup are computed from the
+    whole graph, so an aged-out done relative still counts."""
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    # grandparent completed 20 days ago -> its card ages off the board.
+    grandparent = _make_done_task(
+        title="ancient epic", completed_at=_T0 - 20 * 24 * _HOUR,
+    )
+    # parent completed an hour ago -> still on the board.
+    parent = _make_done_task(
+        title="recent parent", completed_at=_T0 - _HOUR, parents=[grandparent],
+    )
+    done_child = _make_done_task(
+        title="done child", completed_at=_T0 - 1800, parents=[parent],
+    )
+    with kb.connect() as conn:
+        open_child = kb.create_task(conn, title="open child", parents=[parent])
+        assert kb.get_task(conn, open_child).status == "ready"
+
+    columns = _columns(client.get("/api/plugins/kanban/board"))
+    done_ids = {t["id"] for t in columns["done"]}
+    assert grandparent not in done_ids
+    assert done_ids == {parent, done_child}
+
+    parent_card = next(t for t in columns["done"] if t["id"] == parent)
+    # The aged-out grandparent link is still counted.
+    assert parent_card["link_counts"] == {"parents": 1, "children": 2}
+    assert parent_card["progress"] == {"done": 1, "total": 2}
+    assert open_child in {t["id"] for t in columns["ready"]}
+
+
+def test_old_done_task_detail_and_history_remain_available(board_plugin, monkeypatch):
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    tid = _make_done_task(title="archaeology", completed_at=_T0 - 45 * 24 * _HOUR)
+
+    assert _done_ids(client.get("/api/plugins/kanban/board")) == set()
+
+    r = client.get(f"/api/plugins/kanban/tasks/{tid}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["task"]["id"] == tid
+    assert body["task"]["status"] == "done"
+    assert body["task"]["result"] == "result::archaeology"
+    assert body["task"]["latest_summary"] == "summary::archaeology"
+    assert body["events"], "event history disappeared"
+    assert any(e["kind"] == "completed" for e in body["events"])
+    assert body["runs"], "run history disappeared"
+
+
+def test_board_build_does_not_mutate_the_database(board_plugin, monkeypatch):
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    _make_done_task(title="old", completed_at=_T0 - 9 * 24 * _HOUR)
+    _make_done_task(title="new", completed_at=_T0 - _HOUR)
+
+    def _snapshot():
+        with kb.connect() as conn:
+            conn.row_factory = None
+            return {
+                "tasks": conn.execute(
+                    "SELECT * FROM tasks ORDER BY id"
+                ).fetchall(),
+                "events": conn.execute(
+                    "SELECT id, task_id, kind FROM task_events ORDER BY id"
+                ).fetchall(),
+                "runs": conn.execute(
+                    "SELECT id, task_id, status, outcome FROM task_runs ORDER BY id"
+                ).fetchall(),
+            }
+
+    before = _snapshot()
+    assert client.get("/api/plugins/kanban/board").status_code == 200
+    assert _snapshot() == before
+
+
+def test_include_archived_does_not_resurrect_aged_out_done_cards(
+    board_plugin, monkeypatch
+):
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    old_done = _make_done_task(title="old done", completed_at=_T0 - 12 * 24 * _HOUR)
+    fresh_done = _make_done_task(title="fresh done", completed_at=_T0 - 2 * _HOUR)
+    archived = _make_done_task(title="archived", completed_at=_T0 - 12 * 24 * _HOUR)
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'archived' WHERE id = ?", (archived,)
+            )
+
+    columns = _columns(client.get("/api/plugins/kanban/board?include_archived=true"))
+    assert "archived" in columns
+    assert archived in {t["id"] for t in columns["archived"]}
+    done_ids = {t["id"] for t in columns["done"]}
+    assert done_ids == {fresh_done}
+    assert old_done not in done_ids
+
+
+def test_done_window_applies_per_filter_and_per_board(board_plugin, monkeypatch):
+    mod, client = board_plugin
+    _freeze_board_clock(mod, monkeypatch)
+    fresh_acme = _make_done_task(
+        title="fresh acme", completed_at=_T0 - _HOUR, tenant="acme", assignee="alice",
+    )
+    _make_done_task(
+        title="old acme", completed_at=_T0 - 7 * 24 * _HOUR, tenant="acme",
+        assignee="alice",
+    )
+
+    # Tenant filter composes with the window rather than bypassing it.
+    assert _done_ids(client.get("/api/plugins/kanban/board?tenant=acme")) == {
+        fresh_acme
+    }
+
+    # Workflow-template and step filters compose at the same SQL boundary.
+    workflow_fresh = _make_done_task(
+        title="workflow fresh", completed_at=_T0 - _HOUR, assignee="bob",
+    )
+    workflow_old = _make_done_task(
+        title="workflow old", completed_at=_T0 - 8 * 24 * _HOUR, assignee="bob",
+    )
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.executemany(
+                "UPDATE tasks SET workflow_template_id = ?, current_step_key = ? "
+                "WHERE id = ?",
+                [("release", "verify", workflow_fresh),
+                 ("release", "verify", workflow_old)],
+            )
+    workflow_response = client.get(
+        "/api/plugins/kanban/board"
+        "?workflow_template_id=release&current_step_key=verify"
+    )
+    assert _done_ids(workflow_response) == {workflow_fresh}
+    assert "bob" in workflow_response.json()["assignees"]
+
+    # A second board gets the same treatment against its own DB.
+    kb.create_board("secondary")
+    other_fresh = _make_done_task(
+        title="other fresh", completed_at=_T0 - _HOUR, board="secondary",
+    )
+    _make_done_task(
+        title="other old", completed_at=_T0 - 8 * 24 * _HOUR, board="secondary",
+    )
+    assert _done_ids(client.get("/api/plugins/kanban/board?board=secondary")) == {
+        other_fresh
+    }
+
+
+def test_list_tasks_done_completed_after_defaults_to_no_filtering(kanban_home):
+    """The new kanban_db parameter is opt-in: existing callers are unchanged."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ancient")
+        assert kb.complete_task(conn, tid, result="ok")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET completed_at = ? WHERE id = ?",
+                (_T0 - 365 * 24 * _HOUR, tid),
+            )
+        assert tid in {t.id for t in kb.list_tasks(conn)}
+        cutoff = _T0 - _WINDOW
+        assert tid not in {
+            t.id for t in kb.list_tasks(conn, done_completed_after=cutoff)
+        }
+        # Strict boundary, checked directly at the data layer.
+        assert tid not in {
+            t.id
+            for t in kb.list_tasks(conn, done_completed_after=_T0 - 365 * 24 * _HOUR)
+        }
+        assert tid in {
+            t.id
+            for t in kb.list_tasks(
+                conn, done_completed_after=_T0 - 365 * 24 * _HOUR - 1
+            )
+        }
