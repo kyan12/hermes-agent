@@ -383,6 +383,160 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
 
 
 
+# ---------------------------------------------------------------------------
+# active_pr respawn guard — explicit requeue must not stall forever
+# ---------------------------------------------------------------------------
+
+
+_PR_BODY = "Opened https://github.com/example/repo/pull/4242 for review."
+
+
+def test_respawn_guard_active_pr_bypassed_by_explicit_unblock(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A card requeued AFTER its PR comment is a deliberate continuation.
+
+    Without this the duplicate-PR guard is a 24h no-forward-path stall: no
+    live worker holds the card, the hold was explicitly released, and every
+    dispatcher tick still answers ``active_pr``. Same-second writes are the
+    common case here — hold, release and poll land inside one second — so
+    timestamps alone cannot order the comment against the requeue.
+    """
+    now = 9_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="continue-pr", assignee="alice")
+        kb.add_comment(conn, t, author="worker", body=_PR_BODY)
+        assert kb.schedule_task(conn, t, reason="await review")
+        assert kb.unblock_task(conn, t)
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+        spawned: list[str] = []
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        assert spawned == [t]
+        assert [s[0] for s in result.spawned] == [t]
+        assert dict(result.respawn_guarded).get(t) is None
+
+
+def test_respawn_guard_active_pr_bypassed_by_manual_promotion(
+    kanban_home, monkeypatch,
+):
+    """The supported manual-promotion path is an explicit requeue too."""
+    now = 9_150_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="unfinished parent")
+        t = kb.create_task(
+            conn, title="manual-promote-pr", assignee="alice", parents=[parent],
+        )
+        kb.add_comment(conn, t, author="worker", body=_PR_BODY)
+        promoted, error = kb.promote_task(
+            conn, t, actor="operator", reason="review requested changes",
+            force=True,
+        )
+        assert promoted is True and error is None
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_holds_when_pr_comment_is_newer(
+    kanban_home, monkeypatch,
+):
+    """Duplicate-PR protection is preserved: an OLDER requeue never licenses a
+    respawn over newer PR evidence, including in the same second."""
+    now = 9_100_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="newer-pr", assignee="alice")
+        assert kb.schedule_task(conn, t, reason="temporary pause")
+        assert kb.unblock_task(conn, t)
+        kb.add_comment(conn, t, author="worker", body=_PR_BODY)
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_active_pr_holds_without_any_requeue(
+    kanban_home, monkeypatch,
+):
+    """No requeue at all — the guard still defers, unchanged."""
+    now = 9_120_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="plain-pr", assignee="alice")
+        kb.add_comment(conn, t, author="worker", body=_PR_BODY)
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_legacy_same_second_comment_keeps_pr_protection(
+    kanban_home, monkeypatch,
+):
+    """A pre-upgrade comment row with no matching audit event cannot be ordered
+    against a same-second requeue, so the guard fails closed and holds."""
+    now = 9_130_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy-pr", assignee="alice")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (t, "worker", _PR_BODY, now),
+            )
+        assert kb.schedule_task(conn, t, reason="await review")
+        assert kb.unblock_task(conn, t)
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_legacy_audit_event_orders_same_second_requeue(
+    kanban_home, monkeypatch,
+):
+    """A pre-upgrade ``commented`` audit event (author/len, no comment_id)
+    still orders the requeue for boards written before this fix."""
+    now = 9_140_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy-audit-pr", assignee="alice")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (t, "worker", _PR_BODY, now),
+            )
+            kb._append_event(
+                conn, t, "commented",
+                {"author": "worker", "len": len(_PR_BODY)},
+            )
+        assert kb.schedule_task(conn, t, reason="await review")
+        assert kb.unblock_task(conn, t)
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_still_skipped_in_review_lane(
+    kanban_home, monkeypatch,
+):
+    """The review lane's existing exemption is unchanged by the bypass."""
+    now = 9_160_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review-lane-pr", assignee="reviewer")
+        kb.add_comment(conn, t, author="worker", body=_PR_BODY)
+
+        assert kb.check_respawn_guard(conn, t, lane="review") is None
+
+
 def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
     """The guard's effective limit must follow the same resolution order
     as the circuit breaker (#35072): per-task max_retries → dispatcher

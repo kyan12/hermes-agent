@@ -4436,6 +4436,8 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    normalized_author = author.strip()
+    normalized_body = body.strip()
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -4447,10 +4449,24 @@ def add_comment(
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            (task_id, normalized_author, normalized_body, now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        # ``comment_id`` gives writes that share a one-second ``created_at`` a
+        # single ordering sequence (see
+        # ``_explicit_requeue_after_pr_comment``). ``author``/``len`` stay for
+        # existing readers, now normalized to match the stored row.
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {
+                "author": normalized_author,
+                "len": len(normalized_body),
+                "comment_id": comment_id,
+            },
+        )
+        return comment_id
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -10553,6 +10569,16 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
+# Event kinds that constitute an explicit "run it again" request: an operator
+# dragging a card back, a dependency promotion, a hold release, a reclaim.
+_RESPAWN_REQUEUE_EVENT_KINDS = (
+    "status",
+    "promoted",
+    "promoted_manual",
+    "unblocked",
+    "reclaimed",
+)
+
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
@@ -11969,6 +11995,71 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _explicit_requeue_after_pr_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pr_comment: sqlite3.Row,
+) -> bool:
+    """Return whether a deliberate requeue happened after ``pr_comment``.
+
+    Comments and events use independent AUTOINCREMENT ids, so a one-second
+    ``created_at`` cannot order them on its own — and hold/release/poll
+    routinely land in the same second. ``add_comment`` writes its ``commented``
+    audit event in the same transaction as the row, which gives both writes one
+    shared event sequence to compare against. New rows carry ``comment_id`` for
+    an exact match; the author/length fallback keeps pre-upgrade rows
+    comparable. When neither identifies the audit event the order cannot be
+    proven, so this fails closed and duplicate-PR protection is kept.
+    """
+    placeholders = ", ".join("?" for _ in _RESPAWN_REQUEUE_EVENT_KINDS)
+    requeue = conn.execute(
+        "SELECT id, created_at FROM task_events "
+        f"WHERE task_id = ? AND kind IN ({placeholders}) "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, *_RESPAWN_REQUEUE_EVENT_KINDS),
+    ).fetchone()
+    if requeue is None:
+        return False
+
+    requeue_at = int(requeue["created_at"])
+    comment_at = int(pr_comment["created_at"])
+    if requeue_at != comment_at:
+        return requeue_at > comment_at
+
+    exact_event_id: Optional[int] = None
+    fallback_event_ids: list[int] = []
+    for event in conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'commented' AND created_at = ? "
+        "ORDER BY id ASC",
+        (task_id, comment_at),
+    ).fetchall():
+        try:
+            payload = json.loads(event["payload"]) if event["payload"] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("comment_id") == int(pr_comment["id"]):
+            exact_event_id = int(event["id"])
+            break
+        author = str(payload.get("author") or "").strip()
+        if (
+            author == pr_comment["author"]
+            and payload.get("len") == len(pr_comment["body"])
+        ):
+            fallback_event_ids.append(int(event["id"]))
+
+    comment_event_id = exact_event_id
+    if comment_event_id is None and fallback_event_ids:
+        # Ambiguous historical rows: require the requeue to follow every
+        # matching audit event rather than guessing that it won.
+        comment_event_id = max(fallback_event_ids)
+    if comment_event_id is None:
+        return False
+    return int(requeue["id"]) > comment_event_id
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -12021,6 +12112,10 @@ def check_respawn_guard(
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed when an explicit re-queue event lands AFTER the newest such
+        comment — that is a deliberate continuation on the existing PR/branch,
+        and without it a card with no live worker sits unspawnable for the
+        whole 24h window. An older re-queue never bypasses newer PR evidence.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -12098,24 +12193,40 @@ def check_respawn_guard(
     ).fetchone()
     if recent_completed:
         completed_at = int(recent_completed["ended_at"] or 0)
+        requeue_placeholders = ", ".join(
+            "?" for _ in _RESPAWN_REQUEUE_EVENT_KINDS
+        )
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            f"AND kind IN ({requeue_placeholders}) "
             "LIMIT 1",
-            (task_id, completed_at),
+            (task_id, completed_at, *_RESPAWN_REQUEUE_EVENT_KINDS),
         ).fetchone()
         if not requeued_after:
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Exception: an explicit re-queue AFTER the newest such comment is a
+    #    deliberate continuation on that PR/branch. Without it the guard is a
+    #    24h no-forward-path stall — no live worker holds the card and every
+    #    tick answers ``active_pr``. Same-second writes are ordered through the
+    #    comment's own audit event, never by timestamp alone.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    newest_pr_comment = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT id, author, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? "
+        "ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            newest_pr_comment = c
+            break
+    if newest_pr_comment is not None and not _explicit_requeue_after_pr_comment(
+        conn, task_id, newest_pr_comment,
+    ):
+        return "active_pr"
 
     return None
 
