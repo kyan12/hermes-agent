@@ -27,6 +27,7 @@ import json
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -45,7 +46,7 @@ def scoped_worker(monkeypatch, tmp_path):
 
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn,
@@ -89,7 +90,7 @@ def _child_of(parent_id, **overrides):
 
 
 def _task(task_id, board=None):
-    conn = kb.connect(board=board)
+    conn = kbc.connect(board=board)
     try:
         return kb.get_task(conn, task_id)
     finally:
@@ -190,7 +191,7 @@ def test_task_bound_create_rejects_stale_run_and_executor(
     )
     assert "error" in stale and "run" in stale["error"].lower()
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         current_run = kb.get_task(conn, scoped_worker).current_run_id
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current_run))
     monkeypatch.setenv("HERMES_PROFILE", "other-worker")
@@ -214,7 +215,7 @@ def test_task_bound_create_rejects_stale_run_and_executor(
 def test_task_bound_create_rejects_cross_scope_additional_parent(
     scoped_worker, column, value
 ):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         other = kb.create_task(
             conn, title="foreign authority", assignee="test-worker",
             tenant="acme-legal-entity", session_id="sess-principal-1",
@@ -270,7 +271,7 @@ def test_worker_cannot_route_a_continuation_off_its_pinned_board(scoped_worker):
     assert "error" in out, out
     assert "board" in out["error"].lower()
 
-    conn = kb.connect(board="other")
+    conn = kbc.connect(board="other")
     try:
         assert kb.list_tasks(conn) == []
     finally:
@@ -336,7 +337,7 @@ def project_worker(monkeypatch, tmp_path):
 
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn, title="project parent", assignee="test-worker",
@@ -423,7 +424,7 @@ def test_worker_cannot_override_parent_project_or_workspace(project_worker):
 def test_non_project_parent_workspace_is_inherited_and_conflicts_rejected(scoped_worker, tmp_path):
     parent_path = tmp_path / "authoritative-workspace"
     parent_path.mkdir()
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
                          (str(parent_path), scoped_worker))

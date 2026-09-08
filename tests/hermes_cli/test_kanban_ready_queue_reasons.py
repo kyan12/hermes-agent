@@ -20,6 +20,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_health as kh
 
 
@@ -30,7 +32,7 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         yield conn
     finally:
@@ -80,7 +82,7 @@ def test_unknown_profile_is_invalid_not_a_healthy_human_lane(board, real_profile
 def test_default_assignee_census_matches_dispatch_eligibility(board, real_profiles):
     tid = kb.create_task(board, title="fallback", assignee=None)
     report = kh.ready_queue_report(board, default_assignee="alice")
-    dispatched = kb.dispatch_once(
+    dispatched = kbd.dispatch_once(
         board, dry_run=True, spawn_fn=lambda *_a, **_k: 123,
         default_assignee="alice",
     )
@@ -92,13 +94,13 @@ def test_default_assignee_census_matches_dispatch_eligibility(board, real_profil
 def test_default_assignee_does_not_make_unassigned_review_spawnable(
     board, real_profiles, monkeypatch
 ):
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
     tid = kb.create_task(board, title="unowned review", assignee=None)
     assert kb.request_review(board, tid, summary="review")
-    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
 
     report = kh.ready_queue_report(board, default_assignee="alice")
-    dispatched = kb.dispatch_once(board, dry_run=True, default_assignee="alice")
+    dispatched = kbd.dispatch_once(board, dry_run=True, default_assignee="alice")
     assert _reasons(report)[tid] == kh.READY_UNASSIGNED
     assert report.spawnable_ids == []
     assert dispatched.spawned == []
@@ -108,15 +110,15 @@ def test_default_assignee_does_not_make_unassigned_review_spawnable(
 def test_ready_report_matches_separate_lane_order_and_review_reservation(
     board, real_profiles, monkeypatch
 ):
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
     ready_high = kb.create_task(board, title="ready high", assignee="alice", priority=30)
     ready_low = kb.create_task(board, title="ready low", assignee="bob", priority=20)
     review = kb.create_task(board, title="review low", assignee="carol", priority=1)
     assert kb.request_review(board, review, summary="review")
-    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
 
     report = kh.ready_queue_report(board, max_spawn=2, memory_pressure="unknown")
-    dispatched = kb.dispatch_once(board, dry_run=True, max_spawn=2)
+    dispatched = kbd.dispatch_once(board, dry_run=True, max_spawn=2)
     expected = [item[0] for item in dispatched.spawned]
     assert expected == [ready_high, review]
     assert report.spawnable_ids == expected
@@ -181,12 +183,12 @@ def test_review_queue_uses_the_same_spawnability_census(
     tid = kb.create_task(board, title="review me", assignee="alice")
     assert kb.request_review(board, tid, summary="ready for review")
 
-    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: False)
+    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: False)
     disabled = kh.ready_queue_report(board)
     assert _reasons(disabled)[tid] == kh.READY_REVIEW_DISABLED
     assert disabled.spawnable_ids == []
 
-    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
     enabled = kh.ready_queue_report(board)
     assert _reasons(enabled)[tid] == kh.READY_SPAWNABLE
     assert enabled.spawnable_ids == [tid]
@@ -243,7 +245,7 @@ def test_max_spawn_headroom_still_spawns(board, real_profiles):
 
 
 def test_critical_memory_pressure_defers_every_card(board, real_profiles, monkeypatch):
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "critical")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "critical")
     tid = kb.create_task(board, title="would spawn", assignee="alice")
 
     report = kh.ready_queue_report(board)
@@ -255,7 +257,7 @@ def test_critical_memory_pressure_defers_every_card(board, real_profiles, monkey
 def test_elevated_memory_pressure_allows_exactly_one_worker(
     board, real_profiles, monkeypatch
 ):
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "elevated")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "elevated")
     first = kb.create_task(board, title="first", assignee="alice", priority=5)
     second = kb.create_task(board, title="second", assignee="bob")
 
@@ -285,7 +287,7 @@ def test_gateway_passes_max_spawn_into_the_ready_census(monkeypatch, board):
         raising=False,
     )
 
-    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: 4)
+    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 4)
 
     reports = kanban_watchers._ready_queue_reports_for_telemetry()
     assert reports
@@ -323,8 +325,8 @@ def test_gateway_census_uses_dispatcher_cap_parser(
         lambda: {"kanban": {"max_in_progress": raw_cap}},
         raising=False,
     )
-    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: parsed_cap)
-    monkeypatch.setattr(kb, "derive_default_max_in_progress", lambda: 3)
+    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: parsed_cap)
+    monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda: 3)
 
     assert kanban_watchers._ready_queue_reports_for_telemetry()
     assert seen["max_in_progress"] == expected
@@ -335,7 +337,7 @@ def test_configured_census_matches_dispatch_with_other_board_occupancy(
 ):
     """Production health uses the same host-global occupancy as dispatch."""
     kb.create_board("second", name="Second")
-    with kb.connect(board="second") as other:
+    with kbc.connect(board="second") as other:
         running = kb.create_task(other, title="other board busy", assignee="alice")
         assert kb.claim_task(other, running) is not None
     waiting = kb.create_task(board, title="host cap wait", assignee="bob")
@@ -344,10 +346,10 @@ def test_configured_census_matches_dispatch_with_other_board_occupancy(
     monkeypatch.setattr(kh, "_configured_max_in_progress", lambda: 1)
     monkeypatch.setattr(kh, "_configured_per_profile_cap", lambda: None)
     monkeypatch.setattr(kh, "_configured_default_assignee", lambda: None)
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
 
     report = kh.configured_ready_census(board, board="default")
-    dispatched = kb.dispatch_once(
+    dispatched = kbd.dispatch_once(
         board,
         board="default",
         dry_run=True,
@@ -359,11 +361,11 @@ def test_configured_census_matches_dispatch_with_other_board_occupancy(
 
 
 def test_max_spawn_zero_matches_dispatch_and_reports_capacity(board, real_profiles, monkeypatch):
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
     waiting = kb.create_task(board, title="dispatch disabled", assignee="alice")
 
     report = kh.ready_queue_report(board, max_spawn=0)
-    dispatched = kb.dispatch_once(
+    dispatched = kbd.dispatch_once(
         board, dry_run=True, max_spawn=0, reconcile_orphans=False
     )
 
@@ -376,7 +378,7 @@ def test_max_spawn_zero_matches_dispatch_and_reports_capacity(board, real_profil
 def test_invalid_worktree_matches_dry_run_without_writes(
     board, real_profiles, monkeypatch, tmp_path, case
 ):
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -398,7 +400,7 @@ def test_invalid_worktree_matches_dry_run_without_writes(
         workspace_path=raw_path,
     )
     report = kh.ready_queue_report(board)
-    dispatched = kb.dispatch_once(board, dry_run=True, reconcile_orphans=False)
+    dispatched = kbd.dispatch_once(board, dry_run=True, reconcile_orphans=False)
 
     assert report.spawnable_ids == [item[0] for item in dispatched.spawned] == []
     assert report.reason_for(tid) == kh.READY_INVALID_WORKSPACE
@@ -543,7 +545,7 @@ def test_stuck_alert_names_credentials_only_for_the_genuinely_stuck_card(
 def test_alert_aggregates_across_boards(board, real_profiles, tmp_path):
     kb.create_board("second", name="Second")
     kb.create_task(board, title="board one", assignee="alice")
-    conn2 = kb.connect(board="second")
+    conn2 = kbc.connect(board="second")
     try:
         other = kb.create_task(conn2, title="board two", assignee="bob")
         reports = [

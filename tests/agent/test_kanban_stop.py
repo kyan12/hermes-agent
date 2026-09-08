@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from agent.kanban_stop import (
@@ -12,9 +14,16 @@ from agent.kanban_stop import (
 
 
 @pytest.fixture
-def clear_kanban_env(monkeypatch):
-    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
+def clear_kanban_env(monkeypatch, tmp_path):
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE", "HERMES_SESSION_SOURCE"):
         monkeypatch.delenv(var, raising=False)
+    db_path = tmp_path / "kanban.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, current_run_id INTEGER)")
+        for task_id in ("t_abc", "t_46be8aa5"):
+            conn.execute("INSERT INTO tasks VALUES (?, 'running', 42)", (task_id,))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
     return monkeypatch
 
 

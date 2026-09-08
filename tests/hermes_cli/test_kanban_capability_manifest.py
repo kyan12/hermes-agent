@@ -239,7 +239,7 @@ def test_canary_fails_a_candidate_that_keeps_symbols_but_no_ops_behaviour(tmp_pa
 def test_canary_fails_when_dispatch_drops_native_reconciliation(tmp_path):
     staged = _candidate_with_replacement(
         tmp_path,
-        "hermes_cli/kanban_db.py",
+        "hermes_cli/kanban_db_dispatch.py",
         "    if not dry_run:\n        try:\n            from hermes_cli import kanban_health as _kh\n\n            _health = _kh.reconcile_board(conn)\n",
         "    if False and not dry_run:\n        try:\n            from hermes_cli import kanban_health as _kh\n\n            _health = _kh.reconcile_board(conn)\n",
     )
@@ -264,7 +264,7 @@ def test_canary_uses_running_probe_to_reject_zero_cap_drift(tmp_path):
     """The candidate cannot redefine max_spawn=0 as unlimited and self-certify."""
     staged = _candidate_with_replacement(
         tmp_path,
-        "hermes_cli/kanban_db.py",
+        "hermes_cli/kanban_db_dispatch.py",
         "    max_spawn = normalize_max_spawn(max_spawn)\n",
         "    max_spawn = None if max_spawn == 0 else normalize_max_spawn(max_spawn)\n",
     )

@@ -1,21 +1,21 @@
-"""Turn-end guard for kanban workers.
-
-Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
-(especially GLM / Qwen families) sometimes narrate the next step
-("Let me write the report now") and stop with ``finish_reason=stop`` and no
-tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
-``protocol_violation``.
-
-This module is policy-only: when a kanban worker tries to finish without a
-terminal board tool, return a bounded synthetic nudge so the conversation
-loop continues instead of exiting.
+"""Turn-end guard for kanban workers, which must end with ``kanban_complete`` or
+``kanban_block``. Some models narrate the next step and stop with no tool calls;
+Hermes treats that as a clean exit → ``rc=0`` → dispatcher ``protocol_violation``.
+Policy-only: return a bounded synthetic nudge so the loop continues instead of exiting.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import sqlite3
+from contextlib import closing
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from agent.delegation_context import is_dispatcher_owned_worker_context
+
+logger = logging.getLogger(__name__)
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
@@ -23,46 +23,56 @@ _DEFAULT_MAX_ATTEMPTS = 2
 
 
 def kanban_stop_nudge_enabled() -> bool:
-    """Return whether the kanban stop-guard is active for this process.
-
-    On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), unless
-    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
-    """
-    env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
-    if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
+    """Nudge only a verified live dispatcher run, never inherited identity."""
+    if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {"0", "false", "no", "off"}:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    if not task or not is_dispatcher_owned_worker_context():
+        return False
+    from gateway.session_context import get_session_env
+
+    if get_session_env("HERMES_SESSION_SOURCE") in {"desktop", "tui", "web"}:
+        return False
+    db_path = os.environ.get("HERMES_KANBAN_DB")
+    if not db_path:
+        return False
+    try:
+        run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or "")
+        if run_id <= 0:
+            return False
+        with closing(sqlite3.connect(
+            Path(db_path).expanduser().resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=0.1,
+        )) as conn:
+            row = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id=?", (task,)
+            ).fetchone()
+        return row == ("running", run_id)
+    except (OSError, ValueError, sqlite3.Error):
+        logger.debug("Kanban stop guard could not verify live run ownership")
+        return False
 
 
 def _tool_call_name(tc: Any) -> str:
+    """Tool name from a dict or object tool call (``function.name`` first, then ``name``)."""
     if isinstance(tc, dict):
         fn = tc.get("function")
-        if isinstance(fn, dict):
-            return str(fn.get("name") or "")
-        return str(tc.get("name") or "")
+        return str((fn.get("name") if isinstance(fn, dict) else tc.get("name")) or "")
     fn = getattr(tc, "function", None)
-    if fn is not None:
-        return str(getattr(fn, "name", "") or "")
-    return str(getattr(tc, "name", "") or "")
+    return str((getattr(fn, "name", "") if fn is not None else getattr(tc, "name", "")) or "")
 
 
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     """True if this conversation already invoked a terminal kanban tool."""
-    if not messages:
-        return False
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
+    for msg in filter(lambda m: isinstance(m, dict), messages or ()):
         role = msg.get("role")
-        if role == "assistant":
-            for tc in msg.get("tool_calls") or []:
-                if _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS:
-                    return True
-        elif role == "tool":
-            name = str(msg.get("name") or "")
-            if name in _TERMINAL_KANBAN_TOOLS:
-                return True
+        if role == "assistant" and any(
+            _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS for tc in msg.get("tool_calls") or []
+        ):
+            return True
+        if role == "tool" and str(msg.get("name") or "") in _TERMINAL_KANBAN_TOOLS:
+            return True
     return False
 
 
@@ -73,16 +83,14 @@ def build_kanban_stop_nudge(
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     task_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Return a synthetic follow-up when a kanban worker exits without a terminal tool.
-
-    Returns ``None`` when the guard should not fire (not a kanban worker,
-    already completed/blocked, or nudge budget exhausted).
-    """
-    if not kanban_stop_nudge_enabled():
-        return None
-    if attempts >= max_attempts:
-        return None
-    if session_called_kanban_terminal(messages):
+    """Synthetic follow-up when a kanban worker exits without a terminal tool; ``None`` when
+    the guard should not fire (not a kanban worker, already completed/blocked, budget exhausted)."""
+    if (
+        not kanban_stop_nudge_enabled()
+        or (task_id is not None and task_id != os.environ.get("HERMES_KANBAN_TASK"))
+        or attempts >= max_attempts
+        or session_called_kanban_terminal(messages)
+    ):
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
@@ -101,8 +109,4 @@ def build_kanban_stop_nudge(
     )
 
 
-__all__ = [
-    "build_kanban_stop_nudge",
-    "kanban_stop_nudge_enabled",
-    "session_called_kanban_terminal",
-]
+__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal"]

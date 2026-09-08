@@ -129,10 +129,11 @@ def _isolated_board():
         os.environ["HERMES_HOME"] = str(home)
 
         from hermes_cli import kanban_db as kb  # noqa: F811
+        from hermes_cli import kanban_db_connect as kbc
         from hermes_cli import kanban_health as kh
 
         try:
-            kb._INITIALIZED_PATHS.clear()
+            kbc._INITIALIZED_PATHS.clear()
         except Exception:
             pass
         # The principal allowlist is memoised per process and keyed on
@@ -141,8 +142,8 @@ def _isolated_board():
             with contextlib.suppress(Exception):
                 cached.cache_clear()
 
-        kb.init_db()
-        conn = kb.connect()
+        kbc.init_db()
+        conn = kbc.connect()
         yield conn
     finally:
         if conn is not None:
@@ -150,7 +151,7 @@ def _isolated_board():
                 conn.close()
         if kb is not None:
             with contextlib.suppress(Exception):
-                kb._INITIALIZED_PATHS.clear()
+                kbc._INITIALIZED_PATHS.clear()
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -182,6 +183,7 @@ def _evidence(action="Sign the named contract", **overrides):
 def _probe_typed_block_projection(conn) -> bool:
     """CLI, tool and dashboard serializers must all project block authority."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_health as kh
     from hermes_cli import kanban as kcli
     from plugins.kanban.dashboard import plugin_api as dashboard
@@ -199,7 +201,7 @@ def _probe_typed_block_projection(conn) -> bool:
     stale_id = kb.create_task(conn, title="stale gate", assignee="default")
     gate = kb.create_task(conn, title="current gate", assignee="default")
 
-    with kb.write_txn(conn):
+    with kbc.write_txn(conn):
         conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (legacy,))
         conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (unaffirmed,))
         kb._append_event(conn, unaffirmed, "blocked", {"reason": "untyped"})
@@ -218,7 +220,7 @@ def _probe_typed_block_projection(conn) -> bool:
         return False
     if not kh.affirm_human_gate(conn, stale_id, evidence=_evidence(action="Old ask")):
         return False
-    with kb.write_txn(conn):
+    with kbc.write_txn(conn):
         kb._append_event(conn, stale_id, "unblocked", {"by": "probe"})
         kb._append_event(conn, stale_id, "blocked", {"reason": "re-block"})
 
@@ -291,6 +293,7 @@ def _probe_typed_scheduled_hold(conn) -> bool:
 def _probe_durable_wake_reconciler(conn) -> bool:
     """A dispatcher tick must resume a due wake once and stamp its checkpoint."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
     from hermes_cli import kanban_health as kh
 
     if kh.read_checkpoint(conn, kh.CHECKPOINT_RECONCILE) is not None:
@@ -301,7 +304,7 @@ def _probe_durable_wake_reconciler(conn) -> bool:
         return False
     # max_spawn=0 keeps the resumed card in ready, making the transition easy
     # to observe without starting any worker process.
-    first = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None, max_spawn=0)
+    first = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None, max_spawn=0)
     if first.health_resumed.count(tid) != 1:
         return False
     resumed_task = kb.get_task(conn, tid)
@@ -310,17 +313,18 @@ def _probe_durable_wake_reconciler(conn) -> bool:
     checkpoint = kh.read_checkpoint(conn, kh.CHECKPOINT_RECONCILE)
     if not checkpoint or checkpoint["status"] != "ok":
         return False
-    second = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None, max_spawn=0)
+    second = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None, max_spawn=0)
     return tid not in second.health_resumed
 
 
 def _probe_legacy_hold_is_loud(conn) -> bool:
     """A prose-only scheduled card must classify as unhealthy, not healthy."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_health as kh
 
     tid = kb.create_task(conn, title="legacy hold", assignee="default")
-    with kb.write_txn(conn):
+    with kbc.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET status='scheduled', hold_kind=NULL, "
             "hold_wake_at=NULL WHERE id=?",
@@ -397,6 +401,8 @@ def _probe_board_health_report(conn) -> bool:
 def _probe_ready_queue_reason_codes(conn) -> bool:
     """Dispatcher dry-run and telemetry must agree across production gates."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
     from hermes_cli import kanban_health as kh
     from hermes_cli import profiles
 
@@ -418,17 +424,17 @@ def _probe_ready_queue_reason_codes(conn) -> bool:
 
     originals = {
         "profile_exists": profiles.profile_exists,
-        "review_dispatch_enabled": kb.review_dispatch_enabled,
-        "memory": kb._memory_pressure_level,
-        "other_boards": kb.count_running_tasks_other_boards,
-        "guard": kb.check_respawn_guard,
+        "review_dispatch_enabled": kbd.review_dispatch_enabled,
+        "memory": kbd._memory_pressure_level,
+        "other_boards": kbd.count_running_tasks_other_boards,
+        "guard": kbd.check_respawn_guard,
         "release": kb.release_stale_claims,
-        "stale": kb.detect_stale_running,
-        "crashed": kb.detect_crashed_workers,
+        "stale": kbd.detect_stale_running,
+        "crashed": kbd.detect_crashed_workers,
     }
 
     def _retire(*task_ids):
-        with kb.write_txn(conn):
+        with kbc.write_txn(conn):
             for task_id in task_ids:
                 conn.execute(
                     "UPDATE tasks SET status='done', claim_lock=NULL, "
@@ -437,13 +443,13 @@ def _probe_ready_queue_reason_codes(conn) -> bool:
                 )
 
     def _review(task_id):
-        with kb.write_txn(conn):
+        with kbc.write_txn(conn):
             conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
 
     def _parity(*, expected, report_kw=None, **dispatch_kw):
         report_kw = dict(report_kw or dispatch_kw)
         report = kh.ready_queue_report(conn, **report_kw)
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn, dry_run=True, spawn_fn=lambda *_a, **_k: None,
             reconcile_orphans=False, **dispatch_kw,
         )
@@ -454,13 +460,13 @@ def _probe_ready_queue_reason_codes(conn) -> bool:
         # Make executor and host-state decisions deterministic while retaining
         # the candidate's real dispatch/report implementations.
         profiles.profile_exists = lambda name: name in {"default", "other"}
-        kb.review_dispatch_enabled = lambda: True
-        kb._memory_pressure_level = lambda: "ok"
-        kb.count_running_tasks_other_boards = lambda _board: 0
-        kb.check_respawn_guard = lambda _conn, _tid, **_kw: None
+        kbd.review_dispatch_enabled = lambda: True
+        kbd._memory_pressure_level = lambda: "ok"
+        kbd.count_running_tasks_other_boards = lambda _board: 0
+        kbd.check_respawn_guard = lambda _conn, _tid, **_kw: None
         kb.release_stale_claims = lambda _conn: []
-        kb.detect_stale_running = lambda _conn, **_kw: []
-        kb.detect_crashed_workers = lambda _conn: []
+        kbd.detect_stale_running = lambda _conn, **_kw: []
+        kbd.detect_crashed_workers = lambda _conn: []
 
         # default_assignee applies to ready only; review remains unassigned.
         ready_default = kb.create_task(conn, title="ready default", assignee=None)
@@ -493,7 +499,7 @@ def _probe_ready_queue_reason_codes(conn) -> bool:
         )
         guarded = kb.create_task(conn, title="active PR", assignee="default", priority=20)
         eligible = kb.create_task(conn, title="eligible", assignee="default", priority=10)
-        kb.check_respawn_guard = (
+        kbd.check_respawn_guard = (
             lambda _conn, tid, **_kw: "active_pr" if tid == guarded else None
         )
         ok, report = _parity(expected={eligible}, max_spawn=8)
@@ -504,7 +510,7 @@ def _probe_ready_queue_reason_codes(conn) -> bool:
         ):
             return False
         _retire(broken, guarded, eligible)
-        kb.check_respawn_guard = lambda _conn, _tid, **_kw: None
+        kbd.check_respawn_guard = lambda _conn, _tid, **_kw: None
 
         # max_spawn=0 is an explicit dispatch-off cap, not "unlimited".
         zero_wait = kb.create_task(conn, title="dispatch disabled", assignee="default")
@@ -522,7 +528,7 @@ def _probe_ready_queue_reason_codes(conn) -> bool:
             return False
         _retire(running, waiting)
 
-        kb.count_running_tasks_other_boards = lambda _board: 1
+        kbd.count_running_tasks_other_boards = lambda _board: 1
         global_wait = kb.create_task(conn, title="global wait", assignee="default")
         ok, report = _parity(
             expected=set(), max_in_progress=1,
@@ -534,7 +540,7 @@ def _probe_ready_queue_reason_codes(conn) -> bool:
         if not ok or report.reason_for(global_wait) != kh.READY_CAPACITY_GLOBAL:
             return False
         _retire(global_wait)
-        kb.count_running_tasks_other_boards = lambda _board: 0
+        kbd.count_running_tasks_other_boards = lambda _board: 0
 
         running = kb.create_task(conn, title="profile running", assignee="default")
         kb.claim_task(conn, running)
@@ -549,24 +555,24 @@ def _probe_ready_queue_reason_codes(conn) -> bool:
         # Dynamic memory pressure is part of the real dispatch decision too.
         first = kb.create_task(conn, title="pressure first", assignee="default", priority=2)
         second = kb.create_task(conn, title="pressure second", assignee="other", priority=1)
-        kb._memory_pressure_level = lambda: "critical"
+        kbd._memory_pressure_level = lambda: "critical"
         ok, report = _parity(expected=set())
         if not ok or report.reason_for(first) != kh.READY_MEMORY_PRESSURE_CRITICAL:
             return False
-        kb._memory_pressure_level = lambda: "elevated"
+        kbd._memory_pressure_level = lambda: "elevated"
         ok, report = _parity(expected={first})
         return bool(
             ok and report.reason_for(second) == kh.READY_MEMORY_PRESSURE_ELEVATED
         )
     finally:
         profiles.profile_exists = originals["profile_exists"]
-        kb.review_dispatch_enabled = originals["review_dispatch_enabled"]
-        kb._memory_pressure_level = originals["memory"]
-        kb.count_running_tasks_other_boards = originals["other_boards"]
-        kb.check_respawn_guard = originals["guard"]
+        kbd.review_dispatch_enabled = originals["review_dispatch_enabled"]
+        kbd._memory_pressure_level = originals["memory"]
+        kbd.count_running_tasks_other_boards = originals["other_boards"]
+        kbd.check_respawn_guard = originals["guard"]
         kb.release_stale_claims = originals["release"]
-        kb.detect_stale_running = originals["stale"]
-        kb.detect_crashed_workers = originals["crashed"]
+        kbd.detect_stale_running = originals["stale"]
+        kbd.detect_crashed_workers = originals["crashed"]
 
 
 def _probe_dispatcher_stuck_is_gated(conn) -> bool:
@@ -604,6 +610,9 @@ def _probe_continuation_scope_inheritance(conn) -> bool:
     import json as _json
 
     from hermes_cli import kanban_db as kb
+
+    from hermes_cli import kanban_db_connect as kbc
+
     from tools import kanban_tools as kt
 
     repo = Path(os.environ["HOME"]) / "probe-repo"
@@ -618,7 +627,7 @@ def _probe_continuation_scope_inheritance(conn) -> bool:
     )
     parent_workspace = repo / ".worktrees" / parent
     parent_workspace.mkdir()
-    with kb.write_txn(conn):
+    with kbc.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET project_id=?, workspace_kind='worktree', "
             "workspace_path=?, branch_name=? WHERE id=?",
@@ -685,7 +694,7 @@ def _probe_continuation_scope_inheritance(conn) -> bool:
 
         result = _json.loads(kt._handle_create(create_args))
 
-        with kb.write_txn(conn):
+        with kbc.write_txn(conn):
             conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (parent,))
             conn.execute(
                 "UPDATE task_runs SET claim_expires=0 WHERE id=?",
@@ -693,7 +702,7 @@ def _probe_continuation_scope_inheritance(conn) -> bool:
             )
         if "error" not in _json.loads(kt._handle_create(create_args)):
             return False
-        with kb.write_txn(conn):
+        with kbc.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET claim_expires=? WHERE id=?",
                 (parent_task.claim_expires, parent),
@@ -703,7 +712,7 @@ def _probe_continuation_scope_inheritance(conn) -> bool:
                 (parent_task.claim_expires, parent_task.current_run_id),
             )
 
-        with kb.write_txn(conn):
+        with kbc.write_txn(conn):
             conn.execute(
                 "UPDATE task_runs SET status='done', ended_at=strftime('%s','now') "
                 "WHERE id=?",

@@ -206,6 +206,7 @@ def run_sentinel(
     ``apply=False`` is a full dry run: identical analysis, zero writes.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     ts = int(now if now is not None else time.time())
     report = SentinelReport(generated_at=ts)
@@ -235,7 +236,7 @@ def run_sentinel(
         conn = None
         try:
             if apply:
-                conn = kb.connect(board=slug)
+                conn = kbc.connect(board=slug)
             else:
                 # Dry-run is observation, never implicit initialization or
                 # migration.  SQLite mode=ro fails closed for absent boards.
@@ -299,7 +300,7 @@ def run_sentinel(
                     # Serialize with dispatch_once(), whose native reconciler
                     # owns this same board-scoped lock. A losing sentinel skips
                     # this sweep instead of becoming a second writer.
-                    with kb._dispatch_tick_lock(kb.kanban_db_path(slug)) as held:
+                    with kbc._dispatch_tick_lock(kb.kanban_db_path(slug)) as held:
                         if held:
                             _reconcile_if_still_down()
                         else:
@@ -387,18 +388,19 @@ def _maybe_emit(report: SentinelReport, now: int, *, apply: bool) -> bool:
     fingerprint = _fingerprint(
         {"title": action["title"], "evidence": action["evidence"]}
     )
-    # A dry run must be observationally pure. ``kb.connect()`` initializes and
+    # A dry run must be observationally pure. ``kbc.connect()`` initializes and
     # migrates a board, and the dedupe table below is itself durable state, so
     # even opening it would violate ``--dry-run``. Report that this action
     # would be newly emitted without claiming the dedupe interval.
     if not apply:
         return True
 
-    from hermes_cli import kanban_db as kb
 
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
     try:
-        with kb.write_txn(conn):
+        with kbc.write_txn(conn):
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS sentinel_alert_dedupe ("
                 "fingerprint TEXT PRIMARY KEY, last_emitted_at INTEGER NOT NULL, "

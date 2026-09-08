@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_health as kh
 from hermes_cli import kanban_sentinel as ks
 
@@ -32,7 +33,7 @@ def home(tmp_path, monkeypatch):
 
 
 def _due_wake(board_slug, *, now):
-    conn = kb.connect(board=board_slug)
+    conn = kbc.connect(board=board_slug)
     try:
         tid = kb.create_task(conn, title="due wake", assignee="alice")
         kh.set_hold(conn, tid, kind="wake", wake_at=now - 60, apply=True)
@@ -42,7 +43,7 @@ def _due_wake(board_slug, *, now):
 
 
 def _stale_controller(board_slug, *, now):
-    conn = kb.connect(board=board_slug)
+    conn = kbc.connect(board=board_slug)
     try:
         kh.record_checkpoint(
             conn,
@@ -55,7 +56,7 @@ def _stale_controller(board_slug, *, now):
 
 
 def _fresh_controller(board_slug, *, now):
-    conn = kb.connect(board=board_slug)
+    conn = kbc.connect(board=board_slug)
     try:
         kh.record_checkpoint(conn, kh.CHECKPOINT_RECONCILE, status="ok", now=now)
     finally:
@@ -92,7 +93,7 @@ def test_sentinel_does_not_race_a_live_controller(home):
     report = ks.run_sentinel(now=now, apply=True)
     assert report.repairs == []
     assert ks.REASON_CONTROLLER_ACTIVE in {b["reason_code"] for b in report.boards}
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, tid).status == "scheduled"
     finally:
@@ -130,7 +131,7 @@ def test_controller_start_between_read_and_lock_makes_sentinel_stand_down(
     report = ks.run_sentinel(now=now, apply=True)
     assert report.repairs == []
     assert report.boards[0]["reason_code"] == ks.REASON_CONTROLLER_ACTIVE
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, tid).status == "scheduled"
     finally:
@@ -144,7 +145,7 @@ def test_sentinel_repairs_a_due_typed_wake_when_the_controller_is_down(home):
 
     report = ks.run_sentinel(now=now, apply=True)
     assert tid in {r["task_id"] for r in report.repairs}
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, tid).status == "ready"
     finally:
@@ -153,7 +154,7 @@ def test_sentinel_repairs_a_due_typed_wake_when_the_controller_is_down(home):
 
 def test_sentinel_never_resumes_a_legacy_untyped_hold(home):
     now = int(time.time())
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="legacy", assignee="alice")
         kb.schedule_task(conn, tid, reason="waiting on something")
@@ -163,7 +164,7 @@ def test_sentinel_never_resumes_a_legacy_untyped_hold(home):
 
     report = ks.run_sentinel(now=now, apply=True)
     assert tid not in {r["task_id"] for r in report.repairs}
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, tid).status == "scheduled"
     finally:
@@ -173,7 +174,7 @@ def test_sentinel_never_resumes_a_legacy_untyped_hold(home):
 
 def test_sentinel_emits_exactly_one_atomic_action_for_many_bad_cards(home):
     now = int(time.time())
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         for i in range(4):
             tid = kb.create_task(conn, title=f"legacy {i}", assignee="alice")
@@ -191,7 +192,7 @@ def test_sentinel_emits_exactly_one_atomic_action_for_many_bad_cards(home):
 
 def test_sentinel_dedupes_repeated_identical_alerts(home):
     now = int(time.time())
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="legacy", assignee="alice")
         kb.schedule_task(conn, tid, reason="prose only")
@@ -215,7 +216,7 @@ def test_healthy_board_produces_no_action_and_no_repair(home, monkeypatch):
     monkeypatch.setattr(
         kh, "control_plane_assignees", lambda: frozenset({"alice"})
     )
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         kb.create_task(conn, title="ordinary ready card", assignee="alice")
     finally:
@@ -236,7 +237,7 @@ def test_dry_run_makes_no_state_change(home):
     report = ks.run_sentinel(now=now, apply=False)
     assert tid in {r["task_id"] for r in report.would_repair}
     assert report.repairs == []
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, tid).status == "scheduled"
     finally:
@@ -253,7 +254,7 @@ def test_dry_run_alert_dedupe_never_opens_or_initializes_a_board(home, monkeypat
         },
     )
     monkeypatch.setattr(
-        kb,
+        kbc,
         "connect",
         lambda *_a, **_k: pytest.fail("dry-run opened a mutable board connection"),
     )
@@ -349,7 +350,7 @@ def test_dry_run_read_only_does_not_create_or_modify_board_files(tmp_path, monke
 def test_controller_failure_pages_once_even_on_empty_healthy_board(home, checkpoint):
     now = int(time.time())
     if checkpoint is not None:
-        with kb.connect() as conn:
+        with kbc.connect() as conn:
             kh.record_checkpoint(
                 conn, kh.CHECKPOINT_RECONCILE,
                 status="failed" if checkpoint == "failed" else "ok",

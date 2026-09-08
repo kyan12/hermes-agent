@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_health as kh
 from hermes_cli import kanban_sentinel as ks
 
@@ -21,7 +23,7 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         yield conn
     finally:
@@ -259,7 +261,7 @@ def test_dead_running_row_has_no_forward_path(board, monkeypatch):
 def test_dispatch_result_carries_complete_reconciliation_report(board, monkeypatch, all_assignees_spawnable):
     expected = kh.ReconcileReport(errors=[{"task_id": None, "error": "boom"}])
     monkeypatch.setattr(kh, "reconcile_board", lambda conn: expected)
-    result = kb.dispatch_once(board, spawn_fn=lambda *a, **k: 1)
+    result = kbd.dispatch_once(board, spawn_fn=lambda *a, **k: 1)
     assert result.health_reconciliation == expected.to_dict()
     assert result.health_reconciliation["errors"] == [{"task_id": None, "error": "boom"}]
 

@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -44,7 +45,8 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
     dashboards) don't need a side query to filter by chat session."""
     from hermes_cli import kanban_db as kb
-    with kb.connect() as conn:
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect() as conn:
         kb.create_task(
             conn, title="acp task", assignee="alice", session_id="acp-x"
         )
@@ -60,7 +62,7 @@ def test_kanban_list_json_includes_session_id(kanban_home):
 def test_list_blocked_json_projects_only_current_affirmed_gates(kanban_home, monkeypatch):
     from hermes_cli import kanban_health as kh
     monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "kevin")
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         legacy = kb.create_task(conn, title="legacy", assignee="alice")
         stale = kb.create_task(conn, title="stale", assignee="alice")
         current = kb.create_task(conn, title="current", assignee="alice")
@@ -80,7 +82,7 @@ def test_list_blocked_json_projects_only_current_affirmed_gates(kanban_home, mon
 
 
 def test_show_projects_unaffirmed_block_without_mutating_row(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="machine hold", assignee="alice")
         assert kb.block_task(conn, tid, reason="retry internally", kind="transient")
 
@@ -88,7 +90,7 @@ def test_show_projects_unaffirmed_block_without_mutating_row(kanban_home):
     assert payload["status"] == "triage"
     assert payload["block_projection"]["visible"] is False
     assert "status:    triage" in kc.run_slash(f"show {tid}")
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, tid).status == "triage"
 
 
@@ -100,7 +102,7 @@ def test_create_json_projects_unaffirmed_initial_block(kanban_home):
     assert payload["status"] == "triage"
     assert payload["block_projection"]["visible"] is False
     assert payload["block_projection"]["reason_code"] == "untyped_block"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, payload["id"]).status == "blocked"
 
 
@@ -112,7 +114,7 @@ def test_create_text_projects_unaffirmed_initial_block(kanban_home):
 
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")
         child_id = kb.create_task(conn, title="child task")
         kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
@@ -161,9 +163,9 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 
     assert failures == []
 
-    with kb.connect_closing(board="alpha") as conn:
+    with kbc.connect_closing(board="alpha") as conn:
         alpha_titles = [row.title for row in kb.list_tasks(conn, limit=100)]
-    with kb.connect_closing(board="beta") as conn:
+    with kbc.connect_closing(board="beta") as conn:
         beta_titles = [row.title for row in kb.list_tasks(conn, limit=100)]
 
     assert alpha_titles == ["alpha-task"]
@@ -188,6 +190,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import time
     import secrets
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
     m = re.search(r"(t_[a-f0-9]+)", out1)
@@ -195,7 +198,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     tid = m.group(1)
 
     # Simulate a running claim outside TTL.
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         lock = secrets.token_hex(4)
         conn.execute(

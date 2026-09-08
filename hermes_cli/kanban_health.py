@@ -474,11 +474,12 @@ def set_gate_evidence(conn, task_id: str, *, evidence: Any) -> bool:
     honest: there is no path by which prose reaches ``gate_evidence``.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     parsed = parse_evidence(evidence)
     if parsed is None:
         return False
-    with kb.write_txn(conn):
+    with kbc.write_txn(conn):
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -528,6 +529,7 @@ def affirm_human_gate(
     expose a prose-only blocker.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     parsed = parse_evidence(evidence)
     if parsed is None or kind not in HUMAN_GATE_BLOCK_KINDS:
@@ -536,7 +538,7 @@ def affirm_human_gate(
     if parsed.affirmed_at > now + 60 or now - parsed.affirmed_at > 15 * 60:
         return False
 
-    with kb.write_txn(conn):
+    with kbc.write_txn(conn):
         row = conn.execute(
             "SELECT status, block_kind, block_recurrences, current_run_id "
             "FROM tasks WHERE id=?",
@@ -667,6 +669,7 @@ def set_hold(
     without changing its status.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     if kind not in VALID_HOLD_KINDS:
         raise ValueError(
@@ -684,7 +687,7 @@ def set_hold(
 
     # Status, typed fields, closing run, and both audit events are one commit.
     # A crash or constraint failure cannot leave a scheduled-but-untyped row.
-    with kb.write_txn(conn):
+    with kbc.write_txn(conn):
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -765,9 +768,9 @@ def set_hold(
 
 def clear_hold(conn, task_id: str) -> None:
     """Drop the typed-hold classification once a card has resumed."""
-    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
-    with kb.write_txn(conn):
+    with kbc.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET hold_kind = NULL, hold_wake_at = NULL WHERE id = ?",
             (task_id,),
@@ -788,10 +791,10 @@ def record_checkpoint(
     detail: Optional[str] = None,
 ) -> None:
     """Stamp a durable control-loop checkpoint."""
-    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     ts = int(now if now is not None else time.time())
-    with kb.write_txn(conn):
+    with kbc.write_txn(conn):
         conn.execute(
             "INSERT INTO board_health_checkpoints (name, status, updated_at, detail) "
             "VALUES (?, ?, ?, ?) "
@@ -1308,14 +1311,14 @@ def forward_path(
     status = task.status
 
     if status == "running":
-        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_dispatch as kbd
         live = bool(
             task.current_run_id
             and task.claim_lock
             and task.claim_expires
             and int(task.claim_expires) > now
             and task.worker_pid
-            and kb._pid_alive(task.worker_pid)
+            and kbd._pid_alive(task.worker_pid)
         )
         return ForwardPath(
             task.id, PATH_LIVE_WORKER if live else PATH_NONE, live,
@@ -1463,6 +1466,7 @@ def reconcile_board(
     signal would erase the very evidence that the controller is down.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     ts = int(now if now is not None else time.time())
     report = ReconcileReport(applied=apply)
@@ -1531,7 +1535,7 @@ def reconcile_board(
         try:
             # Re-read and classify under the same BEGIN IMMEDIATE transaction
             # that performs the guarded transition and audit write.
-            with kb.write_txn(conn):
+            with kbc.write_txn(conn):
                 current = kb.get_task(conn, task.id)
                 if current is None or current.status != "scheduled":
                     report.parked.append({**entry, "reason_code": "already_resumed"})
@@ -1695,9 +1699,9 @@ def workspace_precondition_error(task, *, board: Optional[str] = None) -> Option
     directory, so telemetry can name an invalid workspace instead of waiting
     for the spawn to fail and be misreported as a credential problem.
     """
-    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_workspace as kbw
 
-    return kb.workspace_precondition_error(task, board=board)
+    return kbw.workspace_precondition_error(task, board=board)
 
 
 def ready_queue_report(
@@ -1728,18 +1732,19 @@ def ready_queue_report(
     paged about a dispatcher that was doing exactly what it was told.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     report = ReadyQueueReport(board=board)
-    max_spawn = kb.normalize_max_spawn(max_spawn)
+    max_spawn = kbd.normalize_max_spawn(max_spawn)
 
-    running = kb.count_running_tasks(conn)
+    running = kbd.count_running_tasks(conn)
     if max_spawn is not None and running >= max_spawn:
         report.at_spawn_cap = True
 
     host_running = running
     if include_other_boards:
         try:
-            host_running += kb.count_running_tasks_other_boards(board)
+            host_running += kbd.count_running_tasks_other_boards(board)
         except Exception:
             pass
     if (
@@ -1761,7 +1766,7 @@ def ready_queue_report(
 
     if memory_pressure is None:
         try:
-            memory_pressure = kb._memory_pressure_level()
+            memory_pressure = kbd._memory_pressure_level()
         except Exception:
             memory_pressure = "unknown"
     if memory_pressure in ("critical", "elevated"):
@@ -1799,7 +1804,7 @@ def ready_queue_report(
 
     review_enabled = True
     try:
-        review_enabled = bool(kb.review_dispatch_enabled())
+        review_enabled = bool(kbd.review_dispatch_enabled())
     except Exception:
         review_enabled = True
 
@@ -1918,10 +1923,10 @@ def ready_queue_report(
                 continue
 
         try:
-            guard = kb.check_respawn_guard(conn, task.id, lane=lane)
+            guard = kbd.check_respawn_guard(conn, task.id, lane=lane)
         except TypeError:
             try:
-                guard = kb.check_respawn_guard(conn, task.id)
+                guard = kbd.check_respawn_guard(conn, task.id)
             except Exception:
                 guard = None
         except Exception:
@@ -2178,20 +2183,20 @@ def _current_board_safe() -> Optional[str]:
 
 def _configured_max_spawn() -> Optional[int]:
     try:
-        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_dispatch as kbd
         from hermes_cli.config import load_config
 
         value = (load_config() or {}).get("kanban", {}).get("max_spawn")
-        return kb.normalize_max_spawn(value)
+        return kbd.normalize_max_spawn(value)
     except Exception:
         return None
 
 
 def _configured_max_in_progress() -> Optional[int]:
     try:
-        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_dispatch as kbd
 
-        return kb.configured_max_in_progress()
+        return kbd.configured_max_in_progress()
     except Exception:
         return None
 

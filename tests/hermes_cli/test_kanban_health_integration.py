@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_health as kh
 
 
@@ -28,7 +30,7 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         yield conn
     finally:
@@ -44,7 +46,7 @@ def test_dispatch_tick_stamps_the_durable_wake_checkpoint(board, all_assignees_s
     """Without this the wake subsystem can never report healthy on a live
     board — the checkpoint IS the proof that something is running."""
     assert kh.read_checkpoint(board, kh.CHECKPOINT_RECONCILE) is None
-    kb.dispatch_once(board, spawn_fn=lambda *a, **k: 4321)
+    kbd.dispatch_once(board, spawn_fn=lambda *a, **k: 4321)
     checkpoint = kh.read_checkpoint(board, kh.CHECKPOINT_RECONCILE)
     assert checkpoint is not None
     assert checkpoint["status"] == "ok"
@@ -56,7 +58,7 @@ def test_dispatch_tick_resumes_a_due_typed_wake_and_reports_it(
     tid = kb.create_task(board, title="due wake", assignee="alice")
     kh.set_hold(board, tid, kind="wake", wake_at=int(time.time()) - 60, apply=True)
 
-    result = kb.dispatch_once(board, spawn_fn=lambda *a, **k: 4321)
+    result = kbd.dispatch_once(board, spawn_fn=lambda *a, **k: 4321)
     assert tid in result.health_resumed
     assert kb.get_task(board, tid).status in ("ready", "running")
 
@@ -67,7 +69,7 @@ def test_dispatch_tick_reports_holds_it_refused_to_resume(
     tid = kb.create_task(board, title="legacy hold", assignee="alice")
     kb.schedule_task(board, tid, reason="prose only")
 
-    result = kb.dispatch_once(board, spawn_fn=lambda *a, **k: 4321)
+    result = kbd.dispatch_once(board, spawn_fn=lambda *a, **k: 4321)
     assert tid in result.health_needs_attention
     assert tid not in result.health_resumed
     assert kb.get_task(board, tid).status == "scheduled"
@@ -86,7 +88,7 @@ def test_a_hold_that_comes_due_is_spawned_in_the_same_tick(
         spawned.append(task.id)
         return 4321
 
-    kb.dispatch_once(board, spawn_fn=_spawn)
+    kbd.dispatch_once(board, spawn_fn=_spawn)
     assert tid in spawned
 
 
@@ -94,7 +96,7 @@ def test_intentional_parks_survive_a_dispatcher_tick(board, all_assignees_spawna
     tid = kb.create_task(board, title="waiting on counsel", assignee="alice")
     kh.set_hold(board, tid, kind="external", apply=True)
 
-    kb.dispatch_once(board, spawn_fn=lambda *a, **k: 4321)
+    kbd.dispatch_once(board, spawn_fn=lambda *a, **k: 4321)
     assert kb.get_task(board, tid).status == "scheduled"
     assert kb.get_task(board, tid).hold_kind == "external"
 
@@ -103,7 +105,7 @@ def test_dry_run_tick_does_not_reconcile(board, all_assignees_spawnable):
     tid = kb.create_task(board, title="due wake", assignee="alice")
     kh.set_hold(board, tid, kind="wake", wake_at=int(time.time()) - 60, apply=True)
 
-    kb.dispatch_once(board, spawn_fn=lambda *a, **k: 4321, dry_run=True)
+    kbd.dispatch_once(board, spawn_fn=lambda *a, **k: 4321, dry_run=True)
     assert kb.get_task(board, tid).status == "scheduled"
 
 
@@ -116,7 +118,7 @@ def test_reconciler_can_be_switched_off_without_breaking_dispatch(
     ordinary = kb.create_task(board, title="ordinary", assignee="alice")
 
     spawned = []
-    kb.dispatch_once(
+    kbd.dispatch_once(
         board, spawn_fn=lambda t, w, *a, **k: (spawned.append(t.id), 4321)[1]
     )
     # Dispatch still works …
