@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from agent.kanban_stop import (
@@ -11,11 +13,45 @@ from agent.kanban_stop import (
 )
 
 
+# The guard reads live board rows, so these tests need a board rather than a
+# bare env var: two tasks, each claimed under its own run, exactly as the
+# dispatcher would leave them mid-flight.
+RUNS = {"t_abc": 41, "t_46be8aa5": 42}
+
+
 @pytest.fixture
-def clear_kanban_env(monkeypatch):
-    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
+def clear_kanban_env(monkeypatch, tmp_path):
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE", "HERMES_SESSION_SOURCE"):
         monkeypatch.delenv(var, raising=False)
+    db = tmp_path / "board.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT, status TEXT, current_run_id INTEGER, "
+            "claim_lock TEXT, claim_expires INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE task_runs (id INTEGER, task_id TEXT, status TEXT, "
+            "claim_lock TEXT, claim_expires INTEGER, ended_at INTEGER)"
+        )
+        for task, run in RUNS.items():
+            conn.execute(
+                "INSERT INTO tasks VALUES (?, 'running', ?, 'test-claim', 4102444800)",
+                (task, run),
+            )
+            conn.execute(
+                "INSERT INTO task_runs VALUES (?, ?, 'running', 'test-claim', 4102444800, NULL)",
+                (run, task),
+            )
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "test-claim")
     return monkeypatch
+
+
+def become_worker(monkeypatch, task):
+    """Take on the live board identity of ``task``, as the dispatcher would."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(RUNS[task]))
 
 
 
@@ -23,14 +59,14 @@ def clear_kanban_env(monkeypatch):
 
 
 def test_env_can_disable(clear_kanban_env):
-    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    become_worker(clear_kanban_env, "t_abc")
     clear_kanban_env.setenv("HERMES_KANBAN_STOP_NUDGE", "0")
     assert kanban_stop_nudge_enabled() is False
     assert build_kanban_stop_nudge(messages=[]) is None
 
 
 def test_nudge_when_no_terminal_tool(clear_kanban_env):
-    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_46be8aa5")
+    become_worker(clear_kanban_env, "t_46be8aa5")
     messages = [
         {"role": "user", "content": "work kanban task"},
         {
@@ -55,7 +91,7 @@ def test_nudge_when_no_terminal_tool(clear_kanban_env):
 
 
 def test_no_nudge_after_kanban_complete(clear_kanban_env):
-    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    become_worker(clear_kanban_env, "t_abc")
     messages = [
         {
             "role": "assistant",

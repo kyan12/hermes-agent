@@ -254,6 +254,44 @@ def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     assert env["NODE_ENV"] == "production"
 
 
+def test_launch_tui_child_cannot_inherit_worker_authority(monkeypatch, main_mod):
+    inherited = {
+        "HERMES_KANBAN_TASK": "t_finished",
+        "HERMES_KANBAN_RUN_ID": "2495",
+        "HERMES_KANBAN_DB": "/tmp/worker-board.db",
+        "HERMES_KANBAN_BOARD": "worker-board",
+        "HERMES_KANBAN_WORKSPACE": "/tmp/worker-worktree",
+        "HERMES_KANBAN_CLAIM_LOCK": "worker-lock",
+        "HERMES_SESSION_SOURCE": "kanban",
+        "HERMES_DELEGATED_CHILD_CONTEXT": "1",
+        "TERMINAL_CWD": "/tmp/worker-worktree",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_HOME", "/tmp/explicit-profile")
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    captured = {}
+
+    def fake_call(argv, cwd=None, env=None):
+        captured.update(env)
+        return 1
+
+    monkeypatch.setattr(main_mod.subprocess, "call", fake_call)
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert not any(key.startswith("HERMES_KANBAN_") for key in captured)
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" not in captured
+    assert "HERMES_SESSION_SOURCE" not in captured
+    assert "TERMINAL_CWD" not in captured
+    assert captured["HERMES_HOME"] == "/tmp/explicit-profile"
+    # The launching worker's own process identity is untouched.
+    assert os.environ["HERMES_KANBAN_TASK"] == "t_finished"
+
 
 
 def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path):

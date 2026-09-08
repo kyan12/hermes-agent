@@ -149,6 +149,69 @@ function buildDesktopBackendEnv({
   }
 }
 
+/**
+ * Kanban worker identity the dispatcher injects into a worker's environment.
+ * Mirrors KANBAN_ENV_KEYS in agent/delegation_context.py plus the
+ * ``HERMES_KANBAN_`` prefix rule in tui_gateway/interactive_env.py; the
+ * Electron main process cannot import either.
+ */
+const DELEGATED_CHILD_ENV_MARKER = 'HERMES_DELEGATED_CHILD_CONTEXT'
+const KANBAN_ENV_PREFIX = 'HERMES_KANBAN_'
+
+/**
+ * Return a copy of `env` with any inherited Kanban worker identity removed.
+ *
+ * The desktop spawns its backend with `...process.env`. When the app itself was
+ * launched from a worker's shell — a worker that ran `hermes desktop`, or a
+ * user who opened the app from that terminal — the spread hands a finished
+ * worker's task and run to a human-facing backend, which then answers ordinary
+ * chat with the worker stop protocol and creates cards as that dead worker.
+ *
+ * Only the CHILD env is scrubbed: `process.env` in the Electron parent is left
+ * exactly as it was, so nothing about the launching worker's own lifecycle
+ * changes. The Python entrypoints scrub again on their side
+ * (tui_gateway/interactive_env.py) — this is the same rule applied one process
+ * earlier, so stdio MCP servers and terminal sessions started by the backend
+ * never see the stale identity either.
+ *
+ * Deliberately preserved:
+ *   - HERMES_HOME / profile pins — the desktop's own explicit choice.
+ *   - TERMINAL_CWD, unless it is precisely the worker's workspace.
+ *   - A standalone board selection (HERMES_KANBAN_DB / _BOARD with no task):
+ *     an operator pinning a board is not an inherited worker.
+ */
+function withoutInheritedWorkerIdentity(env: any = process.env) {
+  const next = { ...(env || {}) }
+
+  // The delegate_task lineage marker travels WITHOUT the task vars —
+  // scrub_kanban_env() strips those and stamps this instead — so it has to be
+  // dropped on its own, or the backend spends its life failing board writes
+  // closed as somebody else's child.
+  delete next[DELEGATED_CHILD_ENV_MARKER]
+
+  if (!next[`${KANBAN_ENV_PREFIX}TASK`]) {
+    return next
+  }
+
+  const workspace = next[`${KANBAN_ENV_PREFIX}WORKSPACE`]
+
+  for (const key of Object.keys(next)) {
+    if (key.startsWith(KANBAN_ENV_PREFIX)) {
+      delete next[key]
+    }
+  }
+
+  if (next.HERMES_SESSION_SOURCE === 'kanban') {
+    delete next.HERMES_SESSION_SOURCE
+  }
+
+  if (workspace && next.TERMINAL_CWD === workspace) {
+    delete next.TERMINAL_CWD
+  }
+
+  return next
+}
+
 export {
   appendUniquePathEntries,
   buildDesktopBackendEnv,
@@ -157,5 +220,6 @@ export {
   hermesManagedNodePathEntries,
   normalizeHermesHomeRoot,
   pathEnvKey,
-  POSIX_SANE_PATH_ENTRIES
+  POSIX_SANE_PATH_ENTRIES,
+  withoutInheritedWorkerIdentity
 }

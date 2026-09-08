@@ -19804,6 +19804,9 @@ def start_server(
     background MCP discovery thread until the ready sentinel has been written,
     so its SDK import cannot hold the GIL against the pre-bind import path.
     """
+    from tui_gateway.interactive_env import clear_inherited_worker_identity
+
+    clear_inherited_worker_identity()
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
 

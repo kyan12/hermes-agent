@@ -712,6 +712,25 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def board_db_path(board: Optional[str] = None) -> Path:
+    """Return where ``board``'s ``kanban.db`` lives, ignoring the path pin.
+
+    Same layout rule as :func:`kanban_db_path` minus the ``HERMES_KANBAN_DB``
+    override, so a caller can ask *where a named board's DB must be* rather
+    than *which DB this process was pinned to*. Ownership checks need that
+    distinction: a pinned path is only the board it claims to be if it
+    matches the path the board slug resolves to.
+
+    ``board`` of ``None`` falls through to :func:`get_current_board`.
+    """
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -729,12 +748,7 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+    return board_db_path(board)
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:

@@ -2967,6 +2967,9 @@ def _launch_tui(
     # the single factory; keep secrets (the TUI/agent needs provider creds).
     from tools.environments.local import build_subprocess_env
     env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
+    from tui_gateway.interactive_env import clear_inherited_worker_identity
+
+    clear_inherited_worker_identity(env)
     try:
         from hermes_cli.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)
@@ -12258,6 +12261,14 @@ def _is_electron_packaged_web_dist(path: str) -> bool:
 
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
+    # First act of a dedicated human-facing server: shed any Kanban worker
+    # identity this process inherited from whatever launched it. Must precede
+    # everything else here — the background MCP discovery thread further down
+    # spawns stdio servers with this environment, so a scrub deferred to
+    # start_server would still hand them a finished worker's task and run.
+    from tui_gateway.interactive_env import clear_inherited_worker_identity
+
+    clear_inherited_worker_identity()
     _token_file = getattr(args, "ssh_session_token_file", None)
     if _token_file and (
         getattr(args, "status", False) or getattr(args, "stop", False)

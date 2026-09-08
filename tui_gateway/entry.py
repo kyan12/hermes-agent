@@ -420,6 +420,9 @@ def ensure_mcp_discovery_started() -> None:
 
 
 def main():
+    from tui_gateway.interactive_env import clear_inherited_worker_identity
+
+    clear_inherited_worker_identity()
     _install_sidecar_publisher()
 
     # Cross-backend liveness (#94895): register a heartbeat row so the

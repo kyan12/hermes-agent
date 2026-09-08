@@ -48,7 +48,12 @@ import {
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { BackendDialClaims } from './backend-dial-claim'
-import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
+import {
+  buildDesktopBackendEnv,
+  hermesManagedNodePathEntries,
+  normalizeHermesHomeRoot,
+  withoutInheritedWorkerIdentity
+} from './backend-env'
 import {
   isReauthRequiredError,
   makeNousCloudBackendDownError,
@@ -12452,7 +12457,10 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     hiddenWindowsChildOptions({
       cwd: hermesCwd,
       env: {
-        ...process.env,
+        // Never hand a human-facing backend a Kanban worker identity this app
+        // merely inherited from whatever launched it: the spread below is the
+        // one place a finished worker's task/run reaches the child.
+        ...withoutInheritedWorkerIdentity(process.env),
         HERMES_HOME,
         ...backend.env,
         // Pin the gateway's tool/terminal cwd to the same directory we chose for
@@ -12869,7 +12877,10 @@ async function startHermes() {
       hiddenWindowsChildOptions({
         cwd: hermesCwd,
         env: {
-          ...process.env,
+          // Never hand a human-facing backend a Kanban worker identity this app
+          // merely inherited from whatever launched it: the spread below is the
+          // one place a finished worker's task/run reaches the child.
+          ...withoutInheritedWorkerIdentity(process.env),
           // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
           // resolves to the SAME location our resolveHermesHome() picked. Without
           // this pin, Python falls back to ~/.hermes on every platform — fine on
