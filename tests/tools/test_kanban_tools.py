@@ -1281,3 +1281,190 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Recovery-owner outcomes through the public tool boundary
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def recovery_worker_env(monkeypatch, tmp_path):
+    """A dispatcher-spawned recovery worker: owner card + full claim env.
+
+    Mirrors exactly what the dispatcher exports for the owner it spawned, so a
+    test here proves the *public* path a real recovery worker actually uses.
+    Returns ``(owner_id, source_id, source_event_id)``.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "code-crab")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    import hermes_cli.config as config_module
+    from hermes_cli import profiles as profiles_module
+
+    monkeypatch.setattr(
+        config_module, "load_config",
+        lambda *a, **k: {
+            "kanban": {"blocker_reconciler": {
+                "enabled": True, "profile": "code-crab", "max_active": 2,
+            }}
+        },
+    )
+    monkeypatch.setattr(
+        profiles_module, "profile_exists",
+        lambda name: str(name).strip().lower() in {"code-crab", "alice", "default"},
+    )
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        source_id = kb.create_task(conn, title="stalled source", assignee="alice")
+        assert kb.claim_task(conn, source_id, claimer="alice") is not None
+        assert kb.block_task(conn, source_id, reason="provider timed out",
+                             kind="transient")
+        owner_id = kb.active_recovery_owner(conn, source_id)
+        assert owner_id is not None
+        event_id = int(conn.execute(
+            "SELECT MAX(id) AS id FROM task_events WHERE task_id=? AND kind IN "
+            "('automation_recovery_requested','gave_up','block_loop_detected')",
+            (source_id,),
+        ).fetchone()["id"])
+        owner = kb.claim_task(conn, owner_id, claimer="code-crab")
+        assert owner is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", owner_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(owner.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", owner.claim_lock)
+
+    from tools import kanban_tools as kt
+    monkeypatch.setattr(
+        kt, "_goal_mode_handoff_rejection", lambda task, evidence: ("done", None)
+    )
+    return owner_id, source_id, event_id
+
+
+def _reconciliation_complete(outcome_extra=None, source=None, event_id=None):
+    from tools import kanban_tools as kt
+
+    reconciliation = {
+        "outcome": "cleared/resumed",
+        "source_task_id": source,
+        "source_event_id": event_id,
+    }
+    reconciliation.update(outcome_extra or {})
+    return json.loads(kt._handle_complete({
+        "summary": "reconciled the stalled source",
+        "metadata": {"reconciliation": reconciliation},
+    }))
+
+
+def test_tool_complete_carries_the_recovery_owners_claim_lock(recovery_worker_env):
+    """The dispatcher's claim lock must reach the kernel's authority check."""
+    owner_id, source_id, event_id = recovery_worker_env
+    from hermes_cli import kanban_db as kb
+
+    out = _reconciliation_complete(source=source_id, event_id=event_id)
+    assert out.get("ok") is True, out
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, owner_id).status == "done"
+        assert kb.get_task(conn, source_id).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_tool_complete_without_the_claim_lock_cannot_move_the_source(
+    recovery_worker_env, monkeypatch
+):
+    """A worker environment stripped of the claim lock has no outcome authority."""
+    owner_id, source_id, event_id = recovery_worker_env
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+    from hermes_cli import kanban_db as kb
+
+    out = _reconciliation_complete(source=source_id, event_id=event_id)
+    assert out.get("error"), out
+    assert "claim" in out["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, owner_id).status == "running"
+        assert kb.get_task(conn, source_id).status == "triage"
+    finally:
+        conn.close()
+
+
+def test_tool_created_continuation_is_accepted_as_the_owners_child(
+    recovery_worker_env
+):
+    """The genuine public path: kanban_create under the owner, then complete.
+
+    A recovery worker has no private kernel helpers — it creates its
+    continuation with the same tool every worker uses and names it in the
+    verdict. That must still be accepted.
+    """
+    owner_id, source_id, event_id = recovery_worker_env
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    created = json.loads(kt._handle_create({
+        "title": "bounded continuation",
+        "body": "retry the provider call with the reset quota window",
+        "assignee": "code-crab",
+        "parents": [owner_id],
+    }))
+    assert created.get("ok") is True, created
+    continuation_id = created["task_id"]
+
+    out = _reconciliation_complete(
+        {"outcome": "continuation_created", "continuation_task_id": continuation_id},
+        source=source_id, event_id=event_id,
+    )
+    assert out.get("ok") is True, out
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (continuation_id, source_id),
+        ).fetchone() is not None
+        assert kb.get_task(conn, source_id).status == "todo"
+    finally:
+        conn.close()
+
+
+def test_tool_complete_rejects_a_pre_existing_task_as_a_continuation(
+    recovery_worker_env
+):
+    """Linking an operator's card under the owner is not creation provenance."""
+    owner_id, source_id, event_id = recovery_worker_env
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        unrelated = kb.create_task(conn, title="operator card", assignee="alice")
+        kb.link_tasks(conn, owner_id, unrelated)
+    finally:
+        conn.close()
+
+    out = _reconciliation_complete(
+        {"outcome": "continuation_created", "continuation_task_id": unrelated},
+        source=source_id, event_id=event_id,
+    )
+    assert out.get("error"), out
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (unrelated, source_id),
+        ).fetchone() is None
+        assert kb.get_task(conn, source_id).status == "triage"
+    finally:
+        conn.close()

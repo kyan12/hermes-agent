@@ -2426,6 +2426,17 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_claim_lock_for(task_id: str) -> Optional[str]:
+    """This worker's dispatcher claim lock, when scoped to ``task_id``.
+
+    Required only for a recovery owner's reconciliation outcome; ordinary
+    completion paths (manual ``hermes kanban complete``) are unaffected.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    return (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip() or None
+
+
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
     """Apply the goal judge to every terminal worker handoff, including review.
 
@@ -2528,6 +2539,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                claim_lock=_worker_claim_lock_for(tid),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)

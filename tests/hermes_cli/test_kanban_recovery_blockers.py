@@ -313,6 +313,7 @@ def test_an_operator_comment_on_the_source_is_material_advancement(board):
             board, owner_id, result="x",
             metadata={"reconciliation": _verdict(source_id, event_id)},
             expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
         )
     assert kb.get_task(board, source_id).status == "triage"
 
@@ -330,6 +331,7 @@ def test_an_unrelated_link_on_the_source_is_material_advancement(board):
             board, owner_id, result="x",
             metadata={"reconciliation": _verdict(source_id, event_id)},
             expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
         )
 
 
@@ -351,6 +353,7 @@ def test_the_owners_own_provenance_bound_evidence_is_not_advancement(board):
         board, owner_id, result="x", summary="done",
         metadata={"reconciliation": _verdict(source_id, event_id)},
         expected_run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock,
     )
     assert kb.get_task(board, source_id).status == "ready"
 
@@ -394,6 +397,7 @@ def test_a_provenance_bound_continuation_link_is_accepted(board):
             "continuation_task_id": cont,
         }},
         expected_run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock,
     )
     assert kb.get_task(board, source_id).status == "todo"
 
@@ -509,6 +513,7 @@ def test_the_kill_switch_is_rechecked_under_the_outcome_transaction(
             board, owner_id, result="x",
             metadata={"reconciliation": _verdict(source_id, event_id)},
             expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
         )
     monkeypatch.undo()
     assert kb.get_task(board, source_id).status == "triage"
@@ -577,6 +582,7 @@ def test_a_stale_outcome_rearms_the_source_for_a_new_owner(board):
             board, owner_id, result="x", summary="done",
             metadata={"reconciliation": _verdict(source_id, event_id)},
             expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
         )
     finally:
         kb._apply_reconciliation_completion = real_apply
@@ -607,6 +613,7 @@ def test_bounded_exhaustion_surfaces_one_precise_action(board):
                 source_id, _occurrence(board, source_id)
             )},
             expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
         )
         if kb.get_task(board, source_id).status not in ("ready", "todo"):
             break
@@ -655,6 +662,7 @@ def test_continuation_outcome_links_owner_created_child_without_private_kernel_c
             "continuation_task_id": continuation_id,
         }},
         expected_run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock,
     )
     assert board.execute(
         "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
@@ -682,3 +690,588 @@ def test_completed_desktop_session_binding_is_scrubbed_at_context_boundary(board
     assert "HERMES_KANBAN_TASK" not in __import__("os").environ
     from agent.kanban_stop import build_kanban_stop_nudge
     assert build_kanban_stop_nudge(messages=[]) is None
+
+
+# ---------------------------------------------------------------------------
+# 9 — an outcome requires possession of the owner's claim LOCK, not just its
+#     run id, and the exact live run row behind it
+# ---------------------------------------------------------------------------
+
+
+def test_an_outcome_without_the_owners_claim_lock_is_refused(board):
+    """The run id is public bookkeeping; the claim lock is the secret.
+
+    A caller that merely knows (owner task, run id) — both readable from any
+    board listing — must not be able to move the source.
+    """
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+
+    with pytest.raises(ValueError, match="claim"):
+        kb.complete_task(
+            board, owner_id, result="x",
+            metadata={"reconciliation": _verdict(source_id, event_id)},
+            expected_run_id=owner.current_run_id,
+        )
+    assert kb.get_task(board, source_id).status == "triage"
+    assert kb.get_task(board, owner_id).status == "running"
+
+
+def test_an_outcome_with_a_forged_claim_lock_is_refused(board):
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+
+    with pytest.raises(ValueError, match="claim"):
+        kb.complete_task(
+            board, owner_id, result="x",
+            metadata={"reconciliation": _verdict(source_id, event_id)},
+            expected_run_id=owner.current_run_id,
+            claim_lock="forged-lock",
+        )
+    assert kb.get_task(board, source_id).status == "triage"
+
+
+def test_the_owners_own_claim_lock_still_reports_an_outcome(board):
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+
+    assert kb.complete_task(
+        board, owner_id, result="x", summary="done",
+        metadata={"reconciliation": _verdict(source_id, event_id)},
+        expected_run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock,
+    )
+    assert kb.get_task(board, source_id).status == "ready"
+
+
+def test_an_outcome_against_a_settled_run_row_is_refused(board):
+    """The task row can lag; the run row is the run's own truth."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+    board.execute(
+        "UPDATE task_runs SET status='reclaimed', ended_at=?, claim_lock=NULL "
+        "WHERE id=?",
+        (int(time.time()), int(owner.current_run_id)),
+    )
+    board.commit()
+
+    with pytest.raises(ValueError, match="claim|run"):
+        kb.complete_task(
+            board, owner_id, result="x",
+            metadata={"reconciliation": _verdict(source_id, event_id)},
+            expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
+        )
+    assert kb.get_task(board, source_id).status == "triage"
+
+
+def test_the_owners_claim_is_rechecked_inside_the_completion_transaction(
+    board, monkeypatch
+):
+    """Validating authority only before the write lock is a TOCTOU.
+
+    The claim expires between validation and the transaction that mutates the
+    source; the task row still says ``running`` with the same ``current_run_id``,
+    so the completion CAS alone does not notice.
+    """
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+
+    real = kb._validate_reconciliation_verdict
+
+    def _expire_after_validation(conn, task_id, metadata, **kwargs):
+        verdict = real(conn, task_id, metadata, **kwargs)
+        expired = int(time.time()) - 5
+        conn.execute(
+            "UPDATE tasks SET claim_expires=? WHERE id=?", (expired, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires=? WHERE id=?",
+            (expired, int(owner.current_run_id)),
+        )
+        conn.commit()
+        return verdict
+
+    monkeypatch.setattr(
+        kb, "_validate_reconciliation_verdict", _expire_after_validation
+    )
+    with pytest.raises(ValueError, match="claim"):
+        kb.complete_task(
+            board, owner_id, result="x",
+            metadata={"reconciliation": _verdict(source_id, event_id)},
+            expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
+        )
+    monkeypatch.undo()
+    assert kb.get_task(board, source_id).status == "triage"
+    assert kb.get_task(board, owner_id).status == "running"
+
+
+def test_ordinary_completion_needs_no_claim_lock(board):
+    """Compatibility: non-recovery completion is untouched by the new authority."""
+    tid = kb.create_task(board, title="ordinary work", assignee="alice")
+    claimed = kb.claim_task(board, tid, claimer="alice")
+    assert kb.complete_task(
+        board, tid, summary="done", expected_run_id=claimed.current_run_id,
+    )
+    assert kb.get_task(board, tid).status == "done"
+
+
+# ---------------------------------------------------------------------------
+# 10 — a recovery owner's source writes are bound to its OWN exact occurrence
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_bound_to_a_foreign_sources_occurrence_is_refused(board):
+    """The exemption is per-occurrence, so the binding must be verified.
+
+    Recording a comment under an event id belonging to somebody else's
+    occurrence would make the owner's note exempt from a guard it was never
+    scoped to.
+    """
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    owner = _claim_owner(board, owner_id)
+    foreign_id = _stall(board, title="somebody else's stall")
+    foreign_event_id = _occurrence(board, foreign_id)
+
+    assert kb.add_recovery_evidence_comment(
+        board, source_id,
+        recovery_task_id=owner_id,
+        run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock,
+        source_event_id=foreign_event_id,
+        body="bound to an occurrence this owner does not own",
+    ) is False
+    assert board.execute(
+        "SELECT COUNT(*) AS n FROM task_comments WHERE task_id=?", (source_id,),
+    ).fetchone()["n"] == 0
+
+
+def test_evidence_bound_to_a_non_occurrence_event_is_refused(board):
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    owner = _claim_owner(board, owner_id)
+    created_event_id = int(board.execute(
+        "SELECT id FROM task_events WHERE task_id=? AND kind='created'",
+        (source_id,),
+    ).fetchone()["id"])
+
+    assert kb.add_recovery_evidence_comment(
+        board, source_id,
+        recovery_task_id=owner_id,
+        run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock,
+        source_event_id=created_event_id,
+        body="not an occurrence at all",
+    ) is False
+
+
+def test_a_recovery_link_bound_to_a_foreign_occurrence_is_refused(board):
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    owner = _claim_owner(board, owner_id)
+    foreign_id = _stall(board, title="somebody else's stall")
+    foreign_event_id = _occurrence(board, foreign_id)
+    parent = kb.create_task(board, title="parent", assignee="alice")
+
+    assert kb.link_recovery_parent(
+        board, parent_id=parent, child_id=source_id,
+        recovery_task_id=owner_id, run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock, source_event_id=foreign_event_id,
+    ) is False
+    assert board.execute(
+        "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+        (parent, source_id),
+    ).fetchone() is None
+
+
+def test_the_stale_exemption_requires_the_owners_exact_occurrence(board):
+    """Owner provenance alone is not the exemption; the occurrence completes it.
+
+    A write carrying this owner's task+run but some other occurrence id is not
+    a note about the occurrence being resolved, so it stays material
+    advancement.
+    """
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+    with kb.write_txn(board):
+        kb._append_event(
+            board, source_id, "commented",
+            {
+                "author": f"reconciler:{owner_id}",
+                "origin_task_id": owner_id,
+                "origin_run_id": int(owner.current_run_id),
+                "source_event_id": event_id + 10_000,
+            },
+        )
+
+    with pytest.raises(ValueError, match="advanced"):
+        kb.complete_task(
+            board, owner_id, result="x",
+            metadata={"reconciliation": _verdict(source_id, event_id)},
+            expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
+        )
+    assert kb.get_task(board, source_id).status == "triage"
+
+
+# ---------------------------------------------------------------------------
+# 11 — a continuation needs durable owner-creation provenance, rechecked under
+#      the completion write lock
+# ---------------------------------------------------------------------------
+
+
+def test_a_pre_existing_task_linked_under_the_owner_is_not_a_continuation(board):
+    """Linking is a public verb; only creation under the live run is provenance.
+
+    Otherwise a recovery owner parks its source behind any card on the board —
+    an operator's own work becomes the source's blocking parent.
+    """
+    unrelated = kb.create_task(board, title="operator's own card", assignee="alice")
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+    kb.link_tasks(board, owner_id, unrelated)
+
+    with pytest.raises(ValueError, match="continuation"):
+        kb.complete_task(
+            board, owner_id, result="x",
+            metadata={"reconciliation": {
+                "outcome": "continuation_created",
+                "source_task_id": source_id,
+                "source_event_id": event_id,
+                "continuation_task_id": unrelated,
+            }},
+            expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
+        )
+    assert board.execute(
+        "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+        (unrelated, source_id),
+    ).fetchone() is None
+    assert kb.get_task(board, source_id).status == "triage"
+
+
+def test_a_continuation_created_before_the_owners_run_is_refused(board):
+    """A card minted before this run cannot be this run's continuation."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    stale_child = kb.create_task(
+        board, title="child of a previous generation", assignee="code-crab",
+        parents=[owner_id], created_by="blocker-reconciler",
+    )
+    board.execute(
+        "UPDATE tasks SET created_at=? WHERE id=?",
+        (int(time.time()) - 3600, stale_child),
+    )
+    board.commit()
+    owner = _claim_owner(board, owner_id)
+
+    with pytest.raises(ValueError, match="continuation"):
+        kb.complete_task(
+            board, owner_id, result="x",
+            metadata={"reconciliation": {
+                "outcome": "continuation_created",
+                "source_task_id": source_id,
+                "source_event_id": event_id,
+                "continuation_task_id": stale_child,
+            }},
+            expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
+        )
+    assert board.execute(
+        "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+        (stale_child, source_id),
+    ).fetchone() is None
+
+
+def test_the_owner_continuation_link_is_rechecked_inside_the_write_transaction(
+    board, monkeypatch
+):
+    """Provenance read before the write lock is a TOCTOU on the source's parent."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+    continuation_id = kb.create_task(
+        board, title="bounded continuation", assignee="code-crab",
+        parents=[owner_id], created_by="blocker-reconciler",
+    )
+
+    real = kb._validate_reconciliation_verdict
+
+    def _unlink_after_validation(conn, task_id, metadata, **kwargs):
+        verdict = real(conn, task_id, metadata, **kwargs)
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+            (owner_id, continuation_id),
+        )
+        conn.commit()
+        return verdict
+
+    monkeypatch.setattr(
+        kb, "_validate_reconciliation_verdict", _unlink_after_validation
+    )
+    with pytest.raises(ValueError, match="continuation"):
+        kb.complete_task(
+            board, owner_id, result="x",
+            metadata={"reconciliation": {
+                "outcome": "continuation_created",
+                "source_task_id": source_id,
+                "source_event_id": event_id,
+                "continuation_task_id": continuation_id,
+            }},
+            expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
+        )
+    monkeypatch.undo()
+    assert board.execute(
+        "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+        (continuation_id, source_id),
+    ).fetchone() is None
+    assert kb.get_task(board, source_id).status == "triage"
+    assert kb.get_task(board, owner_id).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# 12 — duplicate-owner migration keeps the LIVE owner and leaves a forward path
+# ---------------------------------------------------------------------------
+
+
+def _legacy_duplicate_db(
+    tmp_path, monkeypatch, rows, *, runs=(), source_id="t_source"
+):
+    """A pre-constraint board carrying duplicate owners for one occurrence.
+
+    ``rows`` is an ordered list of ``(task_id, status, created_at_offset)`` and
+    ``runs`` an optional list of ``(run_id, task_id)`` open run rows; the
+    duplicates are inserted before the unique index migration ever runs.
+    Returns ``(db_path, reserved_key)``.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db = tmp_path / "legacy.db"
+    key = f"{kb.RECONCILIATION_IDEMPOTENCY_PREFIX}default:{source_id}:42"
+    now = int(time.time())
+
+    conn = kb.connect(db)
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_tasks_recovery_owner_key")
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, workspace_kind, "
+            "recovery_backfill_pending) VALUES (?, 'stalled source', 'triage', "
+            "?, 'scratch', 0)",
+            (source_id, now),
+        )
+        for task_id, status, offset in rows:
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at, "
+                "workspace_kind, idempotency_key, created_by, assignee) "
+                "VALUES (?, ?, ?, ?, 'scratch', ?, 'blocker-reconciler', "
+                "'code-crab')",
+                (task_id, task_id, status, now + offset, key),
+            )
+        for run_id, task_id in runs:
+            conn.execute(
+                "INSERT INTO task_runs (id, task_id, status, claim_lock, "
+                "claim_expires, started_at) VALUES (?, ?, 'running', ?, ?, ?)",
+                (run_id, task_id, f"lock-{run_id}", now + 3600, now),
+            )
+            conn.execute(
+                "UPDATE tasks SET current_run_id=?, claim_lock=?, claim_expires=? "
+                "WHERE id=?",
+                (run_id, f"lock-{run_id}", now + 3600, task_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    # A real deployment reopens the migrated DB in a fresh process.
+    kb._INITIALIZED_PATHS.clear()
+    return db, key
+
+
+def test_migration_retains_the_live_owner_over_an_earlier_dead_one(
+    tmp_path, monkeypatch, set_reconciler
+):
+    """Keeping the earliest row retires the only owner that can still finish."""
+    db, key = _legacy_duplicate_db(
+        tmp_path, monkeypatch,
+        [("t_dead", "archived", 0), ("t_live", "running", 10)],
+    )
+
+    conn = kb.connect(db)
+    try:
+        retained = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=?", (key,),
+        ).fetchall()
+        assert [r["id"] for r in retained] == ["t_live"]
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id='t_dead'"
+        ).fetchone()["status"] == "archived"
+    finally:
+        conn.close()
+
+
+def test_migration_closes_open_runs_for_archived_duplicate_owners(
+    tmp_path, monkeypatch, set_reconciler
+):
+    """Two owners both dispatched: the retired one must not keep a live run.
+
+    An open ``task_runs`` row still advertises an unexpired claim, so a reaper
+    (and every liveness probe that reads runs rather than tasks) keeps treating
+    an archived card as a working owner.
+    """
+    db, key = _legacy_duplicate_db(
+        tmp_path, monkeypatch,
+        [("t_keep", "running", 0), ("t_extra", "running", 10)],
+        runs=[(77, "t_keep"), (78, "t_extra")],
+    )
+
+    conn = kb.connect(db)
+    try:
+        assert [r["id"] for r in conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=?", (key,),
+        )] == ["t_keep"]
+        extra_run = conn.execute("SELECT * FROM task_runs WHERE id=78").fetchone()
+        assert extra_run["ended_at"] is not None
+        assert extra_run["status"] != "running"
+        assert extra_run["claim_lock"] is None
+        # The retained owner keeps working.
+        kept_run = conn.execute("SELECT * FROM task_runs WHERE id=77").fetchone()
+        assert kept_run["ended_at"] is None
+        assert kept_run["status"] == "running"
+    finally:
+        conn.close()
+
+
+def test_migration_rearms_the_source_when_every_duplicate_owner_is_dead(
+    tmp_path, monkeypatch, set_reconciler
+):
+    """No live owner survives, so the source must go back on the backfill scan."""
+    db, key = _legacy_duplicate_db(
+        tmp_path, monkeypatch,
+        [("t_dead1", "archived", 0), ("t_dead2", "done", 10)],
+    )
+
+    conn = kb.connect(db)
+    try:
+        assert conn.execute(
+            "SELECT recovery_backfill_pending AS p FROM tasks WHERE id='t_source'"
+        ).fetchone()["p"] == 1
+        assert len(conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=?", (key,),
+        ).fetchall()) == 1
+    finally:
+        conn.close()
+
+
+def test_duplicate_migration_is_safe_on_a_partial_legacy_schema(tmp_path):
+    """A pre-``task_runs`` board must still open, not crash mid-migration."""
+    db = tmp_path / "partial.db"
+    key = f"{kb.RECONCILIATION_IDEMPOTENCY_PREFIX}default:legacy_source:7"
+    raw = sqlite3.connect(str(db))
+    raw.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, "
+        "body TEXT, assignee TEXT, status TEXT NOT NULL, "
+        "priority INTEGER NOT NULL DEFAULT 0, created_by TEXT, "
+        "created_at INTEGER NOT NULL, started_at INTEGER, "
+        "completed_at INTEGER, workspace_kind TEXT NOT NULL DEFAULT 'scratch', "
+        "workspace_path TEXT, claim_lock TEXT, claim_expires INTEGER, "
+        "idempotency_key TEXT)"
+    )
+    raw.execute(
+        "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "task_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, "
+        "created_at INTEGER NOT NULL)"
+    )
+    for tid in ("legacy_a", "legacy_b"):
+        raw.execute(
+            "INSERT INTO tasks (id, title, status, created_at, idempotency_key) "
+            "VALUES (?, ?, 'ready', 1, ?)",
+            (tid, tid, key),
+        )
+    raw.commit()
+    raw.close()
+    kb._INITIALIZED_PATHS.clear()
+
+    with kb.connect(db) as migrated:
+        assert len(migrated.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=?", (key,),
+        ).fetchall()) == 1
+
+
+# ---------------------------------------------------------------------------
+# 13 — the configured recovery concurrency cap binds where ownership is taken
+# ---------------------------------------------------------------------------
+
+
+def test_the_recovery_concurrency_cap_is_enforced_at_the_claim_boundary(
+    board, set_reconciler
+):
+    """``max_active`` is a promise about live recovery workers, not a comment.
+
+    Enforced anywhere but the atomic claim, two dispatcher ticks both pass an
+    advisory count and both spawn.
+    """
+    set_reconciler(max_active=1)
+    first_source = _stall(board, title="first stall")
+    second_source = _stall(board, title="second stall")
+    first_owner = _owners(board, first_source)[0]["id"]
+    second_owner = _owners(board, second_source)[0]["id"]
+
+    assert kb.claim_task(board, first_owner, claimer="code-crab") is not None
+    assert kb.claim_task(board, second_owner, claimer="code-crab") is None
+    assert kb.get_task(board, second_owner).status == "ready"
+    reasons = [
+        e.payload.get("reason") for e in kb.list_events(board, second_owner)
+        if e.kind == "claim_rejected"
+    ]
+    assert "blocker_reconciler_max_active" in reasons
+
+
+def test_a_stale_recovery_owner_does_not_consume_the_concurrency_cap(
+    board, set_reconciler
+):
+    """A crashed owner holding a dead claim must not wedge the whole lane."""
+    set_reconciler(max_active=1)
+    first_source = _stall(board, title="first stall")
+    second_source = _stall(board, title="second stall")
+    first_owner = _owners(board, first_source)[0]["id"]
+    second_owner = _owners(board, second_source)[0]["id"]
+
+    assert kb.claim_task(board, first_owner, claimer="code-crab") is not None
+    board.execute(
+        "UPDATE tasks SET claim_expires=? WHERE id=?",
+        (int(time.time()) - 5, first_owner),
+    )
+    board.commit()
+
+    assert kb.claim_task(board, second_owner, claimer="code-crab") is not None
+
+
+def test_the_concurrency_cap_never_blocks_ordinary_work(board, set_reconciler):
+    """Only recovery owners are counted, and only against other recovery owners."""
+    set_reconciler(max_active=1)
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    assert kb.claim_task(board, owner_id, claimer="code-crab") is not None
+
+    ordinary = kb.create_task(board, title="ordinary work", assignee="alice")
+    assert kb.claim_task(board, ordinary, claimer="alice") is not None

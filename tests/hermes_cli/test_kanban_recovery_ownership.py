@@ -150,6 +150,7 @@ def _complete_owner(conn, owner_id, reconciliation):
         conn, owner_id, result="reconciled", summary="reconciled",
         metadata={"reconciliation": reconciliation},
         expected_run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock,
     )
 
 
@@ -293,6 +294,7 @@ def test_the_kill_switch_stops_outcomes_from_being_applied(board, set_reconciler
                 "source_event_id": event_id,
             }},
             expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
         )
     assert kb.get_task(board, source_id).status == "triage"
 
@@ -488,6 +490,7 @@ def test_a_dependency_wait_verdict_parks_the_source_behind_its_parent(board):
     assert kb.complete_task(
         board, owner_id, result="reconciled", summary="reconciled",
         expected_run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock,
         metadata={"reconciliation": {
         "outcome": "dependency_wait",
         "source_task_id": source_id,
@@ -630,6 +633,7 @@ def test_a_source_that_advances_while_resolving_discards_the_verdict(board):
                 "source_event_id": event_id,
             }},
             expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
         )
 
 

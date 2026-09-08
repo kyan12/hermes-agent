@@ -167,6 +167,19 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_claim_lock(task_id: str) -> Optional[str]:
+    """Return this worker's dispatcher claim lock when scoped to task_id.
+
+    The dispatcher exports ``HERMES_KANBAN_CLAIM_LOCK`` into the process it
+    spawned; it is the only completion credential a peer process cannot read
+    off the board. Recovery-owner outcomes require it (kanban_db
+    ``_recovery_outcome_authority_error``); every other completion ignores it.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    return (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip() or None
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -794,6 +807,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    claim_lock=_worker_claim_lock(tid),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(

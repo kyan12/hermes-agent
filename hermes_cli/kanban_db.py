@@ -197,6 +197,13 @@ RECONCILIATION_BACKFILL_BATCH_LIMIT = 16
 # process start.
 RECONCILIATION_BACKFILL_TRIGGER_NAME = "trg_recovery_backfill_pending_v1"
 
+# Statuses in which a recovery owner can still reach a verdict. Anything else
+# (done, archived, cancelled, ...) is a dead card: it neither holds the
+# occurrence nor leaves the source a forward path.
+RECOVERY_OWNER_LIVE_STATUSES = frozenset({
+    "todo", "ready", "running", "review", "scheduled",
+})
+
 # Kernel bookkeeping kinds: written by this lane itself, never a material
 # advance of the source.
 RECONCILIATION_BOOKKEEPING_EVENT_KINDS = (
@@ -2962,6 +2969,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # otherwise the index cannot install and the duplicates stay
         # dispatchable, which is exactly the failure the index prevents.
         with write_txn(conn, allow_nested=True):
+            # Synthetic migration fixtures may omit whole tables; every optional
+            # write below is gated on what this database actually has.
+            _runs_cols = {
+                row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+            }
+            _can_close_runs = {"task_id", "status", "ended_at"} <= _runs_cols
+            _can_rearm = "recovery_backfill_pending" in _final_task_cols
+            _now = int(time.time())
             _dupe_keys = [
                 row["idempotency_key"] for row in conn.execute(
                     "SELECT idempotency_key FROM tasks "
@@ -2971,26 +2986,60 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ]
             for _key in _dupe_keys:
                 _rows = conn.execute(
-                    "SELECT id FROM tasks WHERE idempotency_key=? "
+                    "SELECT id, status FROM tasks WHERE idempotency_key=? "
                     "ORDER BY created_at, id",
                     (_key,),
                 ).fetchall()
-                for _extra in _rows[1:]:
-                    # Keep the earliest owner; strip the reserved key from the
-                    # rest and archive them so nothing dispatches twice.
+                # Retire by liveness first, arrival order only to break ties.
+                # Keeping the earliest row unconditionally retires the only
+                # owner that can still produce a verdict whenever an older
+                # duplicate is already dead, which strands the source behind a
+                # card nobody will ever run.
+                _live = [
+                    row for row in _rows
+                    if row["status"] in RECOVERY_OWNER_LIVE_STATUSES
+                ]
+                _retained = (_live[0] if _live else _rows[0])["id"]
+                for _extra in _rows:
+                    if _extra["id"] == _retained:
+                        continue
+                    # Strip the reserved key from every other row and archive it
+                    # so nothing dispatches twice.
                     conn.execute(
                         "UPDATE tasks SET status='archived', claim_lock=NULL, "
                         "claim_expires=NULL, worker_pid=NULL, "
                         "current_run_id=NULL, idempotency_key=? WHERE id=?",
                         (f"{_key}:duplicate:{_extra['id']}", _extra["id"]),
                     )
+                    if _can_close_runs:
+                        # An open run row still advertises an unexpired claim.
+                        # Archiving the card without settling its run leaves
+                        # every liveness probe that reads runs believing a
+                        # retired duplicate is still working.
+                        conn.execute(
+                            "UPDATE task_runs SET status='reclaimed', "
+                            "ended_at=?, claim_lock=NULL, claim_expires=NULL "
+                            "WHERE task_id=? AND ended_at IS NULL",
+                            (_now, _extra["id"]),
+                        )
                     _append_event(
                         conn, _extra["id"], "reconciliation_coalesced",
                         {
                             "reason": "duplicate_recovery_owner_retired",
-                            "retained_task_id": _rows[0]["id"],
+                            "retained_task_id": _retained,
                         },
                     )
+                if not _live and _can_rearm:
+                    # Nothing survivable was retained, so the occurrence has no
+                    # owner at all. Re-arm the source for the backfill scan
+                    # instead of leaving it silently stopped.
+                    _dupe_source, _ = _reconciliation_lineage_from_key(_key)
+                    if _dupe_source:
+                        conn.execute(
+                            "UPDATE tasks SET recovery_backfill_pending=1 "
+                            "WHERE id=? AND status NOT IN ('done','archived')",
+                            (_dupe_source,),
+                        )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_recovery_owner_key "
                 "ON tasks(idempotency_key) "
@@ -4989,16 +5038,31 @@ def claim_task(
         existing = conn.execute(
             "SELECT idempotency_key FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if (
-            existing is not None
-            and is_recovery_owner_key(existing["idempotency_key"])
-            and not blocker_reconciler_enabled()
+        if existing is not None and is_recovery_owner_key(
+            existing["idempotency_key"]
         ):
-            _append_event(
-                conn, task_id, "claim_rejected",
-                {"reason": "blocker_reconciler_disabled"},
-            )
-            return None
+            config = _blocker_reconciler_config()
+            if not config["enabled"]:
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "blocker_reconciler_disabled"},
+                )
+                return None
+            # ``max_active`` is a promise about how many recovery workers may
+            # run at once, so it binds where ownership is actually acquired.
+            # Counted advisorily anywhere earlier, two dispatcher ticks both
+            # read "under the cap" and both spawn.
+            if _live_recovery_owner_count(
+                conn, exclude_task_id=task_id
+            ) >= config["max_active"]:
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {
+                        "reason": "blocker_reconciler_max_active",
+                        "max_active": config["max_active"],
+                    },
+                )
+                return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -5727,6 +5791,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    claim_lock: Optional[str] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
@@ -5745,6 +5810,11 @@ def complete_task(
     callers do not have to pass both. ``metadata`` is a free-form dict
     (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
     are encouraged to use it for structured handoff facts.
+
+    ``claim_lock`` is the secret the dispatcher handed to the process it
+    spawned. It is only *required* for a recovery owner reporting a
+    reconciliation outcome (see :func:`_recovery_outcome_authority_error`);
+    ordinary completion paths are unchanged and may omit it.
 
     ``created_cards`` is an optional list of task ids the completing
     worker claims to have created. Each id is verified against
@@ -5803,8 +5873,24 @@ def complete_task(
     # _apply_reconciliation_completion against current source truth.
     reconciliation_verdict = _validate_reconciliation_verdict(
         conn, task_id, metadata, expected_run_id=expected_run_id,
+        claim_lock=claim_lock,
     )
     with write_txn(conn):
+        if reconciliation_verdict is not None:
+            # Authority is re-proved under the write lock, BEFORE the CAS
+            # clears the claim. Validating only ahead of the transaction leaves
+            # a window in which the claim expires or is reaped while the task
+            # row still carries the same ``current_run_id`` — which the
+            # completion CAS alone cannot detect.
+            _owner_now = get_task(conn, task_id)
+            authority_error = (
+                "reconciliation task no longer exists" if _owner_now is None
+                else _recovery_outcome_authority_error(
+                    conn, _owner_now, expected_run_id, claim_lock,
+                )
+            )
+            if authority_error:
+                raise ValueError(authority_error)
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -6937,9 +7023,9 @@ def _reconciliation_prompt(envelope: Mapping) -> str:
     )
 
 
-def _reconciliation_source_from_key(task: Optional["Task"]):
-    """Decode ``(source_task_id, source_event_id)`` from a recovery owner key."""
-    key = (task.idempotency_key or "") if task is not None else ""
+def _reconciliation_lineage_from_key(key: Optional[str]):
+    """Decode ``(source_task_id, source_event_id)`` from a reserved key string."""
+    key = str(key or "")
     if not is_recovery_owner_key(key):
         return None, None
     parts = key[len(RECONCILIATION_IDEMPOTENCY_PREFIX):].rsplit(":", 2)
@@ -6949,6 +7035,13 @@ def _reconciliation_source_from_key(task: Optional["Task"]):
         return parts[1], int(parts[2])
     except (TypeError, ValueError):
         return None, None
+
+
+def _reconciliation_source_from_key(task: Optional["Task"]):
+    """Decode ``(source_task_id, source_event_id)`` from a recovery owner key."""
+    return _reconciliation_lineage_from_key(
+        (task.idempotency_key or "") if task is not None else ""
+    )
 
 
 def _reconciliation_outcome_payloads(conn: sqlite3.Connection, source_task_id: str):
@@ -7109,7 +7202,7 @@ def _recovery_owner_is_live(conn: sqlite3.Connection, owner: "Task") -> bool:
     absorb a new occurrence. ``worker_pid`` is NULL between claim and spawn,
     which is still live; a *recorded* pid that is gone is not.
     """
-    if owner.status not in {"todo", "ready", "running", "review", "scheduled"}:
+    if owner.status not in RECOVERY_OWNER_LIVE_STATUSES:
         return False
     if owner.status != "running":
         return True
@@ -7120,6 +7213,30 @@ def _recovery_owner_is_live(conn: sqlite3.Connection, owner: "Task") -> bool:
         and int(owner.claim_expires) > int(time.time())
         and (owner.worker_pid is None or _pid_alive(owner.worker_pid))
     )
+
+
+def _live_recovery_owner_count(
+    conn: sqlite3.Connection, *, exclude_task_id: Optional[str] = None
+) -> int:
+    """How many OTHER recovery owners are genuinely running right now.
+
+    Only ``running`` rows whose claim still holds count. A crashed, reaped or
+    settled owner must not consume a concurrency slot — otherwise one dead card
+    wedges the whole recovery lane, which is a worse failure than the
+    over-dispatch the cap exists to prevent.
+    """
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key LIKE ? AND status='running'",
+        (f"{RECONCILIATION_IDEMPOTENCY_PREFIX}%",),
+    ).fetchall()
+    count = 0
+    for row in rows:
+        if exclude_task_id is not None and row["id"] == exclude_task_id:
+            continue
+        owner = get_task(conn, row["id"])
+        if owner is not None and _recovery_owner_is_live(conn, owner):
+            count += 1
+    return count
 
 
 def active_recovery_owner(
@@ -7186,6 +7303,37 @@ def _verify_recovery_owner_claim(
     return owner
 
 
+def _recovery_write_is_occurrence_bound(
+    conn: sqlite3.Connection,
+    owner: "Task",
+    source_task_id: str,
+    source_event_id,
+) -> bool:
+    """Whether this write really names the occurrence ``owner`` was minted for.
+
+    The stale-source guard exempts owner writes *for the occurrence being
+    resolved*. An unchecked ``source_event_id`` makes that exemption a free
+    parameter: an owner could stamp a note with any number — a foreign source's
+    occurrence, or an id that names nothing — and still be waved past a guard it
+    was never scoped to. The owner key is the only durable statement of which
+    occurrence this owner owns, so it is the one the write must match.
+    """
+    bound_source, bound_event = _reconciliation_source_from_key(owner)
+    if bound_source != source_task_id or bound_event is None:
+        return False
+    try:
+        claimed_event = int(source_event_id)
+    except (TypeError, ValueError):
+        return False
+    if claimed_event != int(bound_event):
+        return False
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE id = ? AND task_id = ?",
+        (claimed_event, source_task_id),
+    ).fetchone()
+    return row is not None and row["kind"] in RECONCILIATION_EVENT_KINDS
+
+
 def add_recovery_evidence_comment(
     conn: sqlite3.Connection,
     source_task_id: str,
@@ -7209,8 +7357,9 @@ def add_recovery_evidence_comment(
         )
         if owner is None:
             return False
-        bound_source, _bound_event = _reconciliation_source_from_key(owner)
-        if bound_source != source_task_id:
+        if not _recovery_write_is_occurrence_bound(
+            conn, owner, source_task_id, source_event_id
+        ):
             return False
         now = int(time.time())
         cur = conn.execute(
@@ -7249,8 +7398,9 @@ def link_recovery_parent(
         )
         if owner is None:
             return False
-        bound_source, _bound_event = _reconciliation_source_from_key(owner)
-        if bound_source != child_id:
+        if not _recovery_write_is_occurrence_bound(
+            conn, owner, child_id, source_event_id
+        ):
             return False
         if get_task(conn, parent_id) is None or get_task(conn, child_id) is None:
             return False
@@ -7654,15 +7804,25 @@ def _newer_reconciliation_source_event(
             "SELECT id FROM task_runs WHERE task_id = ?", (recovery_task_id,)
         )
     }
+    # ...and only for the occurrence this owner was minted for. Provenance says
+    # who wrote it; the occurrence says what it is about. Without the second
+    # half, one owner's exemption would cover notes it stamped for any other
+    # occurrence on any other source.
+    _, bound_event_id = _reconciliation_source_from_key(
+        get_task(conn, recovery_task_id)
+    )
 
     def _owner_authored(payload) -> bool:
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or bound_event_id is None:
             return False
         origin_run_id = payload.get("origin_run_id")
+        written_for = payload.get("source_event_id")
         return (
             payload.get("origin_task_id") == recovery_task_id
             and type(origin_run_id) is int
             and origin_run_id in owner_run_ids
+            and type(written_for) is int
+            and written_for == int(bound_event_id)
         )
 
     for row in rows:
@@ -7692,12 +7852,167 @@ def _required_reconciliation_text(reconciliation: Mapping, field_name: str) -> s
     return value.strip()
 
 
+def _recovery_continuation_provenance_error(
+    conn: sqlite3.Connection,
+    owner: "Task",
+    continuation_id: str,
+    source_id: str,
+    owner_run_id: Optional[int],
+) -> Optional[str]:
+    """Why ``continuation_id`` is not this owner's own continuation, or ``None``.
+
+    Accepting a continuation makes it a blocking parent of the source, so the
+    bar is durable proof of *creation* by this owner's current run for this
+    occurrence — not a link, which is a public verb anyone can use. Without it a
+    recovery owner parks its source behind any card on the board, including an
+    operator's own work, simply by linking that card under itself.
+
+    The proof is exactly what the public ``kanban_create`` tool already writes:
+    a ``created`` event naming this owner among the child's creation-time
+    parents. Later ``link_tasks`` calls cannot forge it, and a card minted
+    before this run started cannot carry it.
+    """
+    bound_source, bound_event = _reconciliation_source_from_key(owner)
+    if bound_source != source_id or bound_event is None:
+        return "reconciliation.continuation_task_id does not match recovery lineage"
+    continuation = get_task(conn, continuation_id)
+    if continuation is None:
+        return "reconciliation.continuation_task_id does not exist"
+    if continuation_id in (owner.id, source_id):
+        return (
+            "reconciliation.continuation_task_id must be a distinct task, not "
+            "the recovery owner or the source"
+        )
+    if is_recovery_owner_key(continuation.idempotency_key):
+        return (
+            "reconciliation.continuation_task_id must not be a recovery owner card"
+        )
+    if conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (owner.id, continuation_id),
+    ).fetchone() is None:
+        return (
+            "reconciliation.continuation_task_id must still be a child of this "
+            "recovery owner"
+        )
+    created_event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+        "ORDER BY id ASC LIMIT 1",
+        (continuation_id,),
+    ).fetchone()
+    try:
+        created_payload = json.loads(
+            (created_event["payload"] if created_event else None) or "{}"
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        created_payload = {}
+    created_parents = (
+        created_payload.get("parents")
+        if isinstance(created_payload, dict) else None
+    )
+    if not isinstance(created_parents, list) or owner.id not in created_parents:
+        return (
+            "reconciliation.continuation_task_id must be a task CREATED by this "
+            "recovery owner (linking an existing task is not provenance)"
+        )
+    # The run this outcome speaks for. Its liveness is the authority check's
+    # job (_recovery_outcome_authority_error, re-proved under the write lock);
+    # here it only anchors *when* the continuation had to be created, and by
+    # the time the edge is written the run is already settling.
+    run = conn.execute(
+        "SELECT started_at FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(owner_run_id), owner.id),
+    ).fetchone() if owner_run_id is not None else None
+    if run is None:
+        return (
+            "reconciliation.continuation_task_id has no owner run to be bound to"
+        )
+    created_at = int(continuation.created_at or 0)
+    if created_at < int(run["started_at"] or 0):
+        return (
+            "reconciliation.continuation_task_id predates this owner run and is "
+            "not this generation's continuation"
+        )
+    occurrence = conn.execute(
+        "SELECT created_at FROM task_events WHERE id = ? AND task_id = ?",
+        (int(bound_event), source_id),
+    ).fetchone()
+    if occurrence is None:
+        return "reconciliation.continuation_task_id has no source occurrence to bind to"
+    if created_at < int(occurrence["created_at"] or 0):
+        return (
+            "reconciliation.continuation_task_id predates the source occurrence "
+            "it claims to resolve"
+        )
+    return None
+
+
+def _recovery_outcome_authority_error(
+    conn: sqlite3.Connection,
+    recovery: "Task",
+    expected_run_id: Optional[int],
+    claim_lock: Optional[str],
+) -> Optional[str]:
+    """Why this caller may not report ``recovery``'s outcome, or ``None``.
+
+    Holding the reserved key is not authority to move a source: the key is
+    public once the card exists, and so is the run id. The caller must present
+    the owner's own **claim lock** — the only secret the dispatcher hands to the
+    process it actually spawned — and the live ``task_runs`` row behind it must
+    still agree with the task row. A task row can lag behind a reaped run;
+    checking only ``tasks`` would let a settled or stolen run still speak.
+    """
+    config = _blocker_reconciler_config()
+    if (
+        recovery.created_by != "blocker-reconciler"
+        or recovery.assignee != config["profile"]
+    ):
+        return (
+            "reconciliation outcomes require an authorized blocker reconciler "
+            "owner (created_by=blocker-reconciler, assignee="
+            f"{config['profile']})"
+        )
+    now = int(time.time())
+    run = (
+        conn.execute(
+            "SELECT task_id, status, ended_at, claim_lock, claim_expires "
+            "FROM task_runs WHERE id = ?",
+            (int(expected_run_id),),
+        ).fetchone()
+        if expected_run_id is not None else None
+    )
+    if (
+        recovery.status != "running"
+        or recovery.current_run_id is None
+        or expected_run_id is None
+        or int(expected_run_id) != int(recovery.current_run_id)
+        or not claim_lock
+        or not recovery.claim_lock
+        or recovery.claim_lock != claim_lock
+        or not recovery.claim_expires
+        or int(recovery.claim_expires) <= now
+        or run is None
+        or run["task_id"] != recovery.id
+        or run["status"] != "running"
+        or run["ended_at"] is not None
+        or run["claim_lock"] != claim_lock
+        or run["claim_expires"] is None
+        or int(run["claim_expires"]) <= now
+    ):
+        return (
+            "reconciliation outcomes require the running owner's own live "
+            "claim lock and matching run id"
+        )
+    return None
+
+
 def _validate_reconciliation_verdict(
     conn: sqlite3.Connection,
     recovery_task_id: str,
     metadata: Optional[Mapping],
     *,
     expected_run_id: Optional[int] = None,
+    claim_lock: Optional[str] = None,
 ) -> Optional[dict]:
     """Validate and normalize a recovery owner's machine-readable verdict.
 
@@ -7716,29 +8031,11 @@ def _validate_reconciliation_verdict(
     # the key is public once the card exists. The caller must be the owner's
     # own live run — an unscoped orchestrator, a stale worker environment, or
     # a card whose provenance was rewritten cannot report an outcome.
-    config = _blocker_reconciler_config()
-    if (
-        recovery.created_by != "blocker-reconciler"
-        or recovery.assignee != config["profile"]
-    ):
-        raise ValueError(
-            "reconciliation outcomes require an authorized blocker reconciler "
-            "owner (created_by=blocker-reconciler, assignee="
-            f"{config['profile']})"
-        )
-    if (
-        recovery.status != "running"
-        or recovery.current_run_id is None
-        or expected_run_id is None
-        or int(expected_run_id) != int(recovery.current_run_id)
-        or not recovery.claim_lock
-        or not recovery.claim_expires
-        or int(recovery.claim_expires) <= int(time.time())
-    ):
-        raise ValueError(
-            "reconciliation outcomes require the running owner's own live "
-            "claim and matching run id"
-        )
+    authority_error = _recovery_outcome_authority_error(
+        conn, recovery, expected_run_id, claim_lock,
+    )
+    if authority_error:
+        raise ValueError(authority_error)
 
     reconciliation = (
         metadata.get("reconciliation") if isinstance(metadata, Mapping) else None
@@ -7819,19 +8116,16 @@ def _validate_reconciliation_verdict(
         ).fetchone() is not None
         if not source_linked:
             # The public recovery-worker path is create-child + complete-owner.
-            # A child directly parented by this exact owner is durable proof that
-            # it belongs to this recovery occurrence; the kernel adds the
-            # continuation -> source edge atomically with the accepted verdict.
-            owner_linked = conn.execute(
-                "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-                (recovery_task_id, continuation_id),
-            ).fetchone() is not None
-            continuation = get_task(conn, continuation_id)
-            if not owner_linked or continuation is None:
-                raise ValueError(
-                    "reconciliation.continuation_task_id must already parent the "
-                    "source or be a child created by this recovery owner"
-                )
+            # A child this owner's live run actually CREATED for this occurrence
+            # is durable proof that it belongs to this recovery generation; the
+            # kernel adds the continuation -> source edge atomically with the
+            # accepted verdict. Rechecked under the write lock before that edge
+            # is written (see _apply_reconciliation_completion).
+            provenance_error = _recovery_continuation_provenance_error(
+                conn, recovery, continuation_id, source_id, expected_run_id,
+            )
+            if provenance_error:
+                raise ValueError(provenance_error)
             verdict["link_continuation_to_source"] = True
         verdict["continuation_task_id"] = continuation_id
     elif outcome == "dependency_wait":
@@ -8047,6 +8341,17 @@ def _apply_reconciliation_completion(
         "link_continuation_to_source"
     ):
         continuation_id = str(verdict["continuation_task_id"])
+        # Re-prove provenance under the write lock, immediately before the edge
+        # that makes this card a blocking parent of the source. Validation ran
+        # ahead of the transaction: the continuation can be deleted, unlinked
+        # from the owner, or swapped for an unrelated card in that window, and
+        # nothing else here would notice.
+        provenance_error = _recovery_continuation_provenance_error(
+            conn, recovery, continuation_id, source_id,
+            int(verdict["owner_run_id"]),
+        )
+        if provenance_error:
+            raise ValueError(provenance_error)
         if _would_cycle(conn, continuation_id, source_id):
             raise ValueError("reconciliation continuation link would create a cycle")
         conn.execute(
