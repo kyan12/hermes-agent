@@ -68,7 +68,18 @@ def set_reconciler(monkeypatch):
 
 
 @pytest.fixture
-def board(home, set_reconciler):
+def spawnable(monkeypatch):
+    """The configured recovery profile exists on this host."""
+    from hermes_cli import profiles as profiles_module
+
+    monkeypatch.setattr(
+        profiles_module, "profile_exists",
+        lambda name: str(name).strip().lower() in {"code-crab", "alice", "default"},
+    )
+
+
+@pytest.fixture
+def board(home, set_reconciler, spawnable):
     kb.init_db()
     conn = kb.connect()
     try:
@@ -464,14 +475,25 @@ def test_a_dependency_wait_verdict_parks_the_source_behind_its_parent(board):
     owner_id = _owners(board, source_id)[0]["id"]
     event_id, _ = _occurrence(board, source_id)
     dep = kb.create_task(board, title="real dependency", assignee="alice")
-    kb.link_tasks(board, dep, source_id)
+    owner = kb.claim_task(board, owner_id, claimer="code-crab")
+    assert owner is not None
+    # The edge must carry the owner's own provenance, or it is indistinguishable
+    # from an unrelated writer advancing the source.
+    assert kb.link_recovery_parent(
+        board, parent_id=dep, child_id=source_id,
+        recovery_task_id=owner_id, run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock, source_event_id=event_id,
+    )
 
-    assert _complete_owner(board, owner_id, {
+    assert kb.complete_task(
+        board, owner_id, result="reconciled", summary="reconciled",
+        expected_run_id=owner.current_run_id,
+        metadata={"reconciliation": {
         "outcome": "dependency_wait",
         "source_task_id": source_id,
         "source_event_id": event_id,
         "dependency_task_id": dep,
-    })
+    }})
     assert kb.get_task(board, source_id).status == "todo"
 
 
@@ -798,7 +820,7 @@ def test_the_backfill_cursor_is_durable_so_a_hot_source_cannot_starve_others(boa
 
 
 def test_a_board_created_before_the_lane_still_migrates_and_reconciles(
-    home, set_reconciler, tmp_path
+    home, set_reconciler, spawnable, tmp_path
 ):
     """Mixed-deployment path: an older DB gains the cursor + trigger in place."""
     legacy = tmp_path / "legacy.db"

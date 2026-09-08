@@ -1617,6 +1617,16 @@ def init_agent(
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
+    # A resumed desktop/TUI conversation can inherit a worker environment after
+    # that task's run has already closed.  Remove that stale routing identity
+    # before tool schemas and static Kanban guidance are selected.
+    try:
+        from agent.delegation_context import scrub_stale_dispatcher_worker_env
+
+        scrub_stale_dispatcher_worker_env()
+    except Exception:
+        pass
+
     try:
         from tools.registry import registry as _snapshot_registry
         agent._tool_snapshot_generation = _snapshot_registry._generation

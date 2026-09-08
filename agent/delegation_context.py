@@ -106,6 +106,72 @@ def is_dispatcher_owned_worker_context() -> bool:
     return not _NON_DISPATCHER_OWNED_CONTEXT.get()
 
 
+def scrub_stale_dispatcher_worker_env() -> bool:
+    """Drop inherited worker identity when durable claim authority is closed.
+
+    Desktop/TUI follow-ups may construct a fresh agent in a process that still
+    carries a completed worker's ``HERMES_KANBAN_*`` environment.  Environment
+    strings are routing hints, not authority: retain them only when the task and
+    run rows prove the same live, unexpired claim.  Return ``True`` when stale
+    identity was removed.  Never mutate process-global env from an in-process
+    delegated/cron context, where the variables still belong to the parent.
+    """
+    import os
+    import time
+
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id or not is_dispatcher_owned_worker_context():
+        return False
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    try:
+        run_id = int(raw_run_id) if raw_run_id is not None else None
+    except (TypeError, ValueError):
+        run_id = None
+
+    valid = False
+    try:
+        from hermes_cli import kanban_db as kb
+
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, task_id)
+            run = (
+                conn.execute(
+                    "SELECT task_id, status, ended_at, claim_lock, claim_expires "
+                    "FROM task_runs WHERE id=?",
+                    (run_id,),
+                ).fetchone()
+                if run_id is not None
+                else None
+            )
+            now = int(time.time())
+            valid = bool(
+                task is not None
+                and task.status == "running"
+                and task.current_run_id == run_id
+                and claim_lock
+                and task.claim_lock == claim_lock
+                and task.claim_expires is not None
+                and int(task.claim_expires) > now
+                and run is not None
+                and run["task_id"] == task_id
+                and run["status"] == "running"
+                and run["ended_at"] is None
+                and run["claim_lock"] == claim_lock
+                and run["claim_expires"] is not None
+                and int(run["claim_expires"]) > now
+            )
+    except Exception:
+        # A routing/DB failure cannot authenticate inherited worker identity.
+        valid = False
+
+    if valid:
+        return False
+    for key in KANBAN_ENV_KEYS:
+        os.environ.pop(key, None)
+    return True
+
+
 def enter_non_dispatcher_owned_context() -> Token[bool]:
     """Token-based form of :func:`non_dispatcher_owned_context`.
 

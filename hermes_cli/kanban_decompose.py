@@ -283,11 +283,24 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        recovery_source = (
+            task is not None and kb.is_automation_recovery_source(conn, task_id)
+        )
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    if recovery_source:
+        # Defence in depth for the direct call sites (dashboard specify, CLI):
+        # an automation-recovery source keeps the principal's title, body and
+        # approval envelope byte-for-byte. Classification of that card belongs
+        # to the exact-occurrence recovery lane, not the LLM specifier.
+        return DecomposeOutcome(
+            task_id, False,
+            "task is an automation-recovery source owned by the blocker "
+            "reconciler; auto-decomposition would rewrite its envelope",
         )
 
     cfg = _load_config()
@@ -457,7 +470,16 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column that may be decomposed.
+
+    ``triage`` holds two different things. A fresh intake card is waiting for a
+    specifier — that is what this list is for. A card ``block_task`` parked after
+    a machine failure is an automation-recovery source: its title, body and
+    approval envelope are the principal's, and running the LLM specifier or the
+    workgraph generator over it would rewrite work nobody agreed to change.
+    Those are owned by the exact-occurrence recovery lane
+    (:func:`kanban_db.enqueue_blocker_reconciliation`) and are excluded here.
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -465,4 +487,7 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+        return [
+            row.id for row in rows
+            if not kb.is_automation_recovery_source(conn, row.id)
+        ]

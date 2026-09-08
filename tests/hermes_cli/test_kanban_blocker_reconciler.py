@@ -35,7 +35,18 @@ RECONCILER_CONFIG = {
 
 
 @pytest.fixture
-def board(tmp_path, monkeypatch):
+def spawnable(monkeypatch):
+    """The configured recovery profile exists on this host."""
+    from hermes_cli import profiles as profiles_module
+
+    monkeypatch.setattr(
+        profiles_module, "profile_exists",
+        lambda name: str(name).strip().lower() in {"code-crab", "alice", "default"},
+    )
+
+
+@pytest.fixture
+def board(tmp_path, monkeypatch, spawnable):
     """An isolated HERMES_HOME + board with the reconciler lane enabled."""
     home = tmp_path / ".hermes"
     home.mkdir()
