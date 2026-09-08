@@ -10,7 +10,8 @@ import {
   hermesManagedNodePathEntries,
   normalizeHermesHomeRoot,
   pathEnvKey,
-  POSIX_SANE_PATH_ENTRIES
+  POSIX_SANE_PATH_ENTRIES,
+  withoutInheritedWorkerIdentity
 } from './backend-env'
 
 test('desktop backend PATH adds Hermes-managed bins and missing POSIX sane entries', () => {
@@ -188,4 +189,93 @@ test('Windows PATH casing and delimiter are preserved without POSIX sane entries
 
 test('appendUniquePathEntries drops empty entries and keeps first occurrence', () => {
   assert.equal(appendUniquePathEntries([':/a::/b', ['/a', '/c']], { delimiter: ':' }), '/a:/b:/c')
+})
+
+
+// ── Inherited Kanban worker identity ────────────────────────────────────────
+// The desktop spawns its backend with `...process.env`. When the app itself
+// was launched from a Kanban worker's shell, that spread hands a finished
+// worker's task + run to a human-facing backend, which then answers ordinary
+// chat with the worker stop protocol. Scrub the CHILD env only — the parent
+// Electron process is left alone.
+
+const WORKER_ENV = Object.freeze({
+  HERMES_KANBAN_TASK: 't_finished',
+  HERMES_KANBAN_RUN_ID: '2495',
+  HERMES_KANBAN_DB: '/home/u/.hermes/kanban.db',
+  HERMES_KANBAN_BOARD: 'worker-board',
+  HERMES_KANBAN_WORKSPACE: '/home/u/work/.worktrees/t_finished',
+  HERMES_KANBAN_WORKSPACES_ROOT: '/home/u/work/.worktrees',
+  HERMES_KANBAN_BRANCH: 'worker-branch',
+  HERMES_KANBAN_CLAIM_LOCK: 'worker-lock',
+  HERMES_KANBAN_GOAL_MODE: '1',
+  HERMES_KANBAN_GOAL_MAX_TURNS: '20',
+  HERMES_SESSION_SOURCE: 'kanban',
+  HERMES_DELEGATED_CHILD_CONTEXT: '1'
+})
+
+test('backend child env drops every inherited Kanban worker variable', () => {
+  const env = withoutInheritedWorkerIdentity({
+    ...WORKER_ENV,
+    TERMINAL_CWD: '/home/u/work/.worktrees/t_finished',
+    HERMES_HOME: '/home/u/.hermes',
+    PATH: '/usr/bin'
+  })
+
+  assert.deepEqual(Object.keys(env).filter(k => k.startsWith('HERMES_KANBAN_')), [])
+  assert.equal(env.HERMES_SESSION_SOURCE, undefined)
+  assert.equal(env.HERMES_DELEGATED_CHILD_CONTEXT, undefined)
+  assert.equal(env.TERMINAL_CWD, undefined)
+  // Profile / install intent is the user's, not the worker's.
+  assert.equal(env.HERMES_HOME, '/home/u/.hermes')
+  assert.equal(env.PATH, '/usr/bin')
+})
+
+test('backend child env leaves the parent process env untouched', () => {
+  const source = { ...WORKER_ENV }
+  withoutInheritedWorkerIdentity(source)
+  assert.equal(source.HERMES_KANBAN_TASK, 't_finished')
+})
+
+test('backend child env keeps a standalone board selection', () => {
+  const env = withoutInheritedWorkerIdentity({
+    HERMES_KANBAN_DB: '/home/u/.hermes/kanban.db',
+    HERMES_KANBAN_BOARD: 'ops',
+    TERMINAL_CWD: '/home/u/projects/site',
+    HERMES_SESSION_SOURCE: 'desktop'
+  })
+
+  assert.equal(env.HERMES_KANBAN_DB, '/home/u/.hermes/kanban.db')
+  assert.equal(env.HERMES_KANBAN_BOARD, 'ops')
+  assert.equal(env.TERMINAL_CWD, '/home/u/projects/site')
+  assert.equal(env.HERMES_SESSION_SOURCE, 'desktop')
+})
+
+test('backend child env keeps a cwd the user chose, not the worker workspace', () => {
+  const env = withoutInheritedWorkerIdentity({
+    ...WORKER_ENV,
+    TERMINAL_CWD: '/home/u/projects/site'
+  })
+
+  assert.equal(env.TERMINAL_CWD, '/home/u/projects/site')
+  assert.equal(env.HERMES_KANBAN_WORKSPACE, undefined)
+})
+
+test('backend child env drops a delegate_task lineage marker on its own', () => {
+  // scrub_kanban_env() strips HERMES_KANBAN_* but stamps the marker, so it
+  // arrives with no task var beside it.
+  const env = withoutInheritedWorkerIdentity({
+    HERMES_DELEGATED_CHILD_CONTEXT: '1',
+    HERMES_HOME: '/home/u/.hermes'
+  })
+
+  assert.equal(env.HERMES_DELEGATED_CHILD_CONTEXT, undefined)
+  assert.equal(env.HERMES_HOME, '/home/u/.hermes')
+})
+
+test('backend child env scrub is idempotent across desktop restarts', () => {
+  const once = withoutInheritedWorkerIdentity({ ...WORKER_ENV, HERMES_HOME: '/home/u/.hermes' })
+  const twice = withoutInheritedWorkerIdentity(once)
+
+  assert.deepEqual(twice, once)
 })

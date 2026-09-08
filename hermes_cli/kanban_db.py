@@ -489,6 +489,15 @@ def _board_path(
     return board_dir(slug) / leaf
 
 
+def board_db_path(board: Optional[str] = None) -> Path:
+    """Resolve a board's DB independently of the worker's HERMES_KANBAN_DB pin.
+
+    Ownership checks compare this canonical board path with the independently
+    supplied path pin; preserve the shared upstream layout resolver.
+    """
+    return _board_path(None, board, ("kanban.db",), "kanban.db")
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
     ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""

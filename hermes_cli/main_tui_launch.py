@@ -723,7 +723,15 @@ def _launch_tui(
     # TUI child is a hermes process: propagate the profile-home contract via
     # the single factory; keep secrets (the TUI/agent needs provider creds).
     from tools.environments.local import build_subprocess_env
-    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
+    from tui_gateway.interactive_env import clear_inherited_worker_identity
+
+    # Scrub the snapshot before the generic factory removes TASK but retains
+    # worker board/workspace pins. Scrub again after its descendant fence stamp:
+    # this is a dedicated interactive child, not an ordinary worker subprocess.
+    base_env = os.environ.copy()
+    clear_inherited_worker_identity(base_env)
+    env = build_subprocess_env(base=base_env, scrub_secrets=False, inherit_profile_home=True)
+    clear_inherited_worker_identity(env)
     from hermes_cli.shared_session_attach import configure_tui_attachment
     try:
         configure_tui_attachment(env, resume_session_id)

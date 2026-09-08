@@ -2502,6 +2502,10 @@ def _dashboard_prepare_runtime(args, headless_backend) -> bool:
 
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
+    # Detach before runtime preparation can spawn background MCP servers.
+    from tui_gateway.interactive_env import clear_inherited_worker_identity
+
+    clear_inherited_worker_identity()
     _token_file = getattr(args, "ssh_session_token_file", None)
     _dashboard_lifecycle_flags(args, _token_file)
 
