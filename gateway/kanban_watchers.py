@@ -366,15 +366,49 @@ def _machine_stop_disposition(task_id: str, board_slug: str, event_id):
                     and int(occurrence) > int(event_id)
                 ):
                     return True, ""
-            owner_id = _kb.active_recovery_owner(conn, task_id)
+            disposition = _kb.recovery_owner_disposition(conn, task_id)
     except Exception:
         # Unreadable board: say nothing extra, but still deliver the event.
         return False, ""
-    if owner_id:
-        return False, f"; automatic recovery in progress ({owner_id})"
+    return False, _recovery_disposition_note(disposition)
+
+
+def _recovery_disposition_note(disposition: dict) -> str:
+    """The one honest sentence about what recovery is doing for this card.
+
+    "automatic recovery will pick it up — no action needed from you" used to be
+    the default for every machine stop without a running owner, including the
+    two cases where nothing is coming: the lane is disabled, or no owner holds
+    the occurrence at all. A promise nobody will keep is worse than silence —
+    it is exactly what keeps a stranded card off the operator's radar. So each
+    disposition speaks for itself, and none of them invents a forward path.
+
+    Still machine-owned in every branch: a stop with no owner is automation's
+    debt to settle, never a gate waiting on the reader.
+    """
+    owner_id = disposition.get("owner_id")
+    reason = disposition.get("reason")
+    if reason == "executing" and owner_id:
+        return f"; automatic recovery in progress ({owner_id})"
+    if reason == "queued" and owner_id:
+        return (
+            f"; automatic recovery owner {owner_id} is queued and has not "
+            "started yet"
+        )
+    if reason == "held" and owner_id:
+        return (
+            f"; automatic recovery owner {owner_id} is on hold and is not "
+            "running"
+        )
+    if reason == "lane_disabled":
+        queued = f" (owner {owner_id} cannot be claimed)" if owner_id else ""
+        return (
+            "; automatic recovery is disabled, so nothing will pick this up"
+            f"{queued}"
+        )
     return (
-        False,
-        "; automatic recovery will pick it up — no action needed from you",
+        "; no automatic recovery owner holds this occurrence — nothing will "
+        "pick it up until the recovery lane mints one"
     )
 
 

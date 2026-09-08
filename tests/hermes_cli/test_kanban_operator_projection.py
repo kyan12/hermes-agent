@@ -189,16 +189,90 @@ def test_a_recovery_source_without_a_live_owner_is_machine_owned_blocked(board):
     assert projection.lifecycle_status == "triage"
 
 
-def test_a_queued_recovery_owner_still_reads_as_recovery_in_progress(board):
-    """A minted-but-unclaimed owner is a real forward path, not a dead end."""
+def test_a_queued_recovery_owner_is_blocked_not_recovery_in_progress(board):
+    """Owning an occurrence is not executing it.
+
+    A minted-but-unclaimed owner means the lane accepted the occurrence; it
+    does not mean anything is running. Rendering it "Recovery in progress"
+    told the operator a worker was on the card when no claim existed at all.
+    """
     source_id = _stall(board)
     owner_id = kb.active_recovery_owner(board, source_id)
     assert kb.get_task(board, owner_id).status in {"ready", "todo"}
 
     projection = _project(board, source_id)
-    assert projection.column == "running"
+    assert projection.column == "blocked"
+    assert projection.state == "blocked"
     assert projection.stage == "recovery"
+    assert projection.owner == "machine"
+    assert projection.reason_code == kh.REASON_RECOVERY_QUEUED
+    assert projection.next_owner == "blocker-reconciler"
+    # The owner card is named, so the operator can open the exact card.
     assert projection.evidence["recovery_task_id"] == owner_id
+    assert owner_id in (projection.action or "")
+
+
+def test_a_queued_owner_still_owns_the_occurrence_for_dedupe(board):
+    """Projection honesty must not weaken duplicate-owner exclusion."""
+    source_id = _stall(board)
+    owner_id = kb.active_recovery_owner(board, source_id)
+    owner = kb.get_task(board, owner_id)
+    assert owner.status in {"ready", "todo"}
+    # Still a live owner for coalescing: a repeat occurrence must land on this
+    # card rather than minting a second one.
+    assert kb._recovery_owner_is_live(board, owner) is True
+    assert _project(board, source_id).column == "blocked"
+
+
+def test_a_held_recovery_owner_is_blocked_with_a_machine_reason(board):
+    """A scheduled hold is a stopped card, however it got there."""
+    source_id = _stall(board)
+    owner_id = kb.active_recovery_owner(board, source_id)
+    board.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (owner_id,))
+    board.commit()
+
+    projection = _project(board, source_id)
+    assert projection.column == "blocked"
+    assert projection.owner == "machine"
+    assert projection.reason_code == kh.REASON_RECOVERY_HELD
+    assert projection.next_owner == "blocker-reconciler"
+    assert projection.evidence["recovery_task_id"] == owner_id
+    assert projection.action
+
+
+def test_disabling_the_lane_after_enqueue_stops_reading_as_in_progress(
+    board, set_reconciler
+):
+    """The kill switch scenario: an owner exists, but nothing can claim it."""
+    source_id = _stall(board)
+    owner_id = kb.active_recovery_owner(board, source_id)
+    assert owner_id is not None
+    set_reconciler(enabled=False)
+    # Proof there is no forward path: the claim boundary refuses it.
+    assert kb.claim_task(board, owner_id, claimer="code-crab") is None
+
+    projection = _project(board, source_id)
+    assert projection.column == "blocked"
+    assert projection.state == "blocked"
+    assert projection.owner == "machine"
+    assert projection.reason_code == kh.REASON_RECOVERY_DISABLED
+    assert projection.next_owner == "blocker-reconciler"
+    assert projection.action
+    # The queued owner card is described, never cancelled.
+    assert kb.get_task(board, owner_id).status in {"ready", "todo"}
+
+
+def test_a_running_owner_whose_claim_holds_is_the_only_recovery_in_progress(board):
+    source_id = _stall(board)
+    owner_id = kb.active_recovery_owner(board, source_id)
+    owner = kb.claim_task(board, owner_id, claimer="code-crab")
+    assert owner is not None and kb.get_task(board, owner_id).status == "running"
+
+    projection = _project(board, source_id)
+    assert projection.column == "running"
+    assert projection.state == "in_progress"
+    assert projection.reason_code == kh.REASON_RECOVERY_IN_PROGRESS
+    assert projection.evidence["recovery_run_id"] == int(owner.current_run_id)
 
 
 def test_a_plain_intake_triage_card_is_never_left_for_kevin_to_classify(board):
@@ -283,7 +357,9 @@ def test_no_card_is_hidden_and_no_lane_is_invented(board):
     )
     assert set(columns) == set(kh.OPERATOR_COLUMNS)
     assert review_id in columns["running"]
-    assert source_id in columns["running"]
+    # The stalled source has a queued owner, which is ownership without
+    # execution: visible in Blocked, machine-owned, never hidden.
+    assert source_id in columns["blocked"]
 
 
 def test_the_counts_the_operator_sees_are_the_columns_they_see(board):
@@ -463,19 +539,23 @@ def _gave_up(conn, *, title="circuit broken"):
     return tid
 
 
-def test_a_gave_up_source_with_a_queued_owner_reads_as_recovery(board):
+def test_a_gave_up_source_with_a_queued_owner_is_machine_owned_blocked(board):
+    """The breaker mints an owner in the same txn — but nothing is running."""
     source_id = _gave_up(board)
     owner_id = kb.active_recovery_owner(board, source_id)
     assert owner_id is not None, "gave_up minted no recovery owner"
     assert kb.get_task(board, owner_id).status in {"ready", "todo"}
 
     projection = _project(board, source_id)
-    assert projection.column == "running"
-    assert projection.state == "in_progress"
+    assert projection.column == "blocked"
+    assert projection.state == "blocked"
     assert projection.stage == "recovery"
-    assert projection.owner == "machine"
-    assert projection.reason_code == kh.REASON_RECOVERY_IN_PROGRESS
+    assert projection.owner == "machine", (
+        "a machine failure with a queued owner must not read as Needs Kevin"
+    )
+    assert projection.reason_code == kh.REASON_RECOVERY_QUEUED
     assert projection.evidence["recovery_task_id"] == owner_id
+    assert projection.action
     # The durable row is untouched and still inspectable.
     assert projection.lifecycle_status == "blocked"
     assert kb.get_task(board, source_id).status == "blocked"
@@ -535,7 +615,18 @@ def test_an_affirmed_gate_outranks_a_live_recovery_owner(board):
 def test_the_board_places_a_recovering_gave_up_source_in_progress(board):
     """Columns and counts follow the projection, as everywhere else."""
     source_id = _gave_up(board)
+    owner_id = kb.active_recovery_owner(board, source_id)
+    assert kb.claim_task(board, owner_id, claimer="code-crab") is not None
 
     columns = _board_shape(board)
     assert source_id in columns["running"]
     assert kh.operator_column_counts(board)["running"] >= 1
+
+
+def test_the_board_leaves_a_queued_gave_up_source_in_blocked(board):
+    """Counts must not manufacture progress out of a queued owner card."""
+    source_id = _gave_up(board)
+
+    columns = _board_shape(board)
+    assert source_id in columns["blocked"]
+    assert source_id not in columns["running"]

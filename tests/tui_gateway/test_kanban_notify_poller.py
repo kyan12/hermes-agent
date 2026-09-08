@@ -689,6 +689,31 @@ class TestGaveUpIsAnHonestMachineStop:
         if owner_id:
             assert owner_id in joined or "no action needed" in joined.lower()
 
+    def test_a_stop_with_no_owner_is_never_promised_automatic_recovery(self):
+        """No owner, no promise.
+
+        With the reconciler lane disabled (the default), a machine stop has no
+        forward path at all: nothing will mint an owner and nothing will claim
+        one. "automatic recovery will pick it up — no action needed from you"
+        is then simply false, and it is the sentence that keeps a stranded card
+        invisible.
+        """
+        tid = _create_subscribed_task()
+        _trip_breaker(tid)
+        conn = kb.connect()
+        try:
+            assert kb.active_recovery_owner(conn, tid) is None
+        finally:
+            conn.close()
+
+        joined = "\n".join(_collect_kanban_notifications(_session())).lower()
+
+        assert "no action needed" not in joined, joined
+        assert "will pick it up" not in joined, joined
+        # Still machine-owned and still explicit about the missing path.
+        assert "recovery" in joined, joined
+        assert "no automatic recovery owner" in joined or "disabled" in joined, joined
+
     def test_a_gate_affirmed_before_the_poll_suppresses_gave_up(self):
         tid = _create_subscribed_task()
         _trip_breaker(tid)

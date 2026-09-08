@@ -7451,6 +7451,84 @@ def active_recovery_owner(
     return None
 
 
+def _recovery_owner_is_executing(conn: sqlite3.Connection, owner: "Task") -> bool:
+    """Whether this owner is *executing*, not merely holding the occurrence.
+
+    Ownership and execution are different facts and only one of them is
+    evidence. ``_recovery_owner_is_live`` deliberately counts a queued owner:
+    it answers "may a repeat occurrence coalesce onto this card, or must a
+    second owner be minted?", and a queued card is a perfectly good owner for
+    that. It is the wrong predicate for "is automation on this right now" —
+    answering yes for a card with no claim at all is how a stranded source
+    rendered as *Recovery in progress*.
+    """
+    return owner.status == "running" and _recovery_owner_is_live(conn, owner)
+
+
+def recovery_owner_disposition(
+    conn: sqlite3.Connection, source_task_id: str
+) -> dict:
+    """What automatic recovery is actually doing for ``source_task_id`` now.
+
+    One reading of the lane, shared by every surface that speaks about it, so
+    the board, the gateway notifier and the TUI cannot describe the same card
+    differently. Returns the owner (when there is one) plus a machine reason:
+
+      ``executing``      a running owner whose claim genuinely holds;
+      ``queued``         an owner exists but holds no claim — nothing running;
+      ``held``           the owner is on a scheduled hold;
+      ``lane_disabled``  the kill switch is off, so no claim can be taken at
+                         all — an existing owner cannot advance either;
+      ``unowned``        no owner holds this source's occurrence.
+
+    Only ``executing`` is evidence of progress. Everything else is a stop, and
+    naming which stop it is, is the whole point: "queued" and "disabled" have
+    different fixes, and neither is "wait, it is being handled".
+    """
+    owner: Optional["Task"] = None
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key LIKE ? "
+        "AND status IN ('todo','ready','running','review','scheduled') "
+        "ORDER BY created_at, id",
+        (f"{RECONCILIATION_IDEMPOTENCY_PREFIX}%:{source_task_id}:%",),
+    ).fetchall()
+    for row in rows:
+        candidate = get_task(conn, row["id"])
+        if candidate is None or not _recovery_owner_is_live(conn, candidate):
+            continue
+        if _recovery_owner_is_executing(conn, candidate):
+            owner = candidate
+            break
+        if owner is None:
+            owner = candidate
+
+    def _disposition(reason: str) -> dict:
+        return {
+            "reason": reason,
+            "executing": reason == "executing",
+            "owner_id": owner.id if owner is not None else None,
+            "owner_status": owner.status if owner is not None else None,
+            "owner_assignee": owner.assignee if owner is not None else None,
+            "owner_run_id": (
+                int(owner.current_run_id)
+                if owner is not None and owner.current_run_id is not None
+                else None
+            ),
+        }
+
+    if owner is not None and _recovery_owner_is_executing(conn, owner):
+        # A worker already spawned under this claim keeps running even if the
+        # switch flips; the outcome boundary is where a disabled lane stops it.
+        return _disposition("executing")
+    if not blocker_reconciler_enabled():
+        return _disposition("lane_disabled")
+    if owner is None:
+        return _disposition("unowned")
+    if owner.status == "scheduled":
+        return _disposition("held")
+    return _disposition("queued")
+
+
 def _recovery_profile_spawnable(profile: str) -> bool:
     """Whether the configured recovery profile can actually be dispatched.
 

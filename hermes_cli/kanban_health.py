@@ -2274,6 +2274,12 @@ OWNER_KEVIN = "kevin"
 
 REASON_RECOVERY_IN_PROGRESS = "recovery_in_progress"
 REASON_RECOVERY_UNOWNED = "recovery_unowned"
+#: An owner holds the occurrence but nothing is executing it. Each of these is
+#: a different stop with a different fix, so none of them may collapse into
+#: "recovery in progress" — or into each other.
+REASON_RECOVERY_QUEUED = "recovery_queued"
+REASON_RECOVERY_HELD = "recovery_held"
+REASON_RECOVERY_DISABLED = "recovery_disabled"
 REASON_INTAKE_UNOWNED = "intake_unowned"
 REASON_REVIEW_IN_PROGRESS = "review_in_progress"
 REASON_WORKER_RUNNING = "worker_running"
@@ -2321,36 +2327,56 @@ class OperatorProjection:
         }
 
 
-def _recovery_owner_evidence(conn, task) -> Optional[dict]:
-    """The live recovery owner for this source, as displayable evidence.
+#: Machine reason code per recovery disposition, and whether it is progress.
+_RECOVERY_DISPOSITION_REASONS = {
+    "executing": REASON_RECOVERY_IN_PROGRESS,
+    "queued": REASON_RECOVERY_QUEUED,
+    "held": REASON_RECOVERY_HELD,
+    "lane_disabled": REASON_RECOVERY_DISABLED,
+    "unowned": REASON_RECOVERY_UNOWNED,
+}
 
-    "Recovery in progress" has to be backed by a card an operator can open,
-    not by a hidden triage count or a fabricated source run. ``None`` when no
-    owner can still make progress — which is a real Blocked, not a quiet wait.
+
+def _recovery_disposition(conn, task) -> dict:
+    """What automatic recovery is doing for this source, read from the board.
+
+    "Recovery in progress" has to be backed by a card an operator can open
+    *and* by a claim that genuinely holds — not by a hidden triage count, a
+    fabricated source run, or a queued card nothing has picked up. Anything
+    short of that is a real Blocked, and the disposition says which one.
+
+    Fails closed: an unreadable lane is reported as unowned, so the card lands
+    in Blocked with a next action rather than quietly claiming progress.
     """
     from hermes_cli import kanban_db as kb
 
     try:
-        owner_id = kb.active_recovery_owner(conn, task.id)
+        return kb.recovery_owner_disposition(conn, task.id)
     except Exception:
         logger.debug("recovery owner lookup failed for %s", task.id, exc_info=True)
-        return None
-    if not owner_id:
-        return None
-    owner = kb.get_task(conn, owner_id)
-    if owner is None:
+        return {
+            "reason": "unowned", "executing": False, "owner_id": None,
+            "owner_status": None, "owner_assignee": None, "owner_run_id": None,
+        }
+
+
+def _recovery_owner_evidence(disposition: dict) -> Optional[dict]:
+    """The owner card as displayable evidence, whatever state it is in.
+
+    Shown for a stopped owner too: "queued owner t_ab12cd" is a card an
+    operator can open, and hiding it is how a stall becomes unattributable.
+    """
+    if not disposition.get("owner_id"):
         return None
     return {
-        "recovery_task_id": owner.id,
-        "recovery_status": owner.status,
-        "recovery_run_id": (
-            int(owner.current_run_id) if owner.current_run_id is not None else None
-        ),
-        "recovery_assignee": owner.assignee,
+        "recovery_task_id": disposition["owner_id"],
+        "recovery_status": disposition.get("owner_status"),
+        "recovery_run_id": disposition.get("owner_run_id"),
+        "recovery_assignee": disposition.get("owner_assignee"),
     }
 
 
-def _machine_recovery_action(conn, task) -> str:
+def _machine_recovery_action(conn, task, disposition: Optional[dict] = None) -> str:
     """The one precise next action for a machine-owned stop.
 
     Deliberately phrased as something the machine owes, not something Kevin
@@ -2369,6 +2395,28 @@ def _machine_recovery_action(conn, task) -> str:
         logger.debug("recovery action lookup failed for %s", task.id, exc_info=True)
     if exhausted:
         return str(exhausted)
+    reason = (disposition or {}).get("reason", "unowned")
+    owner_id = (disposition or {}).get("owner_id")
+    if reason == "queued" and owner_id:
+        return (
+            f"Recovery owner {owner_id} holds this occurrence but has not been "
+            f"claimed ({(disposition or {}).get('owner_status')}) — the "
+            "blocker-reconciler dispatcher must claim and run it; nothing is "
+            "executing until it does."
+        )
+    if reason == "held" and owner_id:
+        return (
+            f"Recovery owner {owner_id} is on a scheduled hold and is not "
+            "running — release the hold so the blocker-reconciler dispatcher "
+            "can claim it."
+        )
+    if reason == "lane_disabled":
+        held = f" Owner {owner_id} stays queued and unclaimable." if owner_id else ""
+        return (
+            "The blocker-reconciler lane is disabled, so no recovery owner can "
+            "be claimed for this occurrence — re-enable "
+            f"kanban.blocker_reconciler.enabled to give it a forward path.{held}"
+        )
     return (
         "Automatic recovery has no live owner for this occurrence — the "
         "blocker-reconciler lane must mint one (check that it is enabled and "
@@ -2424,12 +2472,24 @@ def project_operator_state(conn, task) -> OperatorProjection:
             owner=OWNER_MACHINE,
         )
     if status == "triage":
-        evidence = _recovery_owner_evidence(conn, task)
-        if evidence is not None:
+        disposition = _recovery_disposition(conn, task)
+        evidence = _recovery_owner_evidence(disposition)
+        if disposition["executing"]:
             return _projection(
                 "running", STATE_IN_PROGRESS, "recovery",
                 REASON_RECOVERY_IN_PROGRESS,
                 owner=OWNER_MACHINE, next_owner=evidence.get("recovery_assignee"),
+                evidence=evidence,
+            )
+        if evidence is not None:
+            # An owner that is queued, held or unclaimable is still a stop, and
+            # it is a machine stop: the operator is told which card is stuck
+            # and what has to happen to it, never asked to approve anything.
+            return _projection(
+                "blocked", STATE_BLOCKED, "recovery",
+                _RECOVERY_DISPOSITION_REASONS[disposition["reason"]],
+                owner=OWNER_MACHINE, next_owner="blocker-reconciler",
+                action=_machine_recovery_action(conn, task, disposition),
                 evidence=evidence,
             )
         from hermes_cli import kanban_db as kb
@@ -2439,11 +2499,14 @@ def project_operator_state(conn, task) -> OperatorProjection:
         except Exception:
             logger.debug("recovery source probe failed for %s", task_id, exc_info=True)
             is_recovery = True  # fail closed: describe it as a machine stop
+        reason_code = REASON_INTAKE_UNOWNED
+        if is_recovery:
+            reason_code = _RECOVERY_DISPOSITION_REASONS[disposition["reason"]]
         return _projection(
             "blocked", STATE_BLOCKED, "recovery" if is_recovery else "intake",
-            REASON_RECOVERY_UNOWNED if is_recovery else REASON_INTAKE_UNOWNED,
+            reason_code,
             owner=OWNER_MACHINE, next_owner="blocker-reconciler",
-            action=_machine_recovery_action(conn, task),
+            action=_machine_recovery_action(conn, task, disposition),
         )
     if status == "blocked":
         block = classify_block(conn, task)
@@ -2453,8 +2516,9 @@ def project_operator_state(conn, task) -> OperatorProjection:
                 owner=OWNER_KEVIN, next_owner=operator_principal(),
                 action=block.action,
             )
-        evidence = _recovery_owner_evidence(conn, task)
-        if evidence is not None:
+        disposition = _recovery_disposition(conn, task)
+        evidence = _recovery_owner_evidence(disposition)
+        if disposition["executing"]:
             # The circuit breaker sets the source ``blocked`` and emits
             # ``gave_up`` in ONE transaction, and ``gave_up`` is a
             # reconciliation occurrence — so the pre-COMMIT drain mints the
@@ -2475,11 +2539,22 @@ def project_operator_state(conn, task) -> OperatorProjection:
                 next_owner=evidence.get("recovery_assignee"),
                 evidence=evidence,
             )
+        if evidence is not None:
+            # An owner exists and is going nowhere. Blocked, machine-owned, and
+            # explicit about which card is stuck and why — the operator is
+            # never asked to approve a machine failure.
+            return _projection(
+                "blocked", STATE_BLOCKED, "recovery",
+                _RECOVERY_DISPOSITION_REASONS[disposition["reason"]],
+                owner=OWNER_MACHINE, next_owner="blocker-reconciler",
+                action=_machine_recovery_action(conn, task, disposition),
+                evidence=evidence,
+            )
         return _projection(
             "blocked", STATE_BLOCKED, "machine_block", block.reason_code,
             owner=OWNER_MACHINE,
             next_owner="blocker-reconciler",
-            action=_machine_recovery_action(conn, task),
+            action=_machine_recovery_action(conn, task, disposition),
         )
 
     # A status this projection has never seen is not silently "todo": an

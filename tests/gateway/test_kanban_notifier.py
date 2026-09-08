@@ -939,3 +939,80 @@ def test_gave_up_is_suppressed_when_an_operator_already_took_the_card(
     joined = "\n".join(d["text"] for d in adapter.sent).lower()
     assert "gave up" not in joined, joined
     assert "automatic recovery" not in joined, joined
+
+
+def test_a_machine_stop_with_no_forward_path_states_it_plainly(
+    tmp_path, monkeypatch
+):
+    """The disposition note must never promise recovery that cannot happen.
+
+    ``_machine_stop_disposition`` is the one place both the gateway notifier
+    and the TUI poller get this sentence from, so an untruthful default is
+    untruthful in both surfaces at once.
+    """
+    from gateway.kanban_watchers import _machine_stop_disposition
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "no-forward-path.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="stranded", assignee="worker")
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb._record_task_failure(
+            conn, tid, error="elapsed 600s", outcome="timed_out",
+            force_trip=True, release_claim=True, end_run=True,
+        ) is True
+        # The lane is disabled in this profile, so no owner was ever minted.
+        assert kb.active_recovery_owner(conn, tid) is None
+        event_id = max(int(e.id) for e in kb.list_events(conn, tid))
+    finally:
+        conn.close()
+
+    superseded, note = _machine_stop_disposition(tid, "", event_id)
+
+    assert superseded is False
+    lowered = note.lower()
+    assert "no action needed" not in lowered, note
+    assert "will pick it up" not in lowered, note
+    assert "recovery" in lowered, note
+    assert "no automatic recovery owner" in lowered or "disabled" in lowered, note
+
+
+def test_a_queued_recovery_owner_is_reported_as_queued_not_running(
+    tmp_path, monkeypatch
+):
+    """An owner that exists but holds no claim is named, honestly."""
+    from gateway.kanban_watchers import _machine_stop_disposition
+    import hermes_cli.config as config_module
+    from hermes_cli import profiles as profiles_module
+
+    monkeypatch.setattr(
+        config_module, "load_config",
+        lambda *a, **k: {"kanban": {"blocker_reconciler": {
+            "enabled": True, "profile": "code-crab", "max_active": 2,
+        }}},
+    )
+    monkeypatch.setattr(profiles_module, "profile_exists", lambda name: True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "queued-owner.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="queued owner", assignee="worker")
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb._record_task_failure(
+            conn, tid, error="elapsed 600s", outcome="timed_out",
+            force_trip=True, release_claim=True, end_run=True,
+        ) is True
+        owner_id = kb.active_recovery_owner(conn, tid)
+        assert owner_id is not None
+        assert kb.get_task(conn, owner_id).status in {"ready", "todo"}
+        event_id = max(int(e.id) for e in kb.list_events(conn, tid))
+    finally:
+        conn.close()
+
+    _, note = _machine_stop_disposition(tid, "", event_id)
+
+    assert owner_id in note, note
+    assert "in progress" not in note.lower(), note
+    assert "queued" in note.lower(), note
+    assert "no action needed" not in note.lower(), note
