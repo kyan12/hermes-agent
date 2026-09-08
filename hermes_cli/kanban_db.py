@@ -2984,10 +2984,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     "GROUP BY idempotency_key HAVING COUNT(*) > 1"
                 )
             ]
+            _claim_cols = {
+                "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+            } <= _final_task_cols
             for _key in _dupe_keys:
                 _rows = conn.execute(
-                    "SELECT id, status FROM tasks WHERE idempotency_key=? "
-                    "ORDER BY created_at, id",
+                    (
+                        "SELECT id, status, current_run_id, claim_lock, "
+                        "claim_expires, worker_pid FROM tasks "
+                        if _claim_cols else
+                        "SELECT id, status FROM tasks "
+                    )
+                    + "WHERE idempotency_key=? ORDER BY created_at, id",
                     (_key,),
                 ).fetchall()
                 # Retire by liveness first, arrival order only to break ties.
@@ -2995,11 +3003,34 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 # owner that can still produce a verdict whenever an older
                 # duplicate is already dead, which strands the source behind a
                 # card nobody will ever run.
-                _live = [
+                #
+                # Liveness is the same robust predicate the running system uses:
+                # a ``running`` row whose run was reaped, expired or never
+                # existed is dead however recent it is, so a later ``ready``
+                # duplicate — which a dispatcher can still pick up — outranks it.
+                # Rows that are merely *usable* (a queued phase, or a running
+                # row this schema cannot fully judge) are the second choice, so
+                # a genuinely stopped board still keeps its most plausible owner
+                # rather than an archived one.
+                _usable = [
                     row for row in _rows
                     if row["status"] in RECOVERY_OWNER_LIVE_STATUSES
                 ]
-                _retained = (_live[0] if _live else _rows[0])["id"]
+                _live = [
+                    row for row in _usable
+                    if not _claim_cols or _recovery_owner_row_is_live(
+                        conn,
+                        task_id=row["id"],
+                        status=row["status"],
+                        current_run_id=row["current_run_id"],
+                        claim_lock=row["claim_lock"],
+                        claim_expires=row["claim_expires"],
+                        worker_pid=row["worker_pid"],
+                    )
+                ]
+                _retained = (
+                    _live[0] if _live else (_usable[0] if _usable else _rows[0])
+                )["id"]
                 for _extra in _rows:
                     if _extra["id"] == _retained:
                         continue
@@ -3029,7 +3060,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                             "retained_task_id": _retained,
                         },
                     )
-                if not _live and _can_rearm:
+                if not _usable and _can_rearm:
                     # Nothing survivable was retained, so the occurrence has no
                     # owner at all. Re-arm the source for the backfill scan
                     # instead of leaving it silently stopped.
@@ -3549,6 +3580,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    recovery_origin: Optional[Mapping] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3582,6 +3614,17 @@ def create_task(
     (``minimal``…``ultra``, or ``none`` to disable thinking), passed as
     ``--reasoning <level>``. It is independent of ``model_override``: a task
     can run the profile's own model at a different depth.
+
+    ``recovery_origin`` stamps durable creation provenance onto the new task's
+    ``created`` event when a blocker-reconciliation owner creates its own
+    continuation. It is a mapping of ``task_id`` / ``run_id`` / ``claim_lock``,
+    verified against the owner's live claim before anything is written — the
+    claim lock is the one secret the dispatcher hands the process it actually
+    spawned, so an unrelated caller cannot stamp a card as some owner's
+    continuation. The lock itself is never stored; what lands on the event is
+    ``origin_task_id`` / ``origin_run_id`` / ``source_event_id``, which is what
+    the completion boundary later demands as proof of *creation* rather than a
+    link anyone could have made.
 
     ``project_source_task_id`` is an internal cross-profile fallback for a
     worker-created child. When the active profile cannot resolve ``project_id``
@@ -3771,6 +3814,12 @@ def create_task(
             )
         skills_list = cleaned
 
+    if recovery_origin is not None:
+        # Verified here as well as under the write lock: a caller that cannot
+        # prove it is the owner must be refused even when the call would short
+        # circuit on an existing idempotency key rather than insert anything.
+        _verified_recovery_origin(conn, recovery_origin, parents)
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -3816,6 +3865,14 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                # Re-proved under the write lock, so the stamp and the authority
+                # it asserts share one transaction: a reclaim or an expiry
+                # between validation and insertion cannot leave a card carrying
+                # provenance for a run that had already stopped.
+                recovery_provenance = (
+                    _verified_recovery_origin(conn, recovery_origin, parents)
+                    if recovery_origin is not None else None
+                )
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3930,6 +3987,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        **(recovery_provenance or {}),
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -5016,6 +5074,39 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _recovery_claim_rejection(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict]:
+    """Why this recovery owner may not be claimed right now, or ``None``.
+
+    The kill switch and ``max_active`` are promises about how many recovery
+    *workers* exist, so they bind wherever ownership is actually acquired and a
+    worker is about to be spawned. ``review`` is a second such door
+    (:func:`claim_review_task`), so both call this one helper: two copies of
+    this policy is two chances for one door to be left open.
+
+    Returns the ``claim_rejected`` event payload the caller should record.
+    """
+    row = conn.execute(
+        "SELECT idempotency_key FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or not is_recovery_owner_key(row["idempotency_key"]):
+        return None
+    config = _blocker_reconciler_config()
+    if not config["enabled"]:
+        return {"reason": "blocker_reconciler_disabled"}
+    # Counted advisorily anywhere earlier, two dispatcher ticks both read
+    # "under the cap" and both spawn.
+    if _live_recovery_owner_count(
+        conn, exclude_task_id=task_id
+    ) >= config["max_active"]:
+        return {
+            "reason": "blocker_reconciler_max_active",
+            "max_active": config["max_active"],
+        }
+    return None
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5032,37 +5123,14 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        # Kill switch, enforced where ownership is actually acquired rather
-        # than advisory at enqueue: flipping the lane off stops owners that
-        # already exist from being claimed and dispatched, not just new ones.
-        existing = conn.execute(
-            "SELECT idempotency_key FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if existing is not None and is_recovery_owner_key(
-            existing["idempotency_key"]
-        ):
-            config = _blocker_reconciler_config()
-            if not config["enabled"]:
-                _append_event(
-                    conn, task_id, "claim_rejected",
-                    {"reason": "blocker_reconciler_disabled"},
-                )
-                return None
-            # ``max_active`` is a promise about how many recovery workers may
-            # run at once, so it binds where ownership is actually acquired.
-            # Counted advisorily anywhere earlier, two dispatcher ticks both
-            # read "under the cap" and both spawn.
-            if _live_recovery_owner_count(
-                conn, exclude_task_id=task_id
-            ) >= config["max_active"]:
-                _append_event(
-                    conn, task_id, "claim_rejected",
-                    {
-                        "reason": "blocker_reconciler_max_active",
-                        "max_active": config["max_active"],
-                    },
-                )
-                return None
+        # Kill switch and concurrency cap, enforced where ownership is actually
+        # acquired rather than advisory at enqueue: flipping the lane off stops
+        # owners that already exist from being claimed and dispatched, not just
+        # new ones.
+        rejection = _recovery_claim_rejection(conn, task_id)
+        if rejection is not None:
+            _append_event(conn, task_id, "claim_rejected", rejection)
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -5186,11 +5254,21 @@ def claim_review_task(
 
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
+
+    Recovery owners pass through the same kill switch and ``max_active`` gate as
+    :func:`claim_task` (see :func:`_recovery_claim_rejection`).
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # The same recovery gate as claim_task, in the same atomic transaction:
+        # a review claim spawns a worker too, so a disabled lane or an exhausted
+        # ``max_active`` must stop it here as well.
+        rejection = _recovery_claim_rejection(conn, task_id)
+        if rejection is not None:
+            _append_event(conn, task_id, "claim_rejected", rejection)
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -7083,14 +7161,42 @@ def _reconciliation_generation_count(
 
 
 def _source_has_affirmed_gate(conn: sqlite3.Connection, source: "Task") -> bool:
-    """Whether an operator has affirmed a human gate that must stay stopped."""
+    """Whether an operator holds a human gate on this card RIGHT NOW.
+
+    Occurrence-bound, on exactly the terms
+    :func:`kanban_health.classify_block` uses, because this predicate decides
+    whether a machine failure gets a recovery owner at all — and a wrong
+    "yes" is the no-forward-path signature the lane exists to prevent.
+
+    The two things it used to accept are both merely historical:
+
+    * *any* ``blocked{affirmed:true}`` event anywhere in the card's history.
+      ``unblock_task`` releases a gate by clearing ``gate_evidence`` and
+      appending ``unblocked``; it cannot retract an event. So one gate
+      affirmed and released hours ago silenced recovery for every later
+      machine failure on that card, forever.
+    * a non-empty ``gate_evidence`` column on its own. That is a plain column:
+      a writer predating it — or an older version against the same shared DB —
+      can unblock and re-block while leaving it untouched, and the previous
+      occurrence's affirmation then reads as current.
+
+    Fails closed the safe way for THIS predicate: when authority cannot be
+    proven the card is not gated, so automation still owns it and the source
+    keeps a forward path. A genuinely held gate is unaffected — it is exactly
+    what ``classify_block`` reports as visible.
+    """
     if source.status != "blocked":
         return False
-    return bool(getattr(source, "gate_evidence", None)) or conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id=? AND kind='blocked' "
-        "AND json_extract(payload, '$.affirmed')=1 LIMIT 1",
-        (source.id,),
-    ).fetchone() is not None
+    try:
+        from hermes_cli import kanban_health as kh
+
+        return bool(kh.classify_block(conn, source).visible)
+    except Exception:
+        logger.debug(
+            "gate authority check failed for %s; treating as ungated",
+            source.id, exc_info=True,
+        )
+        return False
 
 
 def _handle_terminal_reconciliation_failure(
@@ -7194,24 +7300,97 @@ def is_automation_recovery_source(
     ).fetchone() is not None
 
 
+def _recovery_run_claim_holds(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id,
+    claim_lock: Optional[str],
+    now: Optional[int] = None,
+) -> bool:
+    """Whether the ``task_runs`` row behind a claim still backs it.
+
+    ``tasks`` mirrors the claim; ``task_runs`` is where a reaper, a crash sweep
+    or a superseding claim actually settles it, so the task row can advertise an
+    unexpired lock for a run that ended minutes ago. Every recovery authority
+    check reads the run row through here, so none of them can drift apart.
+
+    A database migrating up from a version without ``task_runs`` has no run to
+    read; that is not proof of a live claim either, so it fails closed.
+    """
+    if run_id is None or not claim_lock:
+        return False
+    now = int(time.time()) if now is None else int(now)
+    try:
+        run = conn.execute(
+            "SELECT task_id, status, ended_at, claim_lock, claim_expires "
+            "FROM task_runs WHERE id = ?",
+            (int(run_id),),
+        ).fetchone()
+    except (sqlite3.Error, TypeError, ValueError):
+        return False
+    return bool(
+        run is not None
+        and run["task_id"] == task_id
+        and run["status"] == "running"
+        and run["ended_at"] is None
+        and run["claim_lock"] == claim_lock
+        and run["claim_expires"] is not None
+        and int(run["claim_expires"]) > now
+    )
+
+
+def _recovery_owner_row_is_live(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    status: Optional[str],
+    current_run_id=None,
+    claim_lock: Optional[str] = None,
+    claim_expires=None,
+    worker_pid=None,
+) -> bool:
+    """Liveness for one recovery-owner row, from raw columns.
+
+    Takes columns rather than a :class:`Task` so the duplicate-owner migration —
+    which runs before the schema is guaranteed to hydrate a ``Task`` — can apply
+    exactly the same predicate the running system does.
+    """
+    if status not in RECOVERY_OWNER_LIVE_STATUSES:
+        return False
+    if status != "running":
+        # Queued phases assert no claim at all: nothing can be stale about them,
+        # and a dispatcher can still pick them up.
+        return True
+    return bool(
+        current_run_id
+        and claim_lock
+        and claim_expires
+        and int(claim_expires) > int(time.time())
+        and (worker_pid is None or _pid_alive(worker_pid))
+        and _recovery_run_claim_holds(
+            conn, task_id=task_id, run_id=current_run_id, claim_lock=claim_lock,
+        )
+    )
+
+
 def _recovery_owner_is_live(conn: sqlite3.Connection, owner: "Task") -> bool:
     """Whether a recovery owner can still actually make progress.
 
-    A ``running`` row is only a live owner while its claim genuinely holds. A
-    crashed or reaped worker must neither suppress the source's forward path nor
-    absorb a new occurrence. ``worker_pid`` is NULL between claim and spawn,
-    which is still live; a *recorded* pid that is gone is not.
+    A ``running`` row is only a live owner while its claim genuinely holds — in
+    ``task_runs``, not merely in the task row that mirrors it. A crashed or
+    reaped worker must neither suppress the source's forward path nor absorb a
+    new occurrence. ``worker_pid`` is NULL between claim and spawn, which is
+    still live; a *recorded* pid that is gone is not.
     """
-    if owner.status not in RECOVERY_OWNER_LIVE_STATUSES:
-        return False
-    if owner.status != "running":
-        return True
-    return bool(
-        owner.current_run_id
-        and owner.claim_lock
-        and owner.claim_expires
-        and int(owner.claim_expires) > int(time.time())
-        and (owner.worker_pid is None or _pid_alive(owner.worker_pid))
+    return _recovery_owner_row_is_live(
+        conn,
+        task_id=owner.id,
+        status=owner.status,
+        current_run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock,
+        claim_expires=owner.claim_expires,
+        worker_pid=owner.worker_pid,
     )
 
 
@@ -7286,6 +7465,12 @@ def _verify_recovery_owner_claim(
     writes outside its own card. Possession of the reserved key proves nothing:
     the caller must present the owner's current run id AND its claim lock, and
     the claim must not have expired.
+
+    The task row alone is not the claim. It lags the authoritative ``task_runs``
+    row whenever a reaper, a crash sweep or a superseding claim settles the run,
+    so a worker whose run ended could keep writing evidence and links onto a
+    source it no longer owns. The live run row is checked here too, exactly as
+    :func:`_recovery_outcome_authority_error` checks it at the outcome boundary.
     """
     owner = get_task(conn, recovery_task_id)
     if owner is None or not is_recovery_owner_key(owner.idempotency_key):
@@ -7300,7 +7485,58 @@ def _verify_recovery_owner_claim(
         return None
     if not owner.claim_expires or int(owner.claim_expires) <= int(time.time()):
         return None
+    if not _recovery_run_claim_holds(
+        conn, task_id=owner.id, run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock,
+    ):
+        return None
     return owner
+
+
+def _verified_recovery_origin(
+    conn: sqlite3.Connection,
+    recovery_origin: Mapping,
+    parents: Iterable[str],
+) -> dict:
+    """Durable creation provenance for a recovery owner's own continuation.
+
+    Returns the fields to stamp onto the child's ``created`` event, or raises
+    when the caller cannot prove it *is* the owner it names. This is the whole
+    point of the stamp: a continuation becomes a blocking parent of the source,
+    so the completion boundary needs proof that this owner's live run created
+    the card — and a proof anyone could write is not one. The claim lock is the
+    only secret the dispatcher hands the process it spawned, so requiring it
+    here is what stops an unrelated caller from minting a card that later reads
+    as some owner's continuation.
+    """
+    if not isinstance(recovery_origin, Mapping):
+        raise ValueError("recovery_origin must be a mapping")
+    owner_id = str(recovery_origin.get("task_id") or "")
+    raw_run_id = recovery_origin.get("run_id")
+    try:
+        run_id = int(raw_run_id) if raw_run_id is not None else None
+    except (TypeError, ValueError):
+        run_id = None
+    owner = _verify_recovery_owner_claim(
+        conn, owner_id, run_id, recovery_origin.get("claim_lock"),
+    )
+    if owner is None:
+        raise ValueError(
+            "recovery_origin does not present a live recovery owner claim"
+        )
+    if owner.id not in [str(parent_id) for parent_id in parents]:
+        raise ValueError(
+            "recovery_origin requires its recovery owner among the new task's "
+            "parents"
+        )
+    _, bound_event_id = _reconciliation_source_from_key(owner)
+    if bound_event_id is None:
+        raise ValueError("recovery_origin owner names no source occurrence")
+    return {
+        "origin_task_id": owner.id,
+        "origin_run_id": int(owner.current_run_id),
+        "source_event_id": int(bound_event_id),
+    }
 
 
 def _recovery_write_is_occurrence_bound(
@@ -7332,6 +7568,27 @@ def _recovery_write_is_occurrence_bound(
         (claimed_event, source_task_id),
     ).fetchone()
     return row is not None and row["kind"] in RECONCILIATION_EVENT_KINDS
+
+
+def recovery_owner_source_binding(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[tuple]:
+    """``(source_task_id, source_event_id)`` this task is a recovery owner for.
+
+    ``None`` for every ordinary card. Public because the tool layer has to make
+    the same distinction the kernel does — a recovery owner's writes on *its own
+    bound source* are evidence and must carry provenance, while the very same
+    tool call against any other card stays the ordinary handoff channel. Reading
+    the reserved key here rather than re-deriving it in the tool layer keeps one
+    definition of "which occurrence does this worker own".
+    """
+    owner = get_task(conn, task_id)
+    if owner is None or not is_recovery_owner_key(owner.idempotency_key):
+        return None
+    bound_source, bound_event = _reconciliation_source_from_key(owner)
+    if not bound_source or bound_event is None:
+        return None
+    return str(bound_source), int(bound_event)
 
 
 def add_recovery_evidence_comment(
@@ -7867,10 +8124,13 @@ def _recovery_continuation_provenance_error(
     recovery owner parks its source behind any card on the board, including an
     operator's own work, simply by linking that card under itself.
 
-    The proof is exactly what the public ``kanban_create`` tool already writes:
-    a ``created`` event naming this owner among the child's creation-time
-    parents. Later ``link_tasks`` calls cannot forge it, and a card minted
-    before this run started cannot carry it.
+    The proof is a durable stamp on the child's own ``created`` event, written
+    at the public ``kanban_create`` boundary only after the creator proved it
+    held this owner's live claim (see :func:`_verified_recovery_origin`): the
+    exact owner, the exact run, and the exact occurrence. Creation-time parents
+    and timestamps are kept as a second fence, but they are not the proof —
+    parents are a public verb, and two cards created in the same second are
+    indistinguishable by time.
     """
     bound_source, bound_event = _reconciliation_source_from_key(owner)
     if bound_source != source_id or bound_event is None:
@@ -7914,6 +8174,22 @@ def _recovery_continuation_provenance_error(
         return (
             "reconciliation.continuation_task_id must be a task CREATED by this "
             "recovery owner (linking an existing task is not provenance)"
+        )
+    if owner_run_id is None:
+        return (
+            "reconciliation.continuation_task_id has no owner run to be bound to"
+        )
+    if (
+        created_payload.get("origin_task_id") != owner.id
+        or type(created_payload.get("origin_run_id")) is not int
+        or created_payload.get("origin_run_id") != int(owner_run_id)
+        or type(created_payload.get("source_event_id")) is not int
+        or created_payload.get("source_event_id") != int(bound_event)
+    ):
+        return (
+            "reconciliation.continuation_task_id lacks durable creation "
+            "provenance for this owner run and occurrence (it was not created "
+            "through this owner's own live claim)"
         )
     # The run this outcome speaks for. Its liveness is the authority check's
     # job (_recovery_outcome_authority_error, re-proved under the write lock);
@@ -7973,14 +8249,6 @@ def _recovery_outcome_authority_error(
             f"{config['profile']})"
         )
     now = int(time.time())
-    run = (
-        conn.execute(
-            "SELECT task_id, status, ended_at, claim_lock, claim_expires "
-            "FROM task_runs WHERE id = ?",
-            (int(expected_run_id),),
-        ).fetchone()
-        if expected_run_id is not None else None
-    )
     if (
         recovery.status != "running"
         or recovery.current_run_id is None
@@ -7991,13 +8259,10 @@ def _recovery_outcome_authority_error(
         or recovery.claim_lock != claim_lock
         or not recovery.claim_expires
         or int(recovery.claim_expires) <= now
-        or run is None
-        or run["task_id"] != recovery.id
-        or run["status"] != "running"
-        or run["ended_at"] is not None
-        or run["claim_lock"] != claim_lock
-        or run["claim_expires"] is None
-        or int(run["claim_expires"]) <= now
+        or not _recovery_run_claim_holds(
+            conn, task_id=recovery.id, run_id=expected_run_id,
+            claim_lock=claim_lock, now=now,
+        )
     ):
         return (
             "reconciliation outcomes require the running owner's own live "
@@ -8110,23 +8375,28 @@ def _validate_reconciliation_verdict(
         )
         if get_task(conn, continuation_id) is None:
             raise ValueError("reconciliation.continuation_task_id does not exist")
-        source_linked = conn.execute(
+        # The public recovery-worker path is create-child + complete-owner.
+        # A child this owner's live run actually CREATED for this occurrence
+        # is durable proof that it belongs to this recovery generation; the
+        # kernel adds the continuation -> source edge atomically with the
+        # accepted verdict. Rechecked under the write lock before that edge
+        # is written (see _apply_reconciliation_completion).
+        #
+        # Checked whether or not the edge already exists. An owner may link
+        # continuation -> source itself through link_recovery_parent, and if a
+        # pre-existing edge skipped this check it would be a free escape hatch:
+        # link the operator's own card under the source first, name it as the
+        # continuation second, and the source is parked behind a card this
+        # recovery generation never created.
+        provenance_error = _recovery_continuation_provenance_error(
+            conn, recovery, continuation_id, source_id, expected_run_id,
+        )
+        if provenance_error:
+            raise ValueError(provenance_error)
+        verdict["link_continuation_to_source"] = conn.execute(
             "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
             (continuation_id, source_id),
-        ).fetchone() is not None
-        if not source_linked:
-            # The public recovery-worker path is create-child + complete-owner.
-            # A child this owner's live run actually CREATED for this occurrence
-            # is durable proof that it belongs to this recovery generation; the
-            # kernel adds the continuation -> source edge atomically with the
-            # accepted verdict. Rechecked under the write lock before that edge
-            # is written (see _apply_reconciliation_completion).
-            provenance_error = _recovery_continuation_provenance_error(
-                conn, recovery, continuation_id, source_id, expected_run_id,
-            )
-            if provenance_error:
-                raise ValueError(provenance_error)
-            verdict["link_continuation_to_source"] = True
+        ).fetchone() is None
         verdict["continuation_task_id"] = continuation_id
     elif outcome == "dependency_wait":
         dependency_id = _required_reconciliation_text(
@@ -8337,39 +8607,43 @@ def _apply_reconciliation_completion(
         )
         return
 
-    if outcome == "continuation_created" and verdict.get(
-        "link_continuation_to_source"
-    ):
+    if outcome == "continuation_created":
         continuation_id = str(verdict["continuation_task_id"])
         # Re-prove provenance under the write lock, immediately before the edge
         # that makes this card a blocking parent of the source. Validation ran
         # ahead of the transaction: the continuation can be deleted, unlinked
         # from the owner, or swapped for an unrelated card in that window, and
-        # nothing else here would notice.
+        # nothing else here would notice. Re-proved even when the edge already
+        # exists — an accepted verdict parks the source behind that card either
+        # way, so the proof has to hold either way.
         provenance_error = _recovery_continuation_provenance_error(
             conn, recovery, continuation_id, source_id,
             int(verdict["owner_run_id"]),
         )
         if provenance_error:
             raise ValueError(provenance_error)
-        if _would_cycle(conn, continuation_id, source_id):
-            raise ValueError("reconciliation continuation link would create a cycle")
-        conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-            (continuation_id, source_id),
-        )
-        _append_event(
-            conn,
-            source_id,
-            "linked",
-            {
-                "parent": continuation_id,
-                "child": source_id,
-                "origin_task_id": recovery_task_id,
-                "origin_run_id": int(verdict["owner_run_id"]),
-                "source_event_id": source_event_id,
-            },
-        )
+        if verdict.get("link_continuation_to_source"):
+            if _would_cycle(conn, continuation_id, source_id):
+                raise ValueError(
+                    "reconciliation continuation link would create a cycle"
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                "VALUES (?, ?)",
+                (continuation_id, source_id),
+            )
+            _append_event(
+                conn,
+                source_id,
+                "linked",
+                {
+                    "parent": continuation_id,
+                    "child": source_id,
+                    "origin_task_id": recovery_task_id,
+                    "origin_run_id": int(verdict["owner_run_id"]),
+                    "source_event_id": source_event_id,
+                },
+            )
 
     generation_exhausted = (
         outcome in RECONCILIATION_RESUMPTIVE_OUTCOMES
@@ -11445,6 +11719,8 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    claim_lock: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -11499,6 +11775,28 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        # Optional caller authority, proved INSIDE the write transaction.
+        #
+        # An in-process caller (the iteration-budget fallback in
+        # ``turn_finalizer``) selects its victim from ``HERMES_KANBAN_TASK``,
+        # which a cron tick or a delegate_task child running inside the
+        # worker's own process inherits verbatim. Charging a failure is not a
+        # read: it increments the breaker, can trip it, emits ``gave_up``,
+        # blocks the card and closes the run. An env check alone is a
+        # check-then-act — the claim can be reaped in the window, and the
+        # process that reclaimed the task is then the one whose run gets
+        # closed. So the run id and claim lock travel with the mutation and
+        # are verified here, under the same lock that performs it.
+        #
+        # Callers that pass neither keep the previous unconditional behaviour:
+        # the dispatcher's own reap paths legitimately act on a task whose
+        # claim they have already released, and must not start failing closed.
+        if expected_run_id is not None or claim_lock is not None:
+            if not _recovery_run_claim_holds(
+                conn, task_id=task_id, run_id=expected_run_id,
+                claim_lock=claim_lock,
+            ) or row["current_run_id"] != expected_run_id:
+                return False
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim

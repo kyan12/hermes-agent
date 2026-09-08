@@ -33,6 +33,9 @@ from hermes_cli import kanban_swarm as ks
 # Small formatting helpers
 # ---------------------------------------------------------------------------
 
+# Keyed by OPERATOR lane, not by raw lifecycle status: the CLI shows the same
+# lanes the dashboard does (see kanban_health.OPERATOR_COLUMNS), so `triage` and
+# `review` never need an icon — they are stages, projected into these lanes.
 _STATUS_ICONS = {
     "todo":     "◻",
     "ready":    "▶",
@@ -50,11 +53,20 @@ def _fmt_ts(ts: Optional[int]) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
-def _fmt_task_line(t: kb.Task) -> str:
-    icon = _STATUS_ICONS.get(t.status, "?")
+def _fmt_task_line(t: kb.Task, projection=None) -> str:
+    """One board row in the operator's vocabulary.
+
+    ``projection`` is the operator lane from
+    ``kanban_health.project_operator_state``. Passing it keeps the terminal and
+    the dashboard describing a card the same way; without it the row falls back
+    to the durable status, which is still what `kanban show` prints for
+    inspection.
+    """
+    lane = getattr(projection, "column", None) or t.status
+    icon = _STATUS_ICONS.get(lane, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    return f"{icon} {t.id}  {lane:9s}  {assignee:20s}{tenant}  {t.title}"
 
 
 def _task_to_dict(t: kb.Task, conn=None) -> dict[str, Any]:
@@ -84,8 +96,13 @@ def _task_to_dict(t: kb.Task, conn=None) -> dict[str, Any]:
         "current_step_key": t.current_step_key,
     }
     if conn is not None:
-        from hermes_cli import kanban_health as kh
-        return kh.project_task_serialization(conn, t, payload)
+        projected = kh.project_task_serialization(conn, t, payload)
+        # Both halves travel together: ``status`` stays the durable lifecycle
+        # value so the board is inspectable, and ``operator`` names the lane
+        # this same card is drawn in, its owner and its one next action — so
+        # the detail view can never disagree with the column it came from.
+        projected["operator"] = kh.project_operator_state(conn, t).as_payload()
+        return projected
     return payload
 
 
@@ -1843,10 +1860,18 @@ def _cmd_list(args: argparse.Namespace) -> int:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
         kb.recompute_ready(conn)
+        # An operator lane is a projection over several lifecycle statuses, so
+        # it cannot be pushed into the SQL status filter: `--status running`
+        # must also return the cards sitting in `review` and in an owned
+        # `triage` recovery, and those rows would never be fetched. Filter by
+        # lane below instead; a raw lifecycle status still filters directly.
+        _lane_filter = (
+            args.status if args.status in kh.OPERATOR_COLUMNS else None
+        )
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,
-            status=args.status,
+            status=None if _lane_filter else args.status,
             tenant=args.tenant,
             session_id=args.session,
             include_archived=args.archived,
@@ -1854,14 +1879,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
             workflow_template_id=args.workflow_template_id,
             current_step_key=args.current_step_key,
         )
-        projections = {}
-        if any(t.status == "blocked" for t in tasks):
-            from hermes_cli import kanban_health as kh
-            projections = {
-                t.id: kh.classify_block(conn, t) for t in tasks if t.status == "blocked"
-            }
-            if args.status == "blocked":
-                tasks = [t for t in tasks if projections[t.id].visible]
+        # One projection for the whole listing: the lane a card prints in, the
+        # lane a --status filter selects, and the lane the dashboard shows are
+        # the same decision. Filtering `--status blocked` down to affirmed
+        # gates only used to HIDE every machine-owned stop, which is how a
+        # stranded card left the operator's view entirely.
+        lanes = {t.id: kh.project_operator_state(conn, t) for t in tasks}
+        if _lane_filter:
+            tasks = [t for t in tasks if lanes[t.id].column == _lane_filter]
         serialized = {t.id: _task_to_dict(t, conn) for t in tasks}
     if getattr(args, "json", False):
         payload = []
@@ -1887,12 +1912,12 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print("(no matching tasks)")
         return 0
+    # The row is printed from the operator projection rather than by
+    # string-replacing "blocked " with "triage  ": that rewrite is exactly the
+    # user-facing Triage bucket this board no longer has, and it disagreed with
+    # both the dashboard column and the count above it.
     for t in tasks:
-        projection = projections.get(t.id)
-        if projection is not None and not projection.visible:
-            print(_fmt_task_line(t).replace("blocked ", "triage  ", 1))
-        else:
-            print(_fmt_task_line(t))
+        print(_fmt_task_line(t, lanes.get(t.id)))
     return 0
 
 
@@ -3446,9 +3471,15 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
-    print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
-        print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
+    # Counted by operator lane through the same projection the board renders,
+    # so the numbers here cannot disagree with the columns. The previous
+    # hardcoded tuple both advertised a Triage bucket and silently dropped
+    # every card sitting in `review`.
+    print("By lane:")
+    with kb.connect_closing() as _conn:
+        lane_counts = kh.operator_column_counts(_conn)
+    for k in kh.OPERATOR_COLUMNS:
+        print(f"  {k:9s}  {lane_counts.get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
         for who, counts in sorted(stats["by_assignee"].items()):

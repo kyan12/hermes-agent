@@ -9092,8 +9092,23 @@ def run_conversation(
                         getattr(agent, "_kanban_stop_nudges", 0) + 1
                     )
                     final_msg["finish_reason"] = "kanban_terminal_required"
-                    final_msg["_kanban_stop_synthetic"] = True
+                    # The assistant turn is REAL content — the worker's own
+                    # words. Only the nudge is synthetic scaffolding. Flagging
+                    # the assistant message too (as this used to) made the
+                    # ephemeral-scaffolding filter drop the worker's actual
+                    # answer from the durable transcript, so a stale binding
+                    # did not merely add a nudge: it deleted the reply. Same
+                    # contract as the pre_verify path above (#65919 §7).
+                    agent._emit_interim_assistant_message(final_msg)
                     append_message(messages, final_msg)
+                    try:
+                        agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        )
+                    except Exception:
+                        logger.debug(
+                            "kanban stop-guard interim flush failed", exc_info=True
+                        )
                     append_message(messages, {
                         "role": "user",
                         "content": _kanban_nudge,

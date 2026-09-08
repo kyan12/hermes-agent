@@ -165,9 +165,30 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
+def _grant_worker_claim(monkeypatch, task_id, *, run_id=7, lock="lock-7"):
+    """Make this process the genuine live worker for ``task_id``.
+
+    The budget-exhaustion path now refuses to charge a failure unless it holds
+    the task's live claim — a cron tick or delegate_task child running inside a
+    worker's own process inherits ``HERMES_KANBAN_TASK`` and used to be able to
+    block the parent's card (see
+    tests/agent/test_kanban_budget_exhaustion_authority.py, which drives a real
+    board). These tests are about the finalizer's ROUTING, so they stub the
+    authority rather than standing up a board.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", lock)
+    monkeypatch.setattr(
+        "agent.delegation_context.live_dispatcher_worker_task",
+        lambda: task_id,
+    )
+    return {"expected_run_id": run_id, "claim_lock": lock}
+
+
 def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    _claim = _grant_worker_claim(monkeypatch, "task-123")
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
@@ -193,6 +214,9 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         release_claim=True,
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
+        # Re-proved inside the write transaction, not just in the env.
+        expected_run_id=_claim["expected_run_id"],
+        claim_lock=_claim["claim_lock"],
     )
 
 
@@ -241,7 +265,7 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     the bounded fallback path (#87096).
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-456")
+    _claim = _grant_worker_claim(monkeypatch, "task-456")
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
@@ -275,6 +299,8 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     assert kwargs["end_run"] is True
     assert kwargs["event_payload_extra"]["budget_used"] == 60
     assert kwargs["event_payload_extra"]["budget_max"] == 60
+    assert kwargs["expected_run_id"] == _claim["expected_run_id"]
+    assert kwargs["claim_lock"] == _claim["claim_lock"]
 
 
 def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
@@ -282,7 +308,7 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     the bounded fallback must still record a terminal kanban failure (#87096).
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-789")
+    _claim = _grant_worker_claim(monkeypatch, "task-789")
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
@@ -309,6 +335,8 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     args, kwargs = record.call_args
     assert args[1] == "task-789"
     assert kwargs["outcome"] == "timed_out"
+    assert kwargs["expected_run_id"] == _claim["expected_run_id"]
+    assert kwargs["claim_lock"] == _claim["claim_lock"]
 
 
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):

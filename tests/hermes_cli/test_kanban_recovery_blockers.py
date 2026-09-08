@@ -377,11 +377,21 @@ def test_evidence_writes_require_the_owners_live_claim(board):
 
 
 def test_a_provenance_bound_continuation_link_is_accepted(board):
+    """The owner may link its own continuation early; the verdict still holds.
+
+    The edge already existing is not itself the authority — the continuation
+    still has to carry this run's creation provenance (see
+    ``test_a_prelinked_continuation_still_needs_creation_provenance``).
+    """
     source_id = _stall(board)
     owner_id = _owners(board, source_id)[0]["id"]
     event_id = _occurrence(board, source_id)
     owner = _claim_owner(board, owner_id)
-    cont = kb.create_task(board, title="continuation", assignee="alice")
+    cont = kb.create_task(
+        board, title="continuation", assignee="code-crab",
+        parents=[owner_id], created_by="blocker-reconciler",
+        recovery_origin=_recovery_origin(owner),
+    )
 
     assert kb.link_recovery_parent(
         board, parent_id=cont, child_id=source_id,
@@ -638,7 +648,13 @@ def test_bounded_exhaustion_surfaces_one_precise_action(board):
 
 
 def test_continuation_outcome_links_owner_created_child_without_private_kernel_call(board):
-    """A real recovery worker only has create + complete, not private DB helpers."""
+    """A real recovery worker only has create + complete, not private DB helpers.
+
+    ``recovery_origin`` is not a private helper: it is what the public
+    ``kanban_create`` handler derives from the worker's own claim environment
+    and passes through on the worker's behalf, so the surface the worker
+    actually drives is still create + complete.
+    """
     source_id = _stall(board)
     event_id = _occurrence(board, source_id)
     owner_id = kb.active_recovery_owner(board, source_id)
@@ -649,6 +665,7 @@ def test_continuation_outcome_links_owner_created_child_without_private_kernel_c
         assignee="code-crab",
         parents=[owner_id],
         created_by="code-crab",
+        recovery_origin=_recovery_origin(owner),
     )
 
     assert kb.complete_task(
@@ -1275,3 +1292,460 @@ def test_the_concurrency_cap_never_blocks_ordinary_work(board, set_reconciler):
 
     ordinary = kb.create_task(board, title="ordinary work", assignee="alice")
     assert kb.claim_task(board, ordinary, claimer="alice") is not None
+
+
+# ---------------------------------------------------------------------------
+# 14 — the owner's live RUN row is the claim, not the task row that mirrors it
+# ---------------------------------------------------------------------------
+
+
+def _reap_owner_run(conn, owner):
+    """Settle the owner's run row while its task row still advertises a claim.
+
+    Exactly what a reaper, a crash sweep or a superseding claim leaves behind:
+    ``tasks`` lags the authoritative ``task_runs`` row.
+    """
+    conn.execute(
+        "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', "
+        "ended_at=?, claim_lock=NULL, claim_expires=NULL WHERE id=?",
+        (int(time.time()), int(owner.current_run_id)),
+    )
+    conn.commit()
+
+
+def test_evidence_writes_require_the_owners_live_run_row(board):
+    """A task row can lag a reaped run; only the run row proves the claim."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+    _reap_owner_run(board, owner)
+
+    assert kb.add_recovery_evidence_comment(
+        board, source_id, recovery_task_id=owner_id,
+        run_id=owner.current_run_id, claim_lock=owner.claim_lock,
+        source_event_id=event_id, body="a reaped worker is still writing",
+    ) is False
+    assert board.execute(
+        "SELECT COUNT(*) AS n FROM task_comments WHERE task_id=?", (source_id,),
+    ).fetchone()["n"] == 0
+
+
+def test_recovery_links_require_the_owners_live_run_row(board):
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+    parent = kb.create_task(board, title="dependency", assignee="alice")
+    _reap_owner_run(board, owner)
+
+    assert kb.link_recovery_parent(
+        board, parent_id=parent, child_id=source_id,
+        recovery_task_id=owner_id, run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock, source_event_id=event_id,
+    ) is False
+    assert board.execute(
+        "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+        (parent, source_id),
+    ).fetchone() is None
+
+
+def test_evidence_writes_reject_a_run_row_belonging_to_another_task(board):
+    """A stolen run id whose row names a different task is not this claim."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+    other = kb.create_task(board, title="another worker", assignee="alice")
+    board.execute(
+        "UPDATE task_runs SET task_id=? WHERE id=?",
+        (other, int(owner.current_run_id)),
+    )
+    board.commit()
+
+    assert kb.add_recovery_evidence_comment(
+        board, source_id, recovery_task_id=owner_id,
+        run_id=owner.current_run_id, claim_lock=owner.claim_lock,
+        source_event_id=event_id, body="not my run",
+    ) is False
+
+
+def test_a_running_owner_without_a_live_run_row_is_not_a_live_owner(board):
+    """A reaped owner must neither hold the occurrence nor stop the source."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    owner = _claim_owner(board, owner_id)
+    _reap_owner_run(board, owner)
+
+    assert kb._recovery_owner_is_live(board, kb.get_task(board, owner_id)) is False
+    assert kb.active_recovery_owner(board, source_id) is None
+
+    _later_occurrence(board, source_id)
+    live = kb.active_recovery_owner(board, source_id)
+    assert live is not None and live != owner_id, (
+        "a new occurrence was coalesced onto an owner whose run was reaped"
+    )
+
+
+def test_a_reaped_recovery_owner_does_not_consume_the_concurrency_cap(
+    board, set_reconciler
+):
+    """One dead run must not wedge the whole recovery lane."""
+    set_reconciler(max_active=1)
+    first_source = _stall(board, title="first stall")
+    second_source = _stall(board, title="second stall")
+    first_owner = _owners(board, first_source)[0]["id"]
+    second_owner = _owners(board, second_source)[0]["id"]
+
+    claimed = kb.claim_task(board, first_owner, claimer="code-crab")
+    assert claimed is not None
+    _reap_owner_run(board, claimed)
+
+    assert kb.claim_task(board, second_owner, claimer="code-crab") is not None
+
+
+def test_a_ready_or_scheduled_owner_stays_usable_without_any_run(board):
+    """Only ``running`` asserts a claim; queued phases are usable as-is."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    for status in ("ready", "todo", "scheduled", "review"):
+        board.execute("UPDATE tasks SET status=? WHERE id=?", (status, owner_id))
+        board.commit()
+        assert kb._recovery_owner_is_live(
+            board, kb.get_task(board, owner_id)
+        ) is True, f"{status} owner was treated as dead"
+
+
+def test_migration_retains_a_later_ready_owner_over_an_earlier_stale_running_one(
+    tmp_path, monkeypatch, set_reconciler
+):
+    """A ``running`` row with no live run is dead; the later ready row survives."""
+    db, key = _legacy_duplicate_db(
+        tmp_path, monkeypatch,
+        [("t_stale_running", "running", 0), ("t_ready", "ready", 10)],
+    )
+
+    conn = kb.connect(db)
+    try:
+        assert [r["id"] for r in conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=?", (key,),
+        )] == ["t_ready"], "the migration kept an owner that can never finish"
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id='t_stale_running'"
+        ).fetchone()["status"] == "archived"
+    finally:
+        conn.close()
+
+
+def test_migration_prefers_the_owner_whose_run_row_is_actually_live(
+    tmp_path, monkeypatch, set_reconciler
+):
+    """Between two ``running`` duplicates, only the one with a live run counts."""
+    db, key = _legacy_duplicate_db(
+        tmp_path, monkeypatch,
+        [("t_reaped", "running", 0), ("t_working", "running", 10)],
+        runs=[(91, "t_working")],
+    )
+
+    conn = kb.connect(db)
+    try:
+        assert [r["id"] for r in conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=?", (key,),
+        )] == ["t_working"]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 15 — a continuation carries durable creation provenance, always validated
+# ---------------------------------------------------------------------------
+
+
+def _recovery_origin(owner):
+    return {
+        "task_id": owner.id,
+        "run_id": owner.current_run_id,
+        "claim_lock": owner.claim_lock,
+    }
+
+
+def test_the_create_boundary_stamps_durable_recovery_provenance(board):
+    """The child's own ``created`` event names the owner, run and occurrence."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+
+    continuation_id = kb.create_task(
+        board, title="bounded continuation", assignee="code-crab",
+        parents=[owner_id], created_by="blocker-reconciler",
+        recovery_origin=_recovery_origin(owner),
+    )
+    payload = json.loads(board.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
+        "ORDER BY id ASC LIMIT 1",
+        (continuation_id,),
+    ).fetchone()["payload"])
+    assert payload["origin_task_id"] == owner_id
+    assert payload["origin_run_id"] == int(owner.current_run_id)
+    assert payload["source_event_id"] == event_id
+
+
+def test_an_unrelated_caller_cannot_stamp_recovery_creation_provenance(board):
+    """The claim lock is the only secret; without it nothing may be stamped."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    owner = _claim_owner(board, owner_id)
+
+    forged = [
+        {"task_id": owner_id, "run_id": owner.current_run_id,
+         "claim_lock": "forged-lock"},
+        {"task_id": owner_id, "run_id": int(owner.current_run_id) + 99,
+         "claim_lock": owner.claim_lock},
+        {"task_id": owner_id, "run_id": owner.current_run_id, "claim_lock": None},
+    ]
+    for origin in forged:
+        with pytest.raises(ValueError, match="recovery_origin"):
+            kb.create_task(
+                board, title="forged continuation", assignee="code-crab",
+                parents=[owner_id], recovery_origin=origin,
+            )
+
+
+def test_a_prelinked_continuation_still_needs_creation_provenance(board):
+    """Pre-linking the source is not an escape hatch from provenance.
+
+    The kernel only *skips the link* when the edge already exists; skipping the
+    provenance check with it lets an owner park its source behind any card by
+    linking first and naming it second.
+    """
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    owner = _claim_owner(board, owner_id)
+    smuggled = kb.create_task(board, title="operator's own card", assignee="alice")
+    assert kb.link_recovery_parent(
+        board, parent_id=smuggled, child_id=source_id,
+        recovery_task_id=owner_id, run_id=owner.current_run_id,
+        claim_lock=owner.claim_lock, source_event_id=event_id,
+    )
+
+    with pytest.raises(ValueError, match="continuation"):
+        kb.complete_task(
+            board, owner_id, result="x",
+            metadata={"reconciliation": {
+                "outcome": "continuation_created",
+                "source_task_id": source_id,
+                "source_event_id": event_id,
+                "continuation_task_id": smuggled,
+            }},
+            expected_run_id=owner.current_run_id,
+            claim_lock=owner.claim_lock,
+        )
+    assert kb.get_task(board, source_id).status == "triage"
+
+
+def test_a_continuation_stamped_by_a_previous_run_is_refused(board):
+    """Provenance is per-run: last generation's child is not this one's."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    event_id = _occurrence(board, source_id)
+    first = _claim_owner(board, owner_id)
+    continuation_id = kb.create_task(
+        board, title="previous generation child", assignee="code-crab",
+        parents=[owner_id], created_by="blocker-reconciler",
+        recovery_origin=_recovery_origin(first),
+    )
+    # The owner is reclaimed and re-dispatched: a brand new run, same card.
+    _reap_owner_run(board, first)
+    board.execute(
+        "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+        "current_run_id=NULL WHERE id=?",
+        (owner_id,),
+    )
+    board.commit()
+    second = _claim_owner(board, owner_id)
+    assert int(second.current_run_id) != int(first.current_run_id)
+
+    with pytest.raises(ValueError, match="continuation"):
+        kb.complete_task(
+            board, owner_id, result="x",
+            metadata={"reconciliation": {
+                "outcome": "continuation_created",
+                "source_task_id": source_id,
+                "source_event_id": event_id,
+                "continuation_task_id": continuation_id,
+            }},
+            expected_run_id=second.current_run_id,
+            claim_lock=second.claim_lock,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 16 — a review claim is the same act of ownership as an implementation claim
+# ---------------------------------------------------------------------------
+
+
+def _park_owner_in_review(conn, owner_id):
+    owner = _claim_owner(conn, owner_id)
+    assert kb.request_review(
+        conn, owner_id, summary="ready for review",
+        expected_run_id=owner.current_run_id,
+    )
+    assert kb.get_task(conn, owner_id).status == "review"
+    return owner
+
+
+def test_the_kill_switch_stops_a_recovery_review_claim(board, set_reconciler):
+    """A disabled lane must not dispatch an owner through the review door."""
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    _park_owner_in_review(board, owner_id)
+
+    set_reconciler(enabled=False)
+    assert kb.claim_review_task(board, owner_id, claimer="code-crab") is None
+    assert kb.get_task(board, owner_id).status == "review"
+    reasons = [
+        e.payload.get("reason") for e in kb.list_events(board, owner_id)
+        if e.kind == "claim_rejected"
+    ]
+    assert "blocker_reconciler_disabled" in reasons
+
+
+def test_the_concurrency_cap_binds_recovery_review_claims(board, set_reconciler):
+    """``max_active`` counts workers, not doors — review claims spawn one too."""
+    set_reconciler(max_active=1)
+    first_source = _stall(board, title="first stall")
+    second_source = _stall(board, title="second stall")
+    first_owner = _owners(board, first_source)[0]["id"]
+    second_owner = _owners(board, second_source)[0]["id"]
+    _park_owner_in_review(board, second_owner)
+
+    assert kb.claim_task(board, first_owner, claimer="code-crab") is not None
+    assert kb.claim_review_task(board, second_owner, claimer="code-crab") is None
+    assert kb.get_task(board, second_owner).status == "review"
+    reasons = [
+        e.payload.get("reason") for e in kb.list_events(board, second_owner)
+        if e.kind == "claim_rejected"
+    ]
+    assert "blocker_reconciler_max_active" in reasons
+
+
+def test_an_ordinary_review_claim_is_unaffected(board, set_reconciler):
+    set_reconciler(max_active=1)
+    source_id = _stall(board)
+    owner_id = _owners(board, source_id)[0]["id"]
+    assert kb.claim_task(board, owner_id, claimer="code-crab") is not None
+
+    ordinary = kb.create_task(board, title="ordinary work", assignee="alice")
+    claimed = kb.claim_task(board, ordinary, claimer="alice")
+    assert claimed is not None
+    assert kb.request_review(
+        board, ordinary, summary="please review",
+        expected_run_id=claimed.current_run_id,
+    )
+    assert kb.claim_review_task(board, ordinary, claimer="alice") is not None
+
+
+# ---------------------------------------------------------------------------
+# 17 — a released gate is history, not standing authority
+# ---------------------------------------------------------------------------
+#
+# An affirmed gate legitimately stops automation. But ``unblock_task`` clears
+# ``gate_evidence`` and appends ``unblocked``: the operator has released the
+# card back to the machine. The ``blocked{affirmed:true}`` event stays in the
+# log forever, and an authority check that merely asks "is there any such event
+# anywhere in this card's history" reads a decision made hours ago as though it
+# were still in force. The next genuine machine failure then mints no recovery
+# owner at all — the exact no-forward-path signature this lane exists to
+# prevent, hidden behind a gate nobody is actually holding.
+#
+# Authority must come from the CURRENT occurrence, on the same terms
+# ``kanban_health.classify_block`` uses.
+
+
+def _affirm(conn, task_id, action="Confirm the approved subject line"):
+    from hermes_cli import kanban_health as kh
+
+    assert kh.affirm_human_gate(conn, task_id, evidence={
+        "type": "human_decision",
+        "action": action,
+        "affirmed_by": "Kevin Yan",
+        "affirmed_at": int(time.time()),
+    }, reason="needs a decision")
+    return kb.get_task(conn, task_id)
+
+
+def _gave_up(conn, task_id):
+    """Trip the circuit breaker the way the dispatcher does."""
+    assert kb.claim_task(conn, task_id, claimer="alice") is not None
+    return kb._record_task_failure(
+        conn, task_id, error="provider refused six times",
+        outcome="crashed", force_trip=True, release_claim=True, end_run=True,
+    )
+
+
+def test_a_released_gate_does_not_suppress_the_next_machine_failure(board):
+    """affirmed gate -> unblock -> later gave_up must still mint one owner."""
+    source_id = kb.create_task(board, title="canary", assignee="alice")
+    assert kb.claim_task(board, source_id, claimer="alice") is not None
+    assert kb.block_task(
+        board, source_id, reason="which envelope ships?", kind="needs_input",
+    )
+    _affirm(board, source_id)
+    assert kb.get_task(board, source_id).status == "blocked"
+    for owner in _owners(board, source_id):
+        board.execute("DELETE FROM tasks WHERE id=?", (owner["id"],))
+    board.commit()
+
+    # The operator releases the card back to automation.
+    assert kb.unblock_task(board, source_id)
+    assert kb.get_task(board, source_id).gate_evidence in (None, "")
+
+    # A later run fails for a machine reason entirely of its own.
+    assert _gave_up(board, source_id) is True
+    assert kb.get_task(board, source_id).status == "blocked"
+
+    owners = _owners(board, source_id)
+    assert len(owners) == 1, (
+        "a released gate suppressed recovery for a later machine failure: "
+        f"{[dict(row) for row in owners]}"
+    )
+    assert kb.active_recovery_owner(board, source_id) is not None
+
+
+def test_a_currently_affirmed_gate_still_suppresses_recovery(board):
+    """The guard must keep doing its real job: a held gate stays stopped."""
+    source_id = kb.create_task(board, title="canary", assignee="alice")
+    assert kb.claim_task(board, source_id, claimer="alice") is not None
+    assert kb.block_task(
+        board, source_id, reason="which envelope ships?", kind="needs_input",
+    )
+    for owner in _owners(board, source_id):
+        board.execute("DELETE FROM tasks WHERE id=?", (owner["id"],))
+    board.commit()
+    _affirm(board, source_id)
+
+    assert kb._source_has_affirmed_gate(
+        board, kb.get_task(board, source_id)
+    ) is True
+    assert _owners(board, source_id) == []
+    assert kb.active_recovery_owner(board, source_id) is None
+
+
+def test_a_stale_affirmed_event_without_current_evidence_has_no_authority(board):
+    """Row state alone is not the occurrence; the event log decides."""
+    source_id = kb.create_task(board, title="canary", assignee="alice")
+    assert kb.claim_task(board, source_id, claimer="alice") is not None
+    assert kb.block_task(
+        board, source_id, reason="which envelope ships?", kind="needs_input",
+    )
+    _affirm(board, source_id)
+    assert kb.unblock_task(board, source_id)
+    # A writer that predates gate_evidence re-blocks the row directly.
+    board.execute("UPDATE tasks SET status='blocked' WHERE id=?", (source_id,))
+    board.commit()
+
+    assert kb._source_has_affirmed_gate(
+        board, kb.get_task(board, source_id)
+    ) is False

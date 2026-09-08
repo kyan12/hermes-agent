@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from typing import Iterator, Mapping, MutableMapping
+from typing import Iterator, Mapping, MutableMapping, Optional
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
     "hermes_delegated_child_context",
@@ -106,22 +106,35 @@ def is_dispatcher_owned_worker_context() -> bool:
     return not _NON_DISPATCHER_OWNED_CONTEXT.get()
 
 
-def scrub_stale_dispatcher_worker_env() -> bool:
-    """Drop inherited worker identity when durable claim authority is closed.
+def live_dispatcher_worker_task() -> Optional[str]:
+    """The task id this process genuinely holds a live worker claim on.
 
-    Desktop/TUI follow-ups may construct a fresh agent in a process that still
-    carries a completed worker's ``HERMES_KANBAN_*`` environment.  Environment
-    strings are routing hints, not authority: retain them only when the task and
-    run rows prove the same live, unexpired claim.  Return ``True`` when stale
-    identity was removed.  Never mutate process-global env from an in-process
-    delegated/cron context, where the variables still belong to the parent.
+    ``HERMES_KANBAN_TASK`` / ``_RUN_ID`` / ``_CLAIM_LOCK`` are routing hints the
+    dispatcher exported into the process it spawned; they are not authority.  A
+    desktop/TUI follow-up, an in-process cron tick, a delegated child, or a
+    replayed transcript can carry the exact same strings long after that run
+    settled.  Authority is what the board still shows: the same task, the same
+    run, the same unexpired claim lock — in ``task_runs`` as well as in the
+    ``tasks`` row that only mirrors it (a reaper, crash sweep or superseding
+    claim settles the run row first).
+
+    Returns the task id when every one of those holds, else ``None``.  Fails
+    closed: an unreadable board cannot authenticate inherited identity, and an
+    in-process delegated/cron context never owns the parent's claim.
+
+    This is the single definition of "am I really the worker for this card".
+    Callers that would otherwise each re-derive it — the agent-init scrub, the
+    turn-end stop guard — share it so one of them cannot drift into trusting the
+    environment alone.
     """
     import os
     import time
 
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id or not is_dispatcher_owned_worker_context():
-        return False
+        return None
+    if is_delegated_child_context():
+        return None
     raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
     claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
     try:
@@ -129,7 +142,6 @@ def scrub_stale_dispatcher_worker_env() -> bool:
     except (TypeError, ValueError):
         run_id = None
 
-    valid = False
     try:
         from hermes_cli import kanban_db as kb
 
@@ -164,8 +176,24 @@ def scrub_stale_dispatcher_worker_env() -> bool:
     except Exception:
         # A routing/DB failure cannot authenticate inherited worker identity.
         valid = False
+    return task_id if valid else None
 
-    if valid:
+
+def scrub_stale_dispatcher_worker_env() -> bool:
+    """Drop inherited worker identity when durable claim authority is closed.
+
+    Desktop/TUI follow-ups may construct a fresh agent in a process that still
+    carries a completed worker's ``HERMES_KANBAN_*`` environment.  Return
+    ``True`` when stale identity was removed.  Never mutate process-global env
+    from an in-process delegated/cron context, where the variables still belong
+    to the parent.
+    """
+    import os
+
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id or not is_dispatcher_owned_worker_context():
+        return False
+    if live_dispatcher_worker_task() == task_id:
         return False
     for key in KANBAN_ENV_KEYS:
         os.environ.pop(key, None)

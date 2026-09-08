@@ -62,6 +62,12 @@ def _fill_assistant_tail_content(agent, tail: dict, final_response) -> None:
 _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    # The kanban worker stop-guard nudge is the same shape: a synthetic user
+    # message injected to keep the worker going one more turn. Left in live
+    # history it is replayed on the next turn as if the user had written
+    # "task X is still running, call kanban_complete" — which is exactly the
+    # instruction a follow-up session must never inherit.
+    "_kanban_stop_synthetic",
 )
 
 
@@ -78,7 +84,41 @@ def _record_kanban_budget_exhausted(
     (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
     already closed the run this is a no-op — so it is safe to call from
     multiple exit paths.
+
+    Only the process that genuinely holds this task's live claim may charge
+    the failure. ``HERMES_KANBAN_TASK`` alone is not that proof: a kanban
+    worker's toolset includes ``cronjob``, and ``cronjob(action="run")``
+    executes in the worker's own process, as do ``delegate_task`` children.
+    Either can exhaust ITS OWN iteration budget mid-run and, on the bare
+    environment variable, charge the parent's card — incrementing the breaker,
+    tripping it, emitting ``gave_up``, blocking the card and closing the
+    parent's still-live run out from under it. A resumed desktop session
+    carrying a finished run's environment is the same shape.
+
+    ``live_dispatcher_worker_task`` is the one definition of that authority
+    (shared with the turn-end stop guard and the agent-init scrub); the run id
+    and claim lock are then passed through so the mutation re-proves it inside
+    the write transaction rather than trusting a check-then-act.
     """
+    try:
+        from agent.delegation_context import live_dispatcher_worker_task
+
+        live_task = live_dispatcher_worker_task()
+    except Exception:
+        logger.debug("worker claim authority check failed", exc_info=True)
+        live_task = None
+    if live_task is None or live_task != kanban_task:
+        logger.debug(
+            "skipping budget-exhausted failure for %s: this process does not "
+            "hold its live claim", kanban_task,
+        )
+        return
+    _raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    try:
+        _run_id = int(_raw_run_id) if _raw_run_id else None
+    except (TypeError, ValueError):
+        _run_id = None
+    _claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip() or None
     try:
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
@@ -99,6 +139,8 @@ def _record_kanban_budget_exhausted(
                     "budget_used": api_call_count,
                     "budget_max": max_iterations,
                 },
+                expected_run_id=_run_id,
+                claim_lock=_claim_lock,
             )
         finally:
             try:

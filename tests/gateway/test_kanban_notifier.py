@@ -6,6 +6,7 @@ from pathlib import Path
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
+    KANBAN_TERMINAL_KINDS,
     _acquire_singleton_lock,
     _release_singleton_lock,
 )
@@ -23,6 +24,18 @@ def _affirm_gate(conn, task_id: str, reason: str) -> None:
         "affirmed_by": "Kevin Yan",
         "affirmed_at": int(time.time()),
     }, reason=reason)
+
+
+def _affirm_gate_only(conn, task_id: str, action: str) -> None:
+    """Affirm a gate on a card that is ALREADY stopped (no fresh block)."""
+    from hermes_cli import kanban_health as kh
+
+    assert kh.affirm_human_gate(conn, task_id, evidence={
+        "type": "human_decision",
+        "action": action,
+        "affirmed_by": "Kevin Yan",
+        "affirmed_at": int(time.time()),
+    }, reason=action)
 
 
 class RecordingAdapter:
@@ -175,10 +188,14 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
-    message = adapter.sent[0]["text"]
-    assert tid in message
-    assert "blocked" in message
+    # Two real transitions, both delivered: the worker's machine stop, then the
+    # operator's affirmed gate. What this test guards is that a named-profile
+    # subscription is routed at all (#71340 was silent zero-delivery).
+    assert adapter.sent, "named-profile subscription delivered nothing"
+    assert all(tid in delivery["text"] for delivery in adapter.sent)
+    assert all("blocked" in delivery["text"] for delivery in adapter.sent)
+    # The affirmed gate is the last thing the operator hears about.
+    assert reason in adapter.sent[-1]["text"]
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
@@ -588,16 +605,21 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     assert tid_good in adapter.sent[0]["text"]
 
 
-def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
-    """A `block_loop_detected` event must reach the subscriber as a triage ping.
+def test_notifier_delivers_block_loop_detected_as_a_machine_owned_block(
+    tmp_path, monkeypatch
+):
+    """A `block_loop_detected` event must reach the subscriber — as automation's.
 
     Regression for the silent-triage gap (PR #62712): kanban_db routes a task
-    to `triage` after BLOCK_RECURRENCE_LIMIT re-blocks for the same cause and
-    emits ONLY a `block_loop_detected` event — no `blocked`/`status` event.
-    Before `block_loop_detected` joined TERMINAL_KINDS with its own message
-    branch, that one transition (the whole point of which is to force human
-    attention) produced zero notification and the task stalled in triage
-    silently.
+    to the internal recovery lane after BLOCK_RECURRENCE_LIMIT re-blocks for
+    the same cause and emits ONLY a `block_loop_detected` event — no
+    `blocked`/`status` event. Before it joined TERMINAL_KINDS the transition
+    produced zero notification and the task stalled silently.
+
+    It is delivered as a *machine-owned* block. The message used to read
+    "routed to TRIAGE — needs a human decision", which invented an approval
+    request out of repeated automation failure and named an internal lane at
+    the user.
     """
     db_path = tmp_path / "block-loop.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -622,7 +644,10 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
     text = adapter.sent[0]["text"]
-    assert "TRIAGE" in text
+    assert "blocked" in text.lower()
+    assert "TRIAGE" not in text.upper()
+    assert "human decision" not in text.lower()
+    assert "recovery" in text.lower()
     assert tid in text
     assert "needs credentials" in text
     # Cursor advanced: the event is claimed and not re-delivered.
@@ -758,3 +783,159 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_a_gate_affirmed_before_the_poll_suppresses_the_machine_chatter(
+    tmp_path, monkeypatch
+):
+    """Superseded machine-recovery events must not be delivered at all.
+
+    A repeated block emits ``automation_recovery_requested`` and, past the
+    recurrence limit, ``block_loop_detected``. Both sit unclaimed until the
+    notifier's next poll. If an operator affirms a gate on the same occurrence
+    in that window, delivering them verbatim tells the user twice that
+    automatic recovery has it — and then that it is blocked on them. The first
+    two are false by the time they are read.
+    """
+    db_path = tmp_path / "superseded-chatter.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    reason = "needs credentials"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="loops then gated", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        for _ in range(kb.BLOCK_RECURRENCE_LIMIT + 1):
+            if kb.get_task(conn, tid).status != "ready":
+                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+                conn.commit()
+            assert kb.claim_task(conn, tid, claimer="worker") is not None
+            assert kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        loops = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
+        assert loops, "the recurrence limit never tripped"
+        _affirm_gate_only(conn, tid, "Confirm the approved subject line")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    texts = [delivery["text"] for delivery in adapter.sent]
+    assert texts, "the affirmed gate itself must still be delivered"
+    joined = "\n".join(texts).lower()
+    assert "automatic recovery" not in joined, texts
+    assert "no action needed from you" not in joined, texts
+    assert len(texts) == 1, f"expected only the gate, got {texts}"
+
+    # Suppressed is not unclaimed: an unclaimed row wedges later events behind
+    # it forever, so the cursor must still have advanced past all three.
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=list(KANBAN_TERMINAL_KINDS),
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
+def test_a_machine_stop_with_no_gate_is_still_delivered(tmp_path, monkeypatch):
+    """Suppression is scoped to a gate an operator actually holds."""
+    db_path = tmp_path / "unsuperseded-chatter.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="just stalled", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="provider quota exhausted",
+                             kind="transient")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    texts = [delivery["text"] for delivery in adapter.sent]
+    assert any("provider quota exhausted" in text for text in texts), texts
+    assert all("human decision" not in text.lower() for text in texts)
+
+
+def test_gave_up_names_the_real_trigger_outcome(tmp_path, monkeypatch):
+    """The breaker fires for every outcome, not just spawn failures.
+
+    ``gave_up`` was announced verbatim as "gave up after repeated spawn
+    failures". For a task that timed out six times that names the wrong
+    failure and sends the reader hunting for spawn errors that never happened.
+    """
+    db_path = tmp_path / "gave-up-trigger.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="times out forever", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb._record_task_failure(
+            conn, tid, error="elapsed 600s > limit 300s", outcome="timed_out",
+            force_trip=True, release_claim=True, end_run=True,
+        ) is True
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    texts = [delivery["text"] for delivery in adapter.sent]
+    assert texts, "a circuit-breaker trip produced no notification"
+    joined = "\n".join(texts)
+    assert "spawn" not in joined.lower(), joined
+    assert "timed_out" in joined
+    # Emitted in the same transaction that mints the recovery owner, so the
+    # message must not stop at "gave up" and omit who owns the next attempt.
+    assert "recovery" in joined.lower(), joined
+
+
+def test_gave_up_is_suppressed_when_an_operator_already_took_the_card(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "gave-up-superseded.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="broken then gated", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb._record_task_failure(
+            conn, tid, error="elapsed 600s", outcome="timed_out",
+            force_trip=True, release_claim=True, end_run=True,
+        ) is True
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="which envelope ships?",
+                             kind="needs_input")
+        _affirm_gate_only(conn, tid, "Confirm the approved subject line")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    joined = "\n".join(d["text"] for d in adapter.sent).lower()
+    assert "gave up" not in joined, joined
+    assert "automatic recovery" not in joined, joined

@@ -12345,14 +12345,18 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
-# Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
-# the cursor advances past them and they can't wedge a later completed/blocked
-# event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = (
-    "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
+# IMPORTED from gateway/kanban_watchers.py rather than mirrored: the local copy
+# had already drifted out of date (it knew nothing about block_loop_detected,
+# review_requested or changes_requested, and nothing about the machine-stop
+# kind that replaced the `blocked` event), so a TUI subscriber silently missed
+# the very events the gateway considered most important. Silent kinds are still
+# claimed so the cursor advances past them and they can't wedge a later
+# completed/blocked event behind an unclaimed row.
+from gateway.kanban_watchers import (  # noqa: E402
+    KANBAN_SILENT_KINDS as _KANBAN_SILENT_KINDS,
+    KANBAN_TERMINAL_KINDS as _KANBAN_NOTIFY_KINDS,
+    format_kanban_notification as _format_kanban_notification,
 )
-_KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
 
@@ -12451,50 +12455,20 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             pass
 
 
-def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
+def _format_kanban_event_text(sub: dict, task, ev, board_slug: str):
     """Single-line notification text for one kanban event.
 
-    Wording mirrors the gateway notifier (gateway/kanban_watchers.py) so a
-    task completion reads the same in the TUI as it does on Telegram.
-    Returns None for kinds that are claimed but intentionally silent.
+    Delegates to the gateway's formatter so a task reads identically in the
+    TUI and on Telegram. This used to be a hand-maintained second copy of that
+    vocabulary and had drifted: it silently returned ``None`` for
+    ``block_loop_detected``, ``review_requested``, ``changes_requested`` and
+    the machine-stop kind, which meant the TUI claimed those events (advancing
+    the cursor past them) and then showed the user nothing at all.
+
+    Returns ``None`` for kinds that are claimed but intentionally silent.
     """
-    kind = getattr(ev, "kind", "")
-    if not kind or kind in _KANBAN_SILENT_KINDS:
-        return None
-    task_id = sub.get("task_id", "")
-    title = (getattr(task, "title", None) or task_id)[:120]
-    board_tag = f"[{board_slug}] " if board_slug else ""
-    who = getattr(task, "assignee", None) or ""
-    tag = f"@{who} " if who else ""
-    payload = getattr(ev, "payload", None) or {}
-    if kind == "completed":
-        handoff = ""
-        summary = payload.get("summary")
-        if summary:
-            lines = str(summary).strip().splitlines()
-            handoff = f"\n{lines[0][:200]}" if lines else ""
-        elif getattr(task, "result", None):
-            lines = str(task.result).strip().splitlines()
-            handoff = f"\n{lines[0][:160]}" if lines else ""
-        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
-    if kind == "blocked":
-        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
-        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
-    if kind == "gave_up":
-        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
-    if kind == "crashed":
-        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
-    if kind == "timed_out":
-        limit = 0
-        try:
-            limit = int(payload.get("limit_seconds") or 0)
-        except (TypeError, ValueError):
-            pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
-    if kind == "status":
-        return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
-    return None
+    return _format_kanban_notification(sub, task, ev, board_slug)
+
 
 
 def _collect_kanban_notifications(session: dict) -> list:

@@ -86,7 +86,7 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
-def test_show_projects_untyped_block_as_triage(monkeypatch, worker_env):
+def test_show_reports_an_untyped_block_as_a_non_visible_gate(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
@@ -96,7 +96,9 @@ def test_show_projects_untyped_block_as_triage(monkeypatch, worker_env):
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
     task = json.loads(kt._handle_show({"task_id": tid}))["task"]
-    assert task["status"] == "triage"
+    # The stored status is never rewritten to "triage" for display; the
+    # projection is what says this is not an affirmed human gate.
+    assert task["status"] == "blocked"
     assert task["block_projection"]["visible"] is False
 
 
@@ -1468,3 +1470,228 @@ def test_tool_complete_rejects_a_pre_existing_task_as_a_continuation(
         assert kb.get_task(conn, source_id).status == "triage"
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# The public tool surface is the only surface a recovery worker actually has
+# ---------------------------------------------------------------------------
+#
+# A recovery owner has kanban_comment / kanban_link / kanban_create / kanban_
+# complete and nothing else. If the public handlers write unprovenanced rows,
+# the owner's own working notes read as "the source advanced while I was
+# resolving it" and every verdict it reaches is discarded.
+
+
+def _recovery_conn():
+    from hermes_cli import kanban_db as kb
+    return kb.connect()
+
+
+def test_tool_comment_on_the_bound_source_is_owner_evidence(recovery_worker_env):
+    """The owner's note about its own occurrence must not read as advancement."""
+    owner_id, source_id, event_id = recovery_worker_env
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = json.loads(kt._handle_comment({
+        "task_id": source_id,
+        "body": "Re-read the source: the provider quota window has reset.",
+    }))
+    assert out.get("ok") is True, out
+
+    conn = _recovery_conn()
+    try:
+        payload = [
+            e.payload for e in kb.list_events(conn, source_id)
+            if e.kind == "commented"
+        ][-1]
+        assert payload["origin_task_id"] == owner_id
+        assert payload["source_event_id"] == event_id
+    finally:
+        conn.close()
+
+    done = _reconciliation_complete(source=source_id, event_id=event_id)
+    assert done.get("ok") is True, done
+    conn = _recovery_conn()
+    try:
+        assert kb.get_task(conn, source_id).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_tool_dependency_wait_works_through_the_public_handlers(
+    recovery_worker_env
+):
+    """create + link + complete: the whole dependency_wait path, public only."""
+    owner_id, source_id, event_id = recovery_worker_env
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    created = json.loads(kt._handle_create({
+        "title": "restore the provider credential",
+        "assignee": "code-crab",
+        "parents": [owner_id],
+    }))
+    assert created.get("ok") is True, created
+    dependency_id = created["task_id"]
+
+    linked = json.loads(kt._handle_link({
+        "parent_id": dependency_id, "child_id": source_id,
+    }))
+    assert linked.get("ok") is True, linked
+
+    out = _reconciliation_complete(
+        {"outcome": "dependency_wait", "dependency_task_id": dependency_id},
+        source=source_id, event_id=event_id,
+    )
+    assert out.get("ok") is True, out
+
+    conn = _recovery_conn()
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (dependency_id, source_id),
+        ).fetchone() is not None
+        assert kb.get_task(conn, source_id).status == "todo"
+    finally:
+        conn.close()
+
+
+def test_tool_comment_on_the_bound_source_fails_closed_on_a_stale_claim(
+    recovery_worker_env, monkeypatch
+):
+    """A worker env stripped of its claim lock has no evidence authority."""
+    owner_id, source_id, event_id = recovery_worker_env
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = json.loads(kt._handle_comment({
+        "task_id": source_id, "body": "unprovenanced note",
+    }))
+    assert out.get("error"), out
+    conn = _recovery_conn()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM task_comments WHERE task_id=?", (source_id,),
+        ).fetchone()["n"] == 0
+        assert kb.get_task(conn, source_id).status == "triage"
+    finally:
+        conn.close()
+
+
+def test_tool_link_to_the_bound_source_fails_closed_on_a_forged_run(
+    recovery_worker_env, monkeypatch
+):
+    owner_id, source_id, event_id = recovery_worker_env
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = _recovery_conn()
+    try:
+        dependency_id = kb.create_task(conn, title="dep", assignee="alice")
+        run_id = int(kb.get_task(conn, owner_id).current_run_id)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id + 99))
+
+    out = json.loads(kt._handle_link({
+        "parent_id": dependency_id, "child_id": source_id,
+    }))
+    assert out.get("error"), out
+    conn = _recovery_conn()
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (dependency_id, source_id),
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_tool_comment_on_an_unrelated_task_keeps_ordinary_behaviour(
+    recovery_worker_env
+):
+    """Only writes on the bound source are routed; the handoff channel stays open."""
+    owner_id, source_id, event_id = recovery_worker_env
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = _recovery_conn()
+    try:
+        other = kb.create_task(conn, title="someone else's card", assignee="alice")
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_comment({"task_id": other, "body": "fyi"}))
+    assert out.get("ok") is True, out
+    conn = _recovery_conn()
+    try:
+        rows = conn.execute(
+            "SELECT author, body FROM task_comments WHERE task_id=?", (other,),
+        ).fetchall()
+        assert [(r["author"], r["body"]) for r in rows] == [("code-crab", "fyi")]
+    finally:
+        conn.close()
+
+
+def test_ordinary_worker_comment_and_link_are_unchanged(worker_env):
+    """A non-recovery worker sees exactly the behaviour it always had."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="peer task", assignee="test-worker")
+    finally:
+        conn.close()
+
+    assert json.loads(kt._handle_comment({
+        "task_id": other, "body": "handing off",
+    })).get("ok") is True
+    assert json.loads(kt._handle_link({
+        "parent_id": other, "child_id": worker_env,
+    })).get("ok") is True
+
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (other, worker_env),
+        ).fetchone() is not None
+        payload = [
+            e.payload for e in kb.list_events(conn, other) if e.kind == "commented"
+        ][-1]
+        assert "origin_task_id" not in payload
+    finally:
+        conn.close()
+
+
+def test_tool_created_continuation_carries_durable_recovery_provenance(
+    recovery_worker_env
+):
+    """kanban_create stamps the owner, its run and its occurrence, durably."""
+    owner_id, source_id, event_id = recovery_worker_env
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    created = json.loads(kt._handle_create({
+        "title": "bounded continuation",
+        "assignee": "code-crab",
+        "parents": [owner_id],
+    }))
+    assert created.get("ok") is True, created
+
+    conn = _recovery_conn()
+    try:
+        run_id = int(kb.get_task(conn, owner_id).current_run_id)
+        payload = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
+            "ORDER BY id ASC LIMIT 1",
+            (created["task_id"],),
+        ).fetchone()["payload"])
+    finally:
+        conn.close()
+    assert payload["origin_task_id"] == owner_id
+    assert payload["origin_run_id"] == run_id
+    assert payload["source_event_id"] == event_id

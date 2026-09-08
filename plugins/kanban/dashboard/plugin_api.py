@@ -52,6 +52,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import kanban_health as kh
 
 log = logging.getLogger(__name__)
 
@@ -144,14 +145,13 @@ def _conn(board: Optional[str] = None):
 # Columns shown by the dashboard, in left-to-right order. "archived" is
 # available via a filter toggle rather than a visible column.
 #
-# Keep this in sync with kanban_db.VALID_STATUSES.  In particular,
-# ``scheduled`` is a first-class waiting column used for time-based follow-ups;
-# if it is omitted here, the board-level fallback below mis-buckets scheduled
-# tasks into ``todo`` and makes the dashboard look like the Scheduled column
-# disappeared.
-BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
-]
+# These are OPERATOR lanes, not raw lifecycle statuses: ``triage`` and
+# ``review`` are internal stages (transient intake that automation consumes,
+# and work in flight under a reviewer) and never appear as lanes, buckets or
+# filters. ``kanban_health.project_operator_state`` owns the mapping — see
+# ``OPERATOR_COLUMNS`` there, which this deliberately mirrors rather than
+# redefines, so a lane cannot exist here that the projection never fills.
+BOARD_COLUMNS: list[str] = list(kh.OPERATOR_COLUMNS)
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -176,8 +176,13 @@ def _task_dict(
     # ``tasks.result``. ``None`` when no run has produced a summary yet.
     d["latest_summary"] = latest_summary
     # Keep body short on list endpoints; full body comes from /tasks/:id.
-    from hermes_cli import kanban_health as kh
-    return kh.project_task_serialization(conn, task, d)
+    projected = kh.project_task_serialization(conn, task, d)
+    # The operator projection travels WITH every card, so the lane a card was
+    # bucketed into, the count above that lane, and the drawer that opens from
+    # it are all reading the same decision rather than three re-derivations of
+    # it. ``lifecycle_status`` inside keeps the durable status inspectable.
+    projected["operator"] = kh.project_operator_state(conn, task).as_payload()
+    return projected
 
 
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
@@ -638,14 +643,16 @@ def _build_board_payload(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
-            if t.status == "blocked":
-                # The visible attention column is an authority projection, not
-                # a raw status dump. Legacy/machine block rows remain durable
-                # but appear in automation triage unless they carry one current
-                # typed Kevin action.
-                if d["status"] == "triage":
-                    col = "triage"
+            # The visible board is an authority projection, not a raw status
+            # dump — and it is the SAME projection the card carries and the
+            # drawer reads (``d["operator"]``), so a card cannot be counted in
+            # one lane and explained as another. Falling back to ``todo`` for
+            # an unrecognised status is what used to make a stranded card look
+            # like ordinary queued work; the projection routes anything it does
+            # not recognise to Blocked with a machine owner instead.
+            col = d["operator"]["column"]
+            if col not in columns:
+                col = "blocked" if "blocked" in columns else BOARD_COLUMNS[0]
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -729,7 +736,6 @@ def get_task(
                 "latest_summary": child_summaries.get(child.id),
                 "result": child.result,
             }
-            from hermes_cli import kanban_health as kh
             child_results.append(kh.project_task_serialization(conn, child, child_result))
         # Attach diagnostics so the drawer's Diagnostics section can
         # render recovery actions without a second round-trip.
@@ -740,6 +746,14 @@ def get_task(
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
         return {
             "task": task_d,
+            # The lane this card is in, restated at the detail boundary from
+            # the same projection the board bucketed it with — the drawer and
+            # the column can never disagree about where a card lives.
+            "operator": task_d["operator"],
+            # Dependencies by TITLE with a real state. Bare ids and an
+            # "Unknown" fallback are what made a running parent unreadable and
+            # an archived one indistinguishable from an ordinary wait.
+            "dependencies": kh.dependency_labels(conn, task_id),
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
@@ -1048,7 +1062,6 @@ def _verified_human_principal(request, claimed: Optional[str]) -> str:
 
     Non-interactive bearer/service principals are machines and never qualify.
     """
-    from hermes_cli import kanban_health as kh
 
     state = getattr(request, "state", None)
     if getattr(state, "token_principal", None) is not None and not getattr(
@@ -1116,7 +1129,6 @@ def affirm_task_gate(
     board: Optional[str] = Query(None),
 ):
     """Verified-human transition into the human-attention column."""
-    from hermes_cli import kanban_health as kh
 
     principal = _verified_human_principal(request, payload.affirmed_by)
     atomic = kh.parse_atomic_action(payload.action)
@@ -1157,7 +1169,6 @@ def type_task_hold(
     board: Optional[str] = Query(None)
 ):
     """Atomically park a card with a machine-verifiable typed hold."""
-    from hermes_cli import kanban_health as kh
 
     board = _resolve_board(board)
     conn = _conn(board=board)
@@ -1833,7 +1844,6 @@ def get_board_health(
     on demand, so mixing them would either poison that cache or slow the
     board render.
     """
-    from hermes_cli import kanban_health as kh
 
     slugs = kh.all_board_slugs() if all_boards else [_resolve_board(board)]
     payloads = []
@@ -1867,7 +1877,6 @@ class BoardHealthReconcileBody(BaseModel):
 @router.post("/board-health/reconcile")
 def reconcile_board_health(payload: BoardHealthReconcileBody):
     """Explicit authenticated mutation counterpart to read-only health GET."""
-    from hermes_cli import kanban_health as kh
 
     slugs = kh.all_board_slugs() if payload.all_boards else [_resolve_board(payload.board)]
     boards = []
@@ -2855,17 +2864,20 @@ def _projects_by_id() -> dict[str, Any]:
 
 
 def _board_counts(slug: str) -> dict[str, int]:
-    """Return ``{status: count}`` for a board. Safe on an empty DB."""
+    """Return ``{operator lane: count}`` for a board. Safe on an empty DB.
+
+    Counted through the same projection the board renders rather than by
+    ``GROUP BY status``: a badge that counts raw statuses would keep reporting
+    a Triage bucket the board no longer has, and a lane whose header disagrees
+    with the cards under it is how a stranded card stays invisible.
+    """
     try:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
             return {}
         conn = kanban_db.connect(board=slug)
         try:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
-            ).fetchall()
-            return {r["status"]: int(r["n"]) for r in rows}
+            return kh.operator_column_counts(conn, include_archived=True)
         finally:
             conn.close()
     except Exception:

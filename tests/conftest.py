@@ -60,6 +60,22 @@ if str(PROJECT_ROOT) not in sys.path:
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
 
+# Kanban path pins that OUTRANK HERMES_HOME in kanban_db's resolution order.
+# Sandboxing HERMES_HOME below does nothing for these: HERMES_KANBAN_DB pins
+# the database file directly, so pytest launched from a dispatcher-spawned
+# worker or a developer shell kept resolving the operator's LIVE board even
+# after the sandbox ran. Captured here (pre-sandbox) for the write guard, then
+# scrubbed with the sandbox below. See tests/test_kanban_db_pin_isolation.py.
+_KANBAN_PATH_PIN_VARS = (
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_HOME",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_LOGS_ROOT",
+)
+_PRE_SANDBOX_KANBAN_PINS = {
+    name: os.environ.get(name, "") for name in _KANBAN_PATH_PIN_VARS
+}
+
 
 def _hermes_home_points_at_production(value: str) -> bool:
     """True when a pre-set HERMES_HOME resolves to the real production root.
@@ -91,6 +107,40 @@ if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+
+
+def _kanban_pin_points_at_production(value: str) -> bool:
+    """True when a kanban path pin resolves inside the real Hermes root.
+
+    Only production-pointing pins are dropped. A genuinely custom root (a
+    Docker/portable install, or a developer deliberately pointing at a scratch
+    board) is honored exactly as ``HERMES_HOME`` is above.
+    """
+    if not value:
+        return False
+    try:
+        resolved = Path(value).expanduser().resolve()
+        real_root = (Path.home() / ".hermes").resolve()
+    except Exception:
+        # Unresolvable: cannot prove it is safe, so treat it as production.
+        return True
+    return resolved == real_root or real_root in resolved.parents
+
+
+# Drop production-pointing kanban path pins for the whole session, AFTER the
+# pre-sandbox capture above (the write guard's deny-list is derived from it and
+# would otherwise point at a tempdir and stop guarding anything).
+for _pin_name, _pin_value in _PRE_SANDBOX_KANBAN_PINS.items():
+    if _kanban_pin_points_at_production(_pin_value):
+        os.environ.pop(_pin_name, None)
+
+#: The kanban path pins as they stood once conftest finished loading — i.e.
+#: what collection-time imports actually see. Recorded because the per-test
+#: fixture blanks these anyway, so reading os.environ from inside a test would
+#: pass even with the scrub above deleted.
+KANBAN_PINS_AT_CONFTEST_IMPORT = {
+    name: os.environ.get(name, "") for name in _KANBAN_PATH_PIN_VARS
+}
 
 # Subprocess-surviving isolation marker (#82770). PYTEST_CURRENT_TEST /
 # PYTEST_VERSION are pytest's own vars, and tests that spawn children

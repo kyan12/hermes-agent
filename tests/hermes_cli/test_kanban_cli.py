@@ -97,18 +97,25 @@ def test_create_json_projects_unaffirmed_initial_block(kanban_home):
         kc.run_slash("create projected-json --initial-status blocked --json")
     )
 
-    assert payload["status"] == "triage"
+    # The durable status is reported as-is; the projection carries authority.
+    assert payload["status"] == "blocked"
     assert payload["block_projection"]["visible"] is False
     assert payload["block_projection"]["reason_code"] == "untyped_block"
     with kb.connect() as conn:
         assert kb.get_task(conn, payload["id"]).status == "blocked"
 
 
-def test_create_text_projects_unaffirmed_initial_block(kanban_home):
+def test_create_text_reports_an_unaffirmed_initial_block_as_blocked(kanban_home):
+    """The word an operator sees is the durable status, not "triage".
+
+    A card parked directly in ``blocked`` without an affirmed typed gate is
+    still machine-owned; it is the projection (and the Blocked lane's own
+    machine-vs-Kevin split) that says so, not a rewritten status string.
+    """
     output = kc.run_slash("create projected-text --initial-status blocked")
 
-    assert "(triage, assignee=-)" in output
-    assert "blocked" not in output
+    assert "(blocked, assignee=-)" in output
+    assert "triage" not in output
 
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):

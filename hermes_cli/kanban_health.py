@@ -1102,8 +1102,14 @@ def project_task_serialization(conn, task, payload: dict) -> dict:
         "reason_code": block.reason_code,
         "action": block.action,
     }
-    if not block.visible:
-        projected["status"] = "triage"
+    # The durable status is NOT rewritten to ``triage`` here any more. Doing so
+    # printed the word "triage" as a user-facing status on the CLI, the tool
+    # surface and the drawer, which is the persistent Triage bucket this board
+    # no longer has — and it disagreed with the lane the same card was drawn
+    # in. ``block_projection.visible is False`` still says the identical thing
+    # ("this is not an affirmed human gate"), and
+    # :func:`project_operator_state` names the lane, the owner and the next
+    # action. The stored status stays exactly what it is, inspectable.
     return projected
 
 
@@ -2228,3 +2234,420 @@ def all_board_slugs() -> list[str]:
         b.get("slug") or kb.DEFAULT_BOARD
         for b in kb.list_boards(include_archived=False)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Operator-facing projection
+# ---------------------------------------------------------------------------
+#
+# ``triage`` and ``review`` are internal lifecycle stages, not places an
+# operator is asked to stand. Triage is transient intake that automation
+# assigns and consumes; Review is work in flight under a reviewer. Showing
+# either as a persistent column turns a machine routing failure into a standing
+# request for a person to classify work — which is exactly what "triage no
+# longer drains" looked like from the desk.
+#
+# Everything below is ONE projection, so a card cannot be counted in one lane,
+# filtered into another, and described as a third. The durable row is never
+# rewritten: the stored status travels with the projection as
+# ``lifecycle_status`` so the board stays inspectable.
+
+#: The lanes an operator actually sees, left to right. ``running`` is the
+#: In-Progress lane (already labelled "In Progress" in the dashboard i18n);
+#: ``triage`` and ``review`` are deliberately absent. ``archived`` remains a
+#: filter toggle rather than a lane, as before.
+OPERATOR_COLUMNS: tuple[str, ...] = (
+    "todo", "scheduled", "ready", "running", "blocked", "done",
+)
+
+#: Operator-facing states, one per lane occupant.
+STATE_IN_PROGRESS = "in_progress"
+STATE_BLOCKED = "blocked"
+STATE_WAITING = "waiting"
+STATE_DONE = "done"
+STATE_ARCHIVED = "archived"
+
+#: Who owns the next move. ``kevin`` only ever comes from an affirmed typed
+#: gate; a machine failure displayed as Blocked stays machine-owned.
+OWNER_MACHINE = "machine"
+OWNER_KEVIN = "kevin"
+
+REASON_RECOVERY_IN_PROGRESS = "recovery_in_progress"
+REASON_RECOVERY_UNOWNED = "recovery_unowned"
+REASON_INTAKE_UNOWNED = "intake_unowned"
+REASON_REVIEW_IN_PROGRESS = "review_in_progress"
+REASON_WORKER_RUNNING = "worker_running"
+REASON_QUEUED_FOR_DISPATCH = "queued_for_dispatch"
+REASON_DEPENDENCY_WAIT = "dependency_wait"
+REASON_SCHEDULED_HOLD = "scheduled_hold"
+REASON_COMPLETE = "complete"
+REASON_UNKNOWN_STATUS = "unknown_status"
+
+#: How far up the parent chain a dependency display will walk. A board can
+#: carry a long or (from a legacy row) cyclic chain; an unbounded walk is how a
+#: detail view turns into a hang. Beyond this the display says it is truncated
+#: rather than guessing.
+MAX_DEPENDENCY_ROOT_DEPTH = 8
+
+_TERMINAL_PARENT_STATUSES = frozenset({"done"})
+
+
+@dataclass(frozen=True)
+class OperatorProjection:
+    """One card as the operator sees it, with the durable status attached."""
+
+    task_id: str
+    lifecycle_status: str
+    column: str
+    state: str
+    stage: str
+    reason_code: str
+    owner: Optional[str] = None
+    next_owner: Optional[str] = None
+    action: Optional[str] = None
+    evidence: Optional[dict] = None
+
+    def as_payload(self) -> dict:
+        return {
+            "lifecycle_status": self.lifecycle_status,
+            "column": self.column,
+            "state": self.state,
+            "stage": self.stage,
+            "reason_code": self.reason_code,
+            "owner": self.owner,
+            "next_owner": self.next_owner,
+            "action": self.action,
+            "evidence": self.evidence,
+        }
+
+
+def _recovery_owner_evidence(conn, task) -> Optional[dict]:
+    """The live recovery owner for this source, as displayable evidence.
+
+    "Recovery in progress" has to be backed by a card an operator can open,
+    not by a hidden triage count or a fabricated source run. ``None`` when no
+    owner can still make progress — which is a real Blocked, not a quiet wait.
+    """
+    from hermes_cli import kanban_db as kb
+
+    try:
+        owner_id = kb.active_recovery_owner(conn, task.id)
+    except Exception:
+        logger.debug("recovery owner lookup failed for %s", task.id, exc_info=True)
+        return None
+    if not owner_id:
+        return None
+    owner = kb.get_task(conn, owner_id)
+    if owner is None:
+        return None
+    return {
+        "recovery_task_id": owner.id,
+        "recovery_status": owner.status,
+        "recovery_run_id": (
+            int(owner.current_run_id) if owner.current_run_id is not None else None
+        ),
+        "recovery_assignee": owner.assignee,
+    }
+
+
+def _machine_recovery_action(conn, task) -> str:
+    """The one precise next action for a machine-owned stop.
+
+    Deliberately phrased as something the machine owes, not something Kevin
+    owes: an automation failure displayed in the Blocked lane must not read as
+    an approval request.
+    """
+    exhausted = None
+    try:
+        from hermes_cli import kanban_db as kb
+
+        for event in reversed(list(kb.list_events(conn, task.id))):
+            if event.kind == "recovery_action_required":
+                exhausted = (event.payload or {}).get("action")
+                break
+    except Exception:
+        logger.debug("recovery action lookup failed for %s", task.id, exc_info=True)
+    if exhausted:
+        return str(exhausted)
+    return (
+        "Automatic recovery has no live owner for this occurrence — the "
+        "blocker-reconciler lane must mint one (check that it is enabled and "
+        "its executor profile is spawnable)."
+    )
+
+
+def project_operator_state(conn, task) -> OperatorProjection:
+    """Project one durable card into the lane an operator should see it in.
+
+    The single definition of that mapping. Board columns, column counts,
+    filters and the detail view all read it, so they cannot disagree — merely
+    hiding a stranded card in one of them is not acceptance.
+    """
+    status = getattr(task, "status", None)
+    task_id = getattr(task, "id", "")
+
+    def _projection(column, state, stage, reason_code, **kw):
+        return OperatorProjection(
+            task_id=task_id, lifecycle_status=status, column=column,
+            state=state, stage=stage, reason_code=reason_code, **kw,
+        )
+
+    if status == "done":
+        return _projection("done", STATE_DONE, "done", REASON_COMPLETE)
+    if status == "archived":
+        return _projection("archived", STATE_ARCHIVED, "archived", REASON_COMPLETE)
+    if status == "running":
+        return _projection(
+            "running", STATE_IN_PROGRESS, "running", REASON_WORKER_RUNNING,
+            owner=OWNER_MACHINE, next_owner=getattr(task, "assignee", None),
+        )
+    if status == "review":
+        # Ordinary review is a stage of work in flight, not a lane for Kevin.
+        return _projection(
+            "running", STATE_IN_PROGRESS, "review", REASON_REVIEW_IN_PROGRESS,
+            owner=OWNER_MACHINE, next_owner=getattr(task, "assignee", None),
+        )
+    if status == "ready":
+        return _projection(
+            "ready", STATE_IN_PROGRESS, "ready", REASON_QUEUED_FOR_DISPATCH,
+            owner=OWNER_MACHINE, next_owner=getattr(task, "assignee", None),
+        )
+    if status == "todo":
+        return _projection(
+            "todo", STATE_WAITING, "todo", REASON_DEPENDENCY_WAIT,
+            owner=OWNER_MACHINE,
+        )
+    if status == "scheduled":
+        # Intentional holds remain exactly what they are.
+        return _projection(
+            "scheduled", STATE_WAITING, "scheduled", REASON_SCHEDULED_HOLD,
+            owner=OWNER_MACHINE,
+        )
+    if status == "triage":
+        evidence = _recovery_owner_evidence(conn, task)
+        if evidence is not None:
+            return _projection(
+                "running", STATE_IN_PROGRESS, "recovery",
+                REASON_RECOVERY_IN_PROGRESS,
+                owner=OWNER_MACHINE, next_owner=evidence.get("recovery_assignee"),
+                evidence=evidence,
+            )
+        from hermes_cli import kanban_db as kb
+
+        try:
+            is_recovery = bool(kb.is_automation_recovery_source(conn, task.id))
+        except Exception:
+            logger.debug("recovery source probe failed for %s", task_id, exc_info=True)
+            is_recovery = True  # fail closed: describe it as a machine stop
+        return _projection(
+            "blocked", STATE_BLOCKED, "recovery" if is_recovery else "intake",
+            REASON_RECOVERY_UNOWNED if is_recovery else REASON_INTAKE_UNOWNED,
+            owner=OWNER_MACHINE, next_owner="blocker-reconciler",
+            action=_machine_recovery_action(conn, task),
+        )
+    if status == "blocked":
+        block = classify_block(conn, task)
+        if block.visible:
+            return _projection(
+                "blocked", STATE_BLOCKED, "human_gate", block.reason_code,
+                owner=OWNER_KEVIN, next_owner=operator_principal(),
+                action=block.action,
+            )
+        evidence = _recovery_owner_evidence(conn, task)
+        if evidence is not None:
+            # The circuit breaker sets the source ``blocked`` and emits
+            # ``gave_up`` in ONE transaction, and ``gave_up`` is a
+            # reconciliation occurrence — so the pre-COMMIT drain mints the
+            # recovery owner in that same transaction. The source lands
+            # ``blocked`` with an owner already working it.
+            #
+            # Showing that as a flat Blocked is the triage lie in a different
+            # status: automation is demonstrably on the card and the board says
+            # nothing is happening. A ``triage`` source with recovery evidence
+            # already answers this question; a ``blocked`` source with no
+            # affirmed gate is the same question, so it gets the same answer.
+            # The gate check above still wins — an operator's own decision can
+            # never be projected back into "in progress" by a live owner card.
+            return _projection(
+                "running", STATE_IN_PROGRESS, "recovery",
+                REASON_RECOVERY_IN_PROGRESS,
+                owner=OWNER_MACHINE,
+                next_owner=evidence.get("recovery_assignee"),
+                evidence=evidence,
+            )
+        return _projection(
+            "blocked", STATE_BLOCKED, "machine_block", block.reason_code,
+            owner=OWNER_MACHINE,
+            next_owner="blocker-reconciler",
+            action=_machine_recovery_action(conn, task),
+        )
+
+    # A status this projection has never seen is not silently "todo": an
+    # unrecognised lifecycle value means the board has drifted from the code
+    # that renders it, which is a machine problem with a machine owner.
+    return _projection(
+        "blocked", STATE_BLOCKED, "unknown", REASON_UNKNOWN_STATUS,
+        owner=OWNER_MACHINE, next_owner="blocker-reconciler",
+        action=(
+            f"Lifecycle status {status!r} is not a status this board version "
+            "knows how to route; reconcile the schema before acting on it."
+        ),
+    )
+
+
+def operator_column_counts(conn, *, include_archived: bool = False) -> dict:
+    """Per-lane counts derived from the same projection the board renders.
+
+    Counted through :func:`project_operator_state` rather than by grouping raw
+    statuses, because a count that disagrees with the column beneath it is how
+    a stranded card becomes invisible without anyone noticing.
+    """
+    from hermes_cli import kanban_db as kb
+
+    counts = {name: 0 for name in OPERATOR_COLUMNS}
+    if include_archived:
+        counts["archived"] = 0
+    for task in kb.list_tasks(conn, include_archived=include_archived):
+        column = project_operator_state(conn, task).column
+        if column in counts:
+            counts[column] += 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Dependency display
+# ---------------------------------------------------------------------------
+
+
+_DEPENDENCY_STATE_LABELS = {
+    STATE_IN_PROGRESS: "In progress",
+    STATE_WAITING: "Waiting on dependency",
+    STATE_BLOCKED: "Blocked",
+    STATE_DONE: "Done",
+}
+
+_UNAVAILABLE_LABELS = {
+    "parent_missing": "Unavailable — parent no longer exists",
+    "parent_archived": "Unavailable — parent archived",
+}
+
+
+def _dependency_entry(conn, parent_id: str, parent) -> dict:
+    """One parent, described by title and real state — never "Unknown"."""
+    if parent is None:
+        return {
+            "task_id": parent_id,
+            "title": None,
+            "lifecycle_status": None,
+            "state": "unavailable",
+            "available": False,
+            "reason": "parent_missing",
+            "label": _UNAVAILABLE_LABELS["parent_missing"],
+        }
+    if parent.status == "archived":
+        return {
+            "task_id": parent.id,
+            "title": parent.title,
+            "lifecycle_status": "archived",
+            "state": "unavailable",
+            "available": False,
+            "reason": "parent_archived",
+            "label": _UNAVAILABLE_LABELS["parent_archived"],
+        }
+    projection = project_operator_state(conn, parent)
+    return {
+        "task_id": parent.id,
+        "title": parent.title,
+        "lifecycle_status": projection.lifecycle_status,
+        "state": projection.state,
+        "available": True,
+        "reason": projection.reason_code,
+        "label": _DEPENDENCY_STATE_LABELS.get(projection.state, "In progress"),
+    }
+
+
+def _parent_ids(conn, task_id: str) -> list:
+    return [
+        row["parent_id"]
+        for row in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id",
+            (task_id,),
+        )
+    ]
+
+
+def dependency_labels(conn, task_id: str, *,
+                      max_depth: int = MAX_DEPENDENCY_ROOT_DEPTH) -> dict:
+    """Operator-readable dependency state for one card.
+
+    Returns the direct parents (by title, with a real state), which of them are
+    actually blocking, a card-level label, and a *bounded* transitive root so a
+    deep or (from a legacy row) cyclic chain cannot hang the view. The walk
+    fails closed: hitting the depth limit or a repeat visit reports
+    ``root_truncated`` rather than guessing at an ancestor it never reached.
+    """
+    from hermes_cli import kanban_db as kb
+
+    task = kb.get_task(conn, task_id)
+    parent_ids = _parent_ids(conn, task_id)
+    parents = [
+        _dependency_entry(conn, pid, kb.get_task(conn, pid)) for pid in parent_ids
+    ]
+    blocking = [
+        entry["task_id"] for entry in parents
+        if entry["lifecycle_status"] not in _TERMINAL_PARENT_STATUSES
+    ]
+
+    label = None
+    if blocking:
+        unavailable = [e for e in parents if not e["available"]]
+        if unavailable and len(unavailable) == len(blocking):
+            # A parent that can never finish is not an ordinary wait, and
+            # saying so is the difference between "be patient" and "act".
+            label = unavailable[0]["label"]
+        else:
+            label = "Waiting on dependency"
+
+    # Bounded ancestor walk toward the oldest unfinished root.
+    root = None
+    root_depth = 0
+    truncated = False
+    seen = {str(task_id)}
+    cursor = blocking[0] if blocking else None
+    while cursor is not None:
+        if cursor in seen:
+            truncated = True
+            break
+        seen.add(cursor)
+        node = kb.get_task(conn, cursor)
+        root = _dependency_entry(conn, cursor, node)
+        root_depth += 1
+        if root_depth >= max_depth:
+            # Report what we reached AND that we stopped early, rather than
+            # presenting a mid-chain card as if it were the origin.
+            next_ids = [
+                pid for pid in _parent_ids(conn, cursor)
+                if (kb.get_task(conn, pid) is None
+                    or kb.get_task(conn, pid).status not in _TERMINAL_PARENT_STATUSES)
+            ]
+            truncated = bool(next_ids)
+            break
+        if node is None:
+            break
+        unfinished = [
+            pid for pid in _parent_ids(conn, cursor)
+            if (kb.get_task(conn, pid) is None
+                or kb.get_task(conn, pid).status not in _TERMINAL_PARENT_STATUSES)
+        ]
+        cursor = unfinished[0] if unfinished else None
+
+    return {
+        "task_id": str(task_id),
+        "lifecycle_status": getattr(task, "status", None),
+        "parents": parents,
+        "blocking": blocking,
+        "label": label,
+        "root": root,
+        "root_depth": root_depth,
+        "root_truncated": truncated,
+    }

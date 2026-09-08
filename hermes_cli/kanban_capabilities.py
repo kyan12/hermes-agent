@@ -228,7 +228,12 @@ def _probe_typed_block_projection(conn) -> bool:
             return False
         for payload in _surfaces(task):
             projection = payload.get("block_projection") or {}
-            if payload.get("status") != "triage" or projection.get("visible") is not False:
+            # The durable status is reported as-is; the projection is what
+            # carries authority. Requiring a rewritten "triage" status here was
+            # requiring the user-facing Triage bucket itself.
+            if payload.get("status") != "blocked":
+                return False
+            if projection.get("visible") is not False:
                 return False
 
     current = kb.get_task(conn, gate)

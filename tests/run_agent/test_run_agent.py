@@ -4628,7 +4628,20 @@ class TestRunConversation:
         self._setup_agent(agent)
         agent.max_iterations = 2
 
+        # The exhaustion path now refuses to charge a failure unless this
+        # process holds the task's live claim — an in-process cron tick or
+        # delegate_task child inherits HERMES_KANBAN_TASK and could otherwise
+        # block the parent's card. This test is about the exhaustion ROUTING,
+        # so grant the claim rather than standing up a board; the authority
+        # itself is driven against a real board in
+        # tests/agent/test_kanban_budget_exhaustion_authority.py.
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "lock-7")
+        monkeypatch.setattr(
+            "agent.delegation_context.live_dispatcher_worker_task",
+            lambda: "t_test_task_123",
+        )
 
         # Return a tool call for every iteration to exhaust the budget.
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

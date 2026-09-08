@@ -360,3 +360,363 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in text for text in submits), submits
         assert session["_kanban_pending"] == []
         assert session["running"] is True
+
+
+# ---------------------------------------------------------------------------
+# A machine stop is visible, and it is visibly the MACHINE's problem
+# ---------------------------------------------------------------------------
+#
+# ``block_task`` routes an untyped / transient / unaffirmed machine stop to the
+# internal recovery lane and emits ``automation_recovery_requested`` — no
+# ``blocked`` event at all. Neither notifier claimed that kind, so the single
+# most important thing a subscriber can be told ("your task stopped") produced
+# exactly zero notifications, on Telegram and in the TUI alike.
+#
+# Making it visible must not overcorrect the other way: an automation failure
+# is not an approval request. The message names the machine as the owner and
+# never asks a person to classify or route the work.
+
+
+def _machine_stop(tid: str, reason: str = "provider timed out", kind=None):
+    conn = kb.connect()
+    try:
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason=reason, kind=kind)
+    finally:
+        conn.close()
+
+
+def _events(tid: str, kind: str):
+    conn = kb.connect()
+    try:
+        return [e for e in kb.list_events(conn, tid) if e.kind == kind]
+    finally:
+        conn.close()
+
+
+def _task(tid: str):
+    conn = kb.connect()
+    try:
+        return kb.get_task(conn, tid)
+    finally:
+        conn.close()
+
+
+class TestMachineStopNotifications:
+    def test_a_machine_stop_notifies_at_all(self):
+        tid = _create_subscribed_task()
+        pre_cursor = _sub_rows(tid)[0]["last_event_id"]
+        _machine_stop(tid, reason="provider quota exhausted")
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert texts, "a machine stop produced no notification whatsoever"
+        assert any("provider quota exhausted" in t for t in texts)
+        assert _sub_rows(tid)[0]["last_event_id"] > pre_cursor
+
+    def test_a_machine_stop_reads_as_blocked_and_machine_owned(self):
+        tid = _create_subscribed_task()
+        _machine_stop(tid, reason="provider quota exhausted")
+
+        text = "\n".join(_collect_kanban_notifications(_session()))
+
+        assert "blocked" in text.lower()
+        # Never an invented approval request, and never the internal lane name.
+        assert "triage" not in text.lower()
+        assert "human decision" not in text.lower()
+        assert "your input" not in text.lower()
+        assert "automatic recovery" in text.lower() or "recovery" in text.lower()
+
+    def test_the_same_wording_is_used_in_the_tui_and_the_gateway(self):
+        """One vocabulary. A card must not read differently per surface."""
+        from gateway.kanban_watchers import format_kanban_notification
+
+        tid = _create_subscribed_task()
+        _machine_stop(tid, reason="provider quota exhausted")
+        ev = _events(tid, "automation_recovery_requested")[-1]
+        sub = _sub_rows(tid)[0]
+
+        tui = _format_kanban_event_text(sub, _task(tid), ev, "default")
+        gateway = format_kanban_notification(sub, _task(tid), ev, "default")
+        assert tui == gateway
+
+    def test_a_repeated_block_loop_is_not_an_invented_kevin_gate(self):
+        """``block_loop_detected`` used to say "routed to TRIAGE — needs a
+        human decision". Repeated machine failure is still machine failure."""
+        from gateway.kanban_watchers import format_kanban_notification
+
+        tid = _create_subscribed_task()
+        for _ in range(6):
+            conn = kb.connect()
+            try:
+                if kb.get_task(conn, tid).status != "ready":
+                    conn.execute(
+                        "UPDATE tasks SET status='ready' WHERE id=?", (tid,)
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+            _machine_stop(tid, reason="same cause again", kind="transient")
+        loops = _events(tid, "block_loop_detected")
+        assert loops, "the recurrence limit never tripped"
+
+        text = format_kanban_notification(
+            _sub_rows(tid)[0], _task(tid), loops[-1], "default",
+        )
+        assert text
+        assert "triage" not in text.lower()
+        assert "needs a human decision" not in text.lower()
+        assert "blocked" in text.lower()
+
+    def test_an_affirmed_human_gate_still_asks_for_kevin(self):
+        """Removing the invented gate must not silence the genuine one."""
+        from gateway.kanban_watchers import format_kanban_notification
+        from hermes_cli import kanban_health as kh
+        import time as _time
+
+        tid = _create_subscribed_task()
+        _machine_stop(tid, reason="which envelope ships?", kind="needs_input")
+        conn = kb.connect()
+        try:
+            assert kh.affirm_human_gate(conn, tid, evidence={
+                "type": "human_decision",
+                "action": "Confirm the approved subject line",
+                "affirmed_by": "Kevin Yan",
+                "affirmed_at": int(_time.time()),
+            }, reason="which envelope ships?")
+        finally:
+            conn.close()
+        gate = [
+            e for e in _events(tid, "blocked") if (e.payload or {}).get("affirmed")
+        ]
+        assert gate
+
+        text = format_kanban_notification(
+            _sub_rows(tid)[0], _task(tid), gate[-1], "default",
+        )
+        assert text and "blocked" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# A gate the operator has since taken supersedes the machine's own play-by-play
+# ---------------------------------------------------------------------------
+#
+# A repeated block emits `automation_recovery_requested` and, past the
+# recurrence limit, `block_loop_detected`. If an operator affirms a human gate
+# on that same occurrence before the notifier's next poll, all three are still
+# sitting unclaimed — and the user receives, in order, two messages promising
+# that automatic recovery will handle it, then one saying it is blocked on
+# them. The first two are false by the time they are sent: nothing is going to
+# pick this card up, because the operator took it.
+#
+# Every machine-recovery intermediary superseded by an affirmed gate for the
+# same occurrence is suppressed. The gate itself is still delivered.
+
+
+def _repeat_block_to_loop(tid: str, reason: str = "needs credentials"):
+    conn = kb.connect()
+    try:
+        for _ in range(kb.BLOCK_RECURRENCE_LIMIT + 1):
+            task = kb.get_task(conn, tid)
+            if task.status != "ready":
+                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+                conn.commit()
+            assert kb.claim_task(conn, tid, claimer="worker") is not None
+            assert kb.block_task(conn, tid, reason=reason, kind="needs_input")
+    finally:
+        conn.close()
+
+
+def _affirm_now(tid: str, action: str = "Confirm the approved subject line"):
+    from hermes_cli import kanban_health as kh
+    import time as _time
+
+    conn = kb.connect()
+    try:
+        assert kh.affirm_human_gate(conn, tid, evidence={
+            "type": "human_decision",
+            "action": action,
+            "affirmed_by": "Kevin Yan",
+            "affirmed_at": int(_time.time()),
+        }, reason="needs a decision")
+    finally:
+        conn.close()
+
+
+class TestGateSupersedesMachineChatter:
+    def test_no_superseded_machine_message_reaches_the_user(self):
+        tid = _create_subscribed_task()
+        _repeat_block_to_loop(tid)
+        assert _events(tid, "block_loop_detected"), "the loop never tripped"
+        _affirm_now(tid)
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert texts, "the affirmed gate itself must still be delivered"
+        joined = "\n".join(texts).lower()
+        assert "automatic recovery" not in joined, (
+            "the user was promised automatic recovery on a card an operator "
+            f"has already taken: {texts}"
+        )
+        assert "no action needed from you" not in joined
+
+    def test_the_affirmed_gate_is_the_message_that_survives(self):
+        tid = _create_subscribed_task()
+        _repeat_block_to_loop(tid)
+        _affirm_now(tid, action="Confirm the approved subject line")
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1, f"expected only the gate, got {texts}"
+        assert "blocked" in texts[0].lower()
+        # The gate's own reason, not the machine's last excuse.
+        assert "needs a decision" in texts[0]
+
+    def test_the_cursor_still_advances_past_suppressed_events(self):
+        """Suppressed is not unclaimed: an unclaimed row wedges later events."""
+        tid = _create_subscribed_task()
+        pre_cursor = _sub_rows(tid)[0]["last_event_id"]
+        _repeat_block_to_loop(tid)
+        _affirm_now(tid)
+
+        _collect_kanban_notifications(_session())
+
+        assert _sub_rows(tid)[0]["last_event_id"] > pre_cursor
+        assert _collect_kanban_notifications(_session()) == []
+
+    def test_an_unsuperseded_machine_stop_is_still_announced(self):
+        """Suppression is scoped to a gate the operator actually holds."""
+        tid = _create_subscribed_task()
+        _repeat_block_to_loop(tid, reason="provider quota exhausted")
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert texts, "a machine stop with no gate must still be announced"
+        assert any("provider quota exhausted" in t for t in texts)
+
+    def test_a_released_gate_does_not_suppress_a_later_machine_stop(self):
+        """Once the operator hands the card back, the machine speaks again."""
+        tid = _create_subscribed_task()
+        _repeat_block_to_loop(tid)
+        _affirm_now(tid)
+        _collect_kanban_notifications(_session())
+        conn = kb.connect()
+        try:
+            assert kb.unblock_task(conn, tid)
+        finally:
+            conn.close()
+        _repeat_block_to_loop(tid, reason="provider quota exhausted")
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert any("provider quota exhausted" in t for t in texts)
+
+
+# ---------------------------------------------------------------------------
+# `gave_up` is a machine stop like any other, and it says what actually failed
+# ---------------------------------------------------------------------------
+#
+# `gave_up` is the circuit breaker tripping. It is emitted for EVERY trigger
+# outcome — timed_out, crashed, protocol_violation, rate_limited, spawn_failed
+# — but was announced verbatim as "gave up after repeated spawn failures". For
+# a task that timed out six times, that message names the wrong failure, and an
+# operator who goes looking for spawn errors finds none.
+#
+# It is also emitted in the SAME transaction that mints the recovery owner, so
+# a message that stops at "gave up" omits the one fact that matters: automation
+# already owns the next attempt. And like every other machine-stop kind it must
+# fall silent when an operator has affirmed a gate on the same occurrence.
+
+
+def _trip_breaker(tid: str, *, outcome: str = "timed_out", error: str = "elapsed 600s"):
+    conn = kb.connect()
+    try:
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb._record_task_failure(
+            conn, tid, error=error, outcome=outcome,
+            force_trip=True, release_claim=True, end_run=True,
+        ) is True
+    finally:
+        conn.close()
+
+
+class TestGaveUpIsAnHonestMachineStop:
+    def test_the_message_does_not_invent_spawn_failures(self):
+        tid = _create_subscribed_task()
+        _trip_breaker(tid, outcome="timed_out", error="elapsed 600s > limit 300s")
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert texts, "a circuit-breaker trip produced no notification"
+        joined = "\n".join(texts)
+        assert "spawn" not in joined.lower(), (
+            f"a timeout was reported as repeated spawn failures: {texts}"
+        )
+        assert "timed_out" in joined or "timed out" in joined.lower()
+
+    def test_a_protocol_violation_is_named_as_itself(self):
+        tid = _create_subscribed_task()
+        _trip_breaker(tid, outcome="protocol_violation", error="no terminal tool")
+
+        joined = "\n".join(_collect_kanban_notifications(_session()))
+
+        assert "protocol_violation" in joined or "protocol violation" in joined
+        assert "spawn" not in joined.lower()
+
+    def test_a_real_spawn_failure_still_says_spawn(self):
+        tid = _create_subscribed_task()
+        _trip_breaker(tid, outcome="spawn_failed", error="no such profile")
+
+        joined = "\n".join(_collect_kanban_notifications(_session()))
+
+        assert "spawn_failed" in joined or "spawn" in joined.lower()
+
+    def test_the_recovery_owner_minted_in_the_same_txn_is_reported(self):
+        tid = _create_subscribed_task()
+        _trip_breaker(tid)
+        conn = kb.connect()
+        try:
+            owner_id = kb.active_recovery_owner(conn, tid)
+        finally:
+            conn.close()
+
+        joined = "\n".join(_collect_kanban_notifications(_session()))
+
+        assert "recovery" in joined.lower(), (
+            "the breaker tripped and automation already owns the retry, but "
+            f"the message says nothing about it: {joined}"
+        )
+        if owner_id:
+            assert owner_id in joined or "no action needed" in joined.lower()
+
+    def test_a_gate_affirmed_before_the_poll_suppresses_gave_up(self):
+        tid = _create_subscribed_task()
+        _trip_breaker(tid)
+        conn = kb.connect()
+        try:
+            # Release the machine stop, then take the card as a real gate.
+            assert kb.unblock_task(conn, tid)
+            assert kb.claim_task(conn, tid, claimer="worker") is not None
+            assert kb.block_task(conn, tid, reason="which envelope ships?",
+                                 kind="needs_input")
+        finally:
+            conn.close()
+        _affirm_now(tid)
+
+        joined = "\n".join(_collect_kanban_notifications(_session())).lower()
+
+        assert "gave up" not in joined, joined
+        assert "automatic recovery" not in joined, joined
+
+    def test_the_gateway_and_the_tui_still_say_the_same_thing(self):
+        from gateway.kanban_watchers import format_kanban_notification
+
+        tid = _create_subscribed_task()
+        _trip_breaker(tid)
+        ev = _events(tid, "gave_up")[-1]
+        sub = _sub_rows(tid)[0]
+
+        assert (
+            _format_kanban_event_text(sub, _task(tid), ev, "default")
+            == format_kanban_notification(sub, _task(tid), ev, "default")
+        )

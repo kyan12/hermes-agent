@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_health as kh
 
 
 # ---------------------------------------------------------------------------
@@ -70,11 +71,12 @@ def test_board_empty(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    # All canonical columns present (triage + the rest), each empty.
+    # Every OPERATOR lane present, each empty. `triage` and `review` are
+    # internal lifecycle stages projected into these lanes, never lanes of
+    # their own (see kanban_health.OPERATOR_COLUMNS).
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
-    for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
-        assert expected in names, f"missing column {expected}: {names}"
+    assert names == list(kh.OPERATOR_COLUMNS)
+    assert "triage" not in names and "review" not in names
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
     assert data["assignees"] == []
@@ -86,7 +88,12 @@ def test_board_empty(client):
 # ---------------------------------------------------------------------------
 
 
-def test_board_projects_unaffirmed_block_into_automation_triage(client):
+def test_board_keeps_an_unaffirmed_block_machine_owned_in_blocked(client):
+    """An unaffirmed machine stop stays in Blocked, owned by automation.
+
+    It used to be moved into a visible Triage column, which turned a machine
+    failure into a standing request for a person to classify work.
+    """
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="legacy machine block", assignee="worker")
         with kb.write_txn(conn):
@@ -98,13 +105,16 @@ def test_board_projects_unaffirmed_block_into_automation_triage(client):
 
     data = client.get("/api/plugins/kanban/board").json()
     columns = {column["name"]: column["tasks"] for column in data["columns"]}
-    assert tid not in {task["id"] for task in columns["blocked"]}
-    triaged = {task["id"]: task for task in columns["triage"]}
-    assert triaged[tid]["status"] == "triage"
-    assert triaged[tid]["block_projection"]["visible"] is False
+    assert "triage" not in columns
+    card = {task["id"]: task for task in columns["blocked"]}[tid]
+    # The durable status is reported as-is and stays inspectable.
+    assert card["status"] == "blocked"
+    assert card["block_projection"]["visible"] is False
+    assert card["operator"]["owner"] == "machine"
+    assert card["operator"]["action"]
 
 
-def test_board_and_detail_project_stale_affirmation_as_triage(client, monkeypatch):
+def test_board_and_detail_agree_a_stale_affirmation_is_machine_owned(client, monkeypatch):
     from hermes_cli import kanban_health as kh
 
     monkeypatch.setenv("HERMES_KANBAN_OPERATOR", "kevin")
@@ -121,11 +131,14 @@ def test_board_and_detail_project_stale_affirmation_as_triage(client, monkeypatc
 
     board = client.get("/api/plugins/kanban/board").json()
     columns = {column["name"]: column["tasks"] for column in board["columns"]}
-    projected = {task["id"]: task for task in columns["triage"]}[tid]
+    projected = {task["id"]: task for task in columns["blocked"]}[tid]
     detail = client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]
+    # Column and drawer describe the same card the same way.
     for task in (projected, detail):
-        assert task["status"] == "triage"
+        assert task["status"] == "blocked"
         assert task["block_projection"]["visible"] is False
+        assert task["operator"]["column"] == "blocked"
+        assert task["operator"]["owner"] == "machine"
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "blocked"
 

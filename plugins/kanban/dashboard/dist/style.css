@@ -170,14 +170,16 @@
   border-radius: 999px;
   background: var(--color-muted-foreground);
 }
-.hermes-kanban-dot-triage   { background: #b47dd6; }  /* lilac — fresh/unspecified */
-.hermes-kanban-dot-todo     { background: var(--color-muted-foreground); }
-.hermes-kanban-dot-ready    { background: #d4b348; }  /* amber */
-.hermes-kanban-dot-running  { background: #3fb97d; }  /* green */
-.hermes-kanban-dot-blocked  { background: var(--color-destructive, #d14a4a); }
-.hermes-kanban-dot-review   { background: #48b0c4; }  /* cyan — awaiting review */
-.hermes-kanban-dot-done     { background: #4a8cd1; }  /* blue */
-.hermes-kanban-dot-archived { background: var(--color-border); }
+/* Keyed by OPERATOR lane, not raw lifecycle status. `triage` and `review` are
+   internal stages projected into these lanes, so they have no dot of their
+   own; `scheduled` is a first-class waiting lane and previously had none. */
+.hermes-kanban-dot-todo      { background: var(--color-muted-foreground); }
+.hermes-kanban-dot-scheduled { background: #b47dd6; }  /* lilac — held */
+.hermes-kanban-dot-ready     { background: #d4b348; }  /* amber */
+.hermes-kanban-dot-running   { background: #3fb97d; }  /* green */
+.hermes-kanban-dot-blocked   { background: var(--color-destructive, #d14a4a); }
+.hermes-kanban-dot-done      { background: #4a8cd1; }  /* blue */
+.hermes-kanban-dot-archived  { background: var(--color-border); }
 
 /* ---- Progress pill (N/M child tasks done) --------------------------- */
 
@@ -299,6 +301,23 @@
   background: color-mix(in srgb, var(--color-warning, #d4b348) 16%, transparent);
   border-color: color-mix(in srgb, var(--color-warning, #d4b348) 45%, var(--color-border));
   color: var(--color-foreground);
+}
+
+/* Who owns the next move on a stopped card. Automation-owned stops are muted;
+   only a genuinely affirmed human gate gets the attention colour, so the
+   Blocked lane cannot read as one undifferentiated pile of asks. */
+.hermes-kanban-owner {
+  font-size: 0.6rem !important;
+  padding: 0.05rem 0.3rem !important;
+  color: var(--color-foreground);
+}
+.hermes-kanban-owner--machine {
+  background: color-mix(in srgb, var(--color-muted-foreground) 14%, transparent);
+  border-color: color-mix(in srgb, var(--color-muted-foreground) 40%, var(--color-border));
+}
+.hermes-kanban-owner--kevin {
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 16%, transparent);
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 45%, var(--color-border));
 }
 
 .hermes-kanban-assignee {
@@ -705,6 +724,12 @@
   padding: 0 0.15rem;
 }
 .hermes-kanban-dep-chip-x:hover { color: var(--color-destructive, #d14a4a); }
+/* A parent that can never finish (archived or gone) is not an ordinary wait,
+   and reading it as one is the difference between "be patient" and "act". */
+.hermes-kanban-dep-chip-unavailable {
+  border-style: dashed;
+  opacity: 0.75;
+}
 
 /* ---- Inline edit affordances --------------------------------------- */
 

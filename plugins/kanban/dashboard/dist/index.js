@@ -86,30 +86,41 @@
     return body || raw;
   }
 
-  // Board column display order; any backend status not listed here renders after these.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
+  // Operator lane display order. These are LANES, not raw lifecycle statuses:
+  // `triage` and `review` are internal stages the backend projects into these
+  // lanes (see kanban_health.OPERATOR_COLUMNS / project_operator_state, and
+  // plugin_api.BOARD_COLUMNS which is built from it). Listing them here would
+  // render permanently empty phantom columns and put the internal vocabulary
+  // back in front of the operator. Any lane the backend sends that is not
+  // listed renders after these.
+  const COLUMN_ORDER = ["todo", "scheduled", "ready", "running", "blocked", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
-    triage: "Triage",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
-    review: "Review",
     done: "Done",
     archived: "Archived",
   };
   const FALLBACK_COLUMN_HELP = {
-    triage: "Raw ideas — a specifier will flesh out the spec",
-    todo: "Waiting on dependencies or unassigned",
-    ready: "Dependencies satisfied; assign a profile to dispatch",
-    running: "Claimed by a worker — in-flight",
-    blocked: "Worker asked for human input",
-    review: "Implementation complete — awaiting review",
+    todo: "Waiting on a dependency",
+    scheduled: "Held until a wake time or an external event",
+    ready: "Dependencies satisfied; queued for dispatch",
+    running: "In flight — includes work under review and automatic recovery",
+    blocked: "Stopped. Each card says who owns the next move",
     done: "Completed",
     archived: "Archived",
+  };
+  // Who owns the next move on a stopped card. A machine failure displayed as
+  // Blocked must never read as an approval request, so the owner is rendered
+  // explicitly rather than inferred from the lane.
+  const OWNER_LABEL = {
+    machine: "Automation",
+    kevin: "Needs you",
   };
   const FALLBACK_DESTRUCTIVE = {
     done: "Mark this task as done? The worker's claim is released and dependent children become ready.",
@@ -170,15 +181,63 @@
   }
 
   const COLUMN_DOT = {
-    triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
+    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
-    review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
   };
+
+  // ── Operator projection accessors ───────────────────────────────────────
+  //
+  // Every task the API serves carries `operator`: the lane it belongs in, the
+  // internal stage it is really at, who owns the next move, and the one next
+  // action when that owner is a machine (see
+  // kanban_health.project_operator_state). Reading `task.status` to decide any
+  // of that is what put `triage` and `review` back in front of the operator
+  // and made a stalled machine card look like an approval request.
+  //
+  // `lifecycle_status` is kept, but as SECONDARY metadata: it is the durable
+  // row value, shown for inspection in the drawer, never used to pick a lane.
+
+  function operatorOf(task) {
+    return (task && task.operator) || {};
+  }
+
+  function operatorLane(task) {
+    const op = operatorOf(task);
+    // Fall back to the raw status only for a task shape that predates the
+    // projection; a lane the board does not render is bucketed by the caller.
+    return op.column || (task && task.status) || "todo";
+  }
+
+  function operatorStage(task) {
+    const op = operatorOf(task);
+    return op.stage || op.lifecycle_status || (task && task.status) || "";
+  }
+
+  function operatorOwnerLabel(t, task) {
+    const owner = operatorOf(task).owner;
+    if (!owner) return "";
+    return tx(t, "owner." + owner, OWNER_LABEL[owner] || owner);
+  }
+
+  function operatorAction(task) {
+    const op = operatorOf(task);
+    return op.action || "";
+  }
+
+  function operatorNextOwner(task) {
+    const op = operatorOf(task);
+    return op.next_owner || "";
+  }
+
+  function lifecycleStatusOf(task) {
+    const op = operatorOf(task);
+    return op.lifecycle_status || (task && task.status) || "";
+  }
 
   function isDiagnosticEvent(kind) {
     return Object.prototype.hasOwnProperty.call(FALLBACK_DIAGNOSTIC_EVENT_LABELS, kind);
@@ -3045,7 +3104,16 @@
     };
 
     const progress = t.progress;
-    const needsAssignee = t.status === "ready" && !t.assignee;
+    const needsAssignee = operatorLane(t) === "ready" && !t.assignee;
+    // A stopped card must say WHO owns the next move. Without this the Blocked
+    // lane reads as one undifferentiated "Kevin, look at this" pile, and a
+    // failed provider call is indistinguishable from a real approval request.
+    const ownerLabel = operatorLane(t) === "blocked"
+      ? operatorOwnerLabel(i18n, t)
+      : "";
+    const ownerKind = operatorOf(t).owner || "";
+    const nextAction = operatorAction(t);
+    const nextOwner = operatorNextOwner(t);
 
     return h("div", {
       ref: cardRef,
@@ -3060,7 +3128,7 @@
       draggable: true,
       tabIndex: 0,
       role: "button",
-      "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.status}`,
+      "aria-label": `${t.title || "untitled"} — ${t.id} — ${operatorLane(t)}${ownerLabel ? " — " + ownerLabel : ""}`,
       onDragStart: handleDragStart,
       onClick: handleClick,
       onKeyDown: handleKeyDown,
@@ -3121,6 +3189,19 @@
                   className: "hermes-kanban-needs-assignee",
                   title: tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile."),
                 }, tx(i18n, "needsAssignee", "Needs assignee"))
+              : null,
+            ownerLabel
+              ? h(Badge, {
+                  variant: "outline",
+                  className: cn(
+                    "hermes-kanban-owner",
+                    "hermes-kanban-owner--" + (ownerKind || "machine"),
+                  ),
+                  // The one next action, and who owes it. For a machine-owned
+                  // stop this is what automation will do next, not a request.
+                  title: [nextAction, nextOwner ? "Next owner: " + nextOwner : ""]
+                    .filter(Boolean).join("\n"),
+                }, ownerLabel)
               : null,
           ),
           h("div", { className: "hermes-kanban-card-title" },
@@ -3564,48 +3645,13 @@
       return Object.assign({}, patch, { result: summary, summary: summary });
     }
 
-    // Triage specifier — calls the auxiliary LLM to flesh out a rough
-    // idea in the Triage column into a concrete spec (title + body with
-    // goal, approach, acceptance criteria) and promotes it to todo.
-    // Not a PATCH: runs through a dedicated POST endpoint because the
-    // LLM call can take tens of seconds, and its outcome is richer than
-    // a status flip (may update title AND body AND emit an audit
-    // comment — or fail with a human-readable reason that the UI
-    // surfaces inline without treating it as an HTTP error).
-    const doSpecify = function () {
-      return SDK.fetchJSON(
-        withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/specify`, boardSlug),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        }
-      ).then(function (res) {
-        load();
-        props.onRefresh();
-        return res;
-      });
-    };
-
-    // POST /tasks/:id/decompose — fan a triage task out into a graph
-    // of child tasks routed to specialist profiles by description.
-    // Refreshes both the drawer (so the user sees the root flip to
-    // todo) and the board (so the new children appear in the columns).
-    const doDecompose = function () {
-      return SDK.fetchJSON(
-        withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/decompose`, boardSlug),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        }
-      ).then(function (res) {
-        load();
-        props.onRefresh();
-        return res;
-      });
-    };
-
+    // The POST /tasks/:id/specify and /tasks/:id/decompose callers used to
+    // live here, wired to buttons in the drawer. Both are gone from the
+    // operator surface (see StatusActions): they only ever applied to the
+    // internal triage stage, and running the auxiliary specifier over a
+    // stalled recovery source rewrites its title and body through a truncated
+    // LLM input — the one thing the recovery lane must never do to a card
+    // carrying an approval envelope. The backend endpoints are unchanged.
     const addLink = function (parentId) {
       return SDK.fetchJSON(withBoard(`${API}/links`, boardSlug), {
         method: "POST",
@@ -3696,8 +3742,6 @@
           assignees: props.assignees || [],
           boardSlug: boardSlug,
           onPatch: doPatch,
-          onSpecify: doSpecify,
-          onDecompose: doDecompose,
           onAddParent: addLink,
           onRemoveParent: removeLink,
           onAddChild: addChild,
@@ -3874,10 +3918,12 @@
     const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
     const childResults = props.data.child_results || [];
+    // Titled, stateful dependency labels (kanban_health.dependency_labels).
+    const deps = props.data.dependencies || {};
 
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
-        h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[t.status]) }),
+        h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[operatorLane(t)]) }),
         props.editing
           ? h(TitleEditor, {
               initial: t.title || "",
@@ -3893,7 +3939,28 @@
             }, t.title || tx(i18n, "untitled", "(untitled)")),
       ),
       h("div", { className: "hermes-kanban-drawer-meta" },
-        h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
+        // The operator lane is the primary line; `lifecycle_status` follows as
+        // SECONDARY metadata so the durable row stays inspectable (a card can
+        // legitimately sit at the internal `review` or `triage` stage) without
+        // that internal vocabulary being the thing the drawer leads with.
+        h(MetaRow, {
+          label: tx(i18n, "status", "Status"),
+          value: getColumnLabel(i18n, operatorLane(t))
+            + (operatorOwnerLabel(i18n, t)
+                ? ` — ${operatorOwnerLabel(i18n, t)}`
+                : ""),
+        }),
+        operatorAction(t) ? h(MetaRow, {
+          label: tx(i18n, "nextAction", "Next action"),
+          value: operatorAction(t)
+            + (operatorNextOwner(t) ? ` (${operatorNextOwner(t)})` : ""),
+        }) : null,
+        h(MetaRow, {
+          label: tx(i18n, "lifecycleStatus", "Lifecycle"),
+          value: operatorStage(t) && operatorStage(t) !== lifecycleStatusOf(t)
+            ? `${lifecycleStatusOf(t)} (${operatorStage(t)})`
+            : lifecycleStatusOf(t),
+        }),
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         h(ModelEditor, { task: t, onPatch: props.onPatch }),
@@ -3917,8 +3984,6 @@
       h(StatusActions, {
         task: t,
         onPatch: props.onPatch,
-        onSpecify: props.onSpecify,
-        onDecompose: props.onDecompose,
       }),
       h(DiagnosticsSection, {
         task: t,
@@ -3940,6 +4005,7 @@
       h(DependencyEditor, {
         task: t,
         links, allTasks: props.allTasks,
+        dependencies: deps,
         onAddParent: props.onAddParent,
         onRemoveParent: props.onRemoveParent,
         onAddChild: props.onAddChild,
@@ -4517,6 +4583,34 @@
     const { task, links, allTasks } = props;
     const [newParent, setNewParent] = useState("");
     const [newChild, setNewChild] = useState("");
+    // The API serves `dependencies` (kanban_health.dependency_labels): each
+    // parent by TITLE with a real state, plus whether it is genuinely
+    // unavailable (archived / missing) rather than merely not finished yet.
+    // Chips used to render the bare task id, which made a running parent
+    // unreadable and an archived one indistinguishable from an ordinary wait.
+    const deps = props.dependencies || {};
+    const depEntries = {};
+    (deps.parents || []).forEach(function (entry) {
+      depEntries[entry.task_id] = entry;
+    });
+    const byId = {};
+    (allTasks || []).forEach(function (tk) { byId[tk.id] = tk; });
+    // One chip label. Falls back to the id when neither the projection nor the
+    // board list can name the card — an id is a poor label, but a blank chip
+    // is worse and inventing a title would be a lie.
+    const depChipText = function (id) {
+      const entry = depEntries[id];
+      const title = (entry && entry.title) || (byId[id] && byId[id].title) || "";
+      const label = entry && entry.label ? ` — ${entry.label}` : "";
+      return title ? `${title}${label}` : id;
+    };
+    const depChipClass = function (id) {
+      const entry = depEntries[id];
+      if (entry && entry.available === false) {
+        return "hermes-kanban-dep-chip hermes-kanban-dep-chip-unavailable";
+      }
+      return "hermes-kanban-dep-chip";
+    };
     // Filter out self + existing links when offering the "add" dropdown.
     const candidatesFor = function (excludeSet) {
       return (allTasks || []).filter(function (tk) {
@@ -4534,8 +4628,12 @@
           (links.parents || []).length === 0
             ? h("span", { className: "hermes-kanban-deps-empty" }, tx(t, "none", "none"))
             : (links.parents || []).map(function (id) {
-                return h("span", { key: id, className: "hermes-kanban-dep-chip" },
-                  id,
+                return h("span", {
+                  key: id,
+                  className: depChipClass(id),
+                  title: id,
+                },
+                  depChipText(id),
                   h("button", {
                     type: "button",
                     className: "hermes-kanban-dep-chip-x",
@@ -4572,8 +4670,12 @@
           (links.children || []).length === 0
             ? h("span", { className: "hermes-kanban-deps-empty" }, tx(t, "none", "none"))
             : (links.children || []).map(function (id) {
-                return h("span", { key: id, className: "hermes-kanban-dep-chip" },
-                  id,
+                return h("span", {
+                  key: id,
+                  className: "hermes-kanban-dep-chip",
+                  title: id,
+                },
+                  (byId[id] && byId[id].title) || id,
                   h("button", {
                     type: "button",
                     className: "hermes-kanban-dep-chip-x",
@@ -4610,10 +4712,6 @@
   function StatusActions(props) {
     const { t } = useI18n();
     const task = props.task;
-    const [specifyBusy, setSpecifyBusy] = useState(false);
-    const [specifyMsg, setSpecifyMsg] = useState(null);
-    const [decomposeBusy, setDecomposeBusy] = useState(false);
-    const [decomposeMsg, setDecomposeMsg] = useState(null);
     const b = function (label, patch, enabled, confirmMsg) {
       return h(Button, {
         onClick: function () { if (enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
@@ -4622,94 +4720,28 @@
       }, label);
     };
 
-    // "Specify" appears only when the task is in the Triage column — the
-    // one column where an auxiliary LLM pass is meaningful. Elsewhere
-    // the backend would return ok:false with "not in triage" anyway,
-    // so hiding the button keeps the action row uncluttered.
-    const specifyButton = (task.status === "triage" && props.onSpecify)
-      ? h(Button, {
-          onClick: function () {
-            if (specifyBusy) return;
-            setSpecifyBusy(true);
-            setSpecifyMsg(null);
-            props.onSpecify().then(function (res) {
-              if (res && res.ok) {
-                const suffix = res.new_title
-                  ? ` — retitled: ${res.new_title}`
-                  : "";
-                setSpecifyMsg({ ok: true, text: `Specified${suffix}` });
-              } else {
-                setSpecifyMsg({
-                  ok: false,
-                  text: "Specify failed: " + ((res && res.reason) || "unknown error"),
-                });
-              }
-            }).catch(function (err) {
-              setSpecifyMsg({
-                ok: false,
-                text: "Specify failed: " + (err.message || String(err)),
-              });
-            }).then(function () {
-              setSpecifyBusy(false);
-            });
-          },
-          disabled: specifyBusy,
-          size: "sm",
-        }, specifyBusy ? "Specifying…" : "✨ Specify")
-      : null;
-
-    // "Decompose" is the built-in decomposer fan-out. Like Specify, only
-    // makes sense on triage-column tasks — elsewhere the backend short-
-    // circuits with ok:false. When the decomposer returns fanout:false
-    // we render the same single-task message as Specify; when it fans
-    // out we report the child count for quick at-a-glance verification.
-    const decomposeButton = (task.status === "triage" && props.onDecompose)
-      ? h(Button, {
-          onClick: function () {
-            if (decomposeBusy) return;
-            setDecomposeBusy(true);
-            setDecomposeMsg(null);
-            props.onDecompose().then(function (res) {
-              if (res && res.ok) {
-                if (res.fanout && res.child_ids && res.child_ids.length) {
-                  setDecomposeMsg({
-                    ok: true,
-                    text: `Decomposed into ${res.child_ids.length} children: ${res.child_ids.join(", ")}`,
-                  });
-                } else {
-                  const suffix = res.new_title
-                    ? ` — retitled: ${res.new_title}`
-                    : "";
-                  setDecomposeMsg({
-                    ok: true,
-                    text: `Single task (no fanout)${suffix}`,
-                  });
-                }
-              } else {
-                setDecomposeMsg({
-                  ok: false,
-                  text: "Decompose failed: " + ((res && res.reason) || "unknown error"),
-                });
-              }
-            }).catch(function (err) {
-              setDecomposeMsg({
-                ok: false,
-                text: "Decompose failed: " + (err.message || String(err)),
-              });
-            }).then(function () {
-              setDecomposeBusy(false);
-            });
-          },
-          disabled: decomposeBusy,
-          size: "sm",
-        }, decomposeBusy ? "Decomposing…" : "⚗ Decompose")
-      : null;
-
+    // Specify / Decompose used to live here, gated on `task.status ===
+    // "triage"`. Both are removed from the operator surface:
+    //
+    //  * they made Triage an operator concept again — the button existed only
+    //    to be pressed on a lane the board no longer shows;
+    //  * a stalled card in that lane is a machine-recovery source, and running
+    //    the auxiliary specifier over it rewrites the card's title and body
+    //    through a truncated LLM input. That is precisely the "never blindly
+    //    rewrite a long card through the specifier" rule the recovery lane is
+    //    built on, and an approval envelope is exactly the sort of body it
+    //    would paraphrase.
+    //
+    // Classifying a stalled card is the blocker-reconciler's job, and it does
+    // that with the original title/body/assignee preserved byte-for-byte. The
+    // backend endpoints are untouched; they are simply no longer offered as a
+    // one-click operator action.
     return h("div", null,
       h("div", { className: "hermes-kanban-actions" },
-        specifyButton,
-        decomposeButton,
-        b("→ triage",  { status: "triage" },   task.status !== "triage"),
+        // No "→ triage" control: triage is an internal intake/recovery stage
+        // that automation assigns and consumes, never a lane an operator
+        // pushes work into. No "→ review" for the same reason — review is
+        // entered through request_review by the worker that finished the work.
         b("→ ready",   { status: "ready" },    task.status !== "ready"),
         // No direct → running button: /tasks/:id PATCH rejects status=running
         // with 400 (issue #19535). Tasks enter running only through the
@@ -4725,16 +4757,6 @@
         b(tx(t, "archive", "Archive"),   { status: "archived" }, task.status !== "archived",
           getDestructiveConfirm(t, "archived")),
       ),
-      specifyMsg ? h("div", {
-        className: specifyMsg.ok
-          ? "hermes-kanban-msg-ok"
-          : "hermes-kanban-msg-err",
-      }, specifyMsg.text) : null,
-      decomposeMsg ? h("div", {
-        className: decomposeMsg.ok
-          ? "hermes-kanban-msg-ok"
-          : "hermes-kanban-msg-err",
-      }, decomposeMsg.text) : null,
     );
   }
 

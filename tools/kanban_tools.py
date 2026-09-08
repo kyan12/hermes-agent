@@ -180,6 +180,51 @@ def _worker_claim_lock(task_id: str) -> Optional[str]:
     return (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip() or None
 
 
+def _recovery_worker_binding(kb: Any, conn: Any) -> Optional[dict]:
+    """This process's recovery-owner identity, or ``None`` if it has none.
+
+    A recovery worker's only surface is the ordinary kanban tools, so those
+    handlers have to know when a call is the owner acting on the occurrence it
+    was minted for. Returns ``task_id`` / ``run_id`` / ``claim_lock`` (the
+    routing hints the dispatcher exported, unverified — the kernel is what
+    authenticates them) plus the ``source_task_id`` / ``source_event_id`` the
+    owner is durably bound to.
+
+    Deliberately does NOT require the run id or claim lock to be present or
+    plausible: a worker whose claim environment is missing or stale must still
+    be *routed* through the provenance-bound kernel path, so that it fails
+    closed there rather than silently landing an unprovenanced row that later
+    reads as "the source advanced while I was resolving it".
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id or _is_delegated_child_context():
+        return None
+    if not _is_dispatcher_owned_worker():
+        return None
+    try:
+        binding = kb.recovery_owner_source_binding(conn, task_id)
+    except Exception:
+        logger.debug("recovery owner binding lookup failed", exc_info=True)
+        return None
+    if binding is None:
+        return None
+    source_task_id, source_event_id = binding
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    try:
+        run_id = int(raw_run_id) if raw_run_id else None
+    except (TypeError, ValueError):
+        run_id = None
+    return {
+        "task_id": task_id,
+        "run_id": run_id,
+        "claim_lock": (
+            os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or ""
+        ).strip() or None,
+        "source_task_id": source_task_id,
+        "source_event_id": source_event_id,
+    }
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -1148,6 +1193,29 @@ def _handle_comment(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # A recovery owner's note about the occurrence it is resolving is
+            # evidence, not advancement. Routed through the provenance-bound
+            # kernel boundary so the row carries this owner, run and occurrence;
+            # otherwise the owner's own working notes trip the stale-source
+            # guard and every verdict it reaches is discarded as "the source
+            # advanced while I was resolving it".
+            binding = _recovery_worker_binding(kb, conn)
+            if binding is not None and str(tid) == binding["source_task_id"]:
+                ok = kb.add_recovery_evidence_comment(
+                    conn, binding["source_task_id"],
+                    recovery_task_id=binding["task_id"],
+                    run_id=binding["run_id"],
+                    claim_lock=binding["claim_lock"],
+                    source_event_id=binding["source_event_id"],
+                    body=str(body),
+                )
+                if not ok:
+                    return tool_error(
+                        "kanban_comment: this recovery owner cannot write "
+                        "evidence on its source — its claim is no longer live "
+                        "for the occurrence it was minted for"
+                    )
+                return _ok(task_id=tid, recovery_evidence=True)
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
             return _ok(task_id=tid, comment_id=cid)
         finally:
@@ -1721,6 +1789,19 @@ def _handle_create(args: dict, **kw) -> str:
                 ),
                 "session_id": session_id,
             }
+            # A recovery owner creating a card under itself is minting its own
+            # bounded continuation. Stamp durable creation provenance here — the
+            # worker never handles the claim lock itself, and the completion
+            # boundary later demands exactly this proof before it will park the
+            # source behind the new card. Only when the owner is genuinely a
+            # parent: any other create by the same worker is ordinary fan-out.
+            _binding = _recovery_worker_binding(kb, conn)
+            if _binding is not None and _binding["task_id"] in parents:
+                create_kwargs["recovery_origin"] = {
+                    "task_id": _binding["task_id"],
+                    "run_id": _binding["run_id"],
+                    "claim_lock": _binding["claim_lock"],
+                }
             # Revalidate authority under the same IMMEDIATE transaction as the
             # nested create_task savepoint. A completion, reclaim, expiry, or
             # parent-scope edit cannot race between validation and insertion.
@@ -1923,6 +2004,31 @@ def _handle_link(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # Same routing as kanban_comment: an edge a recovery owner adds to
+            # its own bound source is part of resolving that occurrence, so it
+            # goes through the provenance-bound boundary rather than reading as
+            # unrelated advancement.
+            binding = _recovery_worker_binding(kb, conn)
+            if binding is not None and str(child_id) == binding["source_task_id"]:
+                ok = kb.link_recovery_parent(
+                    conn, parent_id=str(parent_id),
+                    child_id=binding["source_task_id"],
+                    recovery_task_id=binding["task_id"],
+                    run_id=binding["run_id"],
+                    claim_lock=binding["claim_lock"],
+                    source_event_id=binding["source_event_id"],
+                )
+                if not ok:
+                    return tool_error(
+                        "kanban_link: this recovery owner cannot link a parent "
+                        "onto its source — its claim is no longer live for the "
+                        "occurrence it was minted for, the parent does not "
+                        "exist, or the edge would create a cycle"
+                    )
+                return _ok(
+                    parent_id=parent_id, child_id=child_id,
+                    recovery_provenance=True,
+                )
             kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
             return _ok(parent_id=parent_id, child_id=child_id)
         finally:
