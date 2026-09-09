@@ -81,12 +81,18 @@ def _existing_board_slug(slug: str) -> str:
 
 
 def _conn(board: Optional[str] = None):
-    """Connect to the already-normalised ``board`` (``None`` = active). ``init_db`` is
-    idempotent; running it here lets a fresh install self-heal if POST /tasks arrives first."""
-    try:
-        kanban_db.init_db(board=board)
-    except Exception as exc:
-        log.warning("kanban init_db failed: %s", exc)
+    """Connect to the already-normalised ``board`` (``None`` = active).
+
+    ``connect()`` already auto-runs the schema pass on the first connection per
+    path and re-runs it if the schema later vanishes, so a fresh install still
+    self-heals when POST /tasks arrives first. Calling ``init_db`` here as well
+    was NOT idempotent from the caller's side: it evicts the path from
+    ``_INITIALIZED_PATHS``, which is the sole gate for both ``connect()``'s fast
+    path and the early return in ``_guard_existing_db_is_healthy``. Every
+    request therefore re-took the cross-process init flock and re-ran a
+    whole-database ``PRAGMA integrity_check`` plus the schema and migration
+    passes -- on a shared, actively-written board.
+    """
     return kbc.connect(board=board)
 
 
