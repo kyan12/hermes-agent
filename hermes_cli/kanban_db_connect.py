@@ -1199,6 +1199,42 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         _check_file_length_invariant(conn)
 
 
+@contextlib.contextmanager
+def read_txn(conn: sqlite3.Connection):
+    """DEFERRED transaction: every read inside sees ONE snapshot of the database.
+
+    A read-only handler that issues several statements on an autocommit
+    connection is not reading one board, it is reading several. That is
+    invisible until the answers are *compared* — the dashboard's ``/board``
+    returns the tasks AND the event id a client resumes its stream from, and a
+    write landing between those two statements was absent from the board while
+    already behind the cursor, so nothing would ever mention it again.
+
+    ``BEGIN DEFERRED`` takes no lock here and none at all until the first read;
+    in WAL mode that read pins the snapshot and concurrent writers keep
+    committing past it. It is a read snapshot, never an escalation to a writer:
+    a caller that needs to write wants :func:`write_txn`.
+
+    Nesting joins the enclosing transaction rather than refusing, because that
+    transaction is already the snapshot the caller is asking for. (``write_txn``
+    refuses instead: its nesting question is about durability, not visibility.)
+
+    Keep the body short. The snapshot holds back WAL checkpointing for as long
+    as it is open.
+    """
+    if getattr(conn, "in_transaction", False):
+        yield conn
+        return
+    _execute_boundary_with_retry(conn, "BEGIN DEFERRED")
+    try:
+        yield conn
+    finally:
+        # Nothing was written, so ROLLBACK and COMMIT are the same end; ROLLBACK
+        # is the one that cannot become durable if this is ever wrong.
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute("ROLLBACK")
+
+
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402

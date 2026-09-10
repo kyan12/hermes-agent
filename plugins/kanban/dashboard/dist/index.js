@@ -641,11 +641,15 @@
     // showing stale data.
     const [taskEventTick, setTaskEventTick] = useState({});
 
-    const cursorRef = useRef(0);
+    // The event-stream position, and the board it belongs to. `null` means "we
+    // hold no position for any board" — which is NOT the same as 0 ("replay this
+    // board from the beginning"). Conflating them is why a board switch produced
+    // either a full-history replay or a permanently silent socket.
+    const cursorRef = useRef(null);
+    const cursorBoardRef = useRef(null);
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
-    const wsClosedRef = useRef(false);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -671,7 +675,17 @@
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
           setBoardData(data);
-          cursorRef.current = data.latest_event_id || 0;
+          // `latest_event_id` is a SNAPSHOT cursor: the board response and that
+          // id describe one moment (the server reads them under one read
+          // snapshot). It seeds the stream when we have no position for this
+          // board — but it must never overwrite one we already hold, because a
+          // reload triggered mid-stream would then step over events the socket
+          // has not delivered yet. Their effects are already in the snapshot,
+          // but the per-task signals the drawer reloads on are not.
+          if (cursorRef.current === null || cursorBoardRef.current !== board) {
+            cursorRef.current = data.latest_event_id || 0;
+            cursorBoardRef.current = board;
+          }
           setError(null);
         })
         .catch(function (err) {
@@ -723,11 +737,39 @@
     }, [loadBoard]);
 
     // --- WebSocket ---------------------------------------------------------
+    // Kept in a ref so the socket effect below depends on `board` alone. As a
+    // dependency it also carried `tenantFilter`/`includeArchived` (through
+    // loadBoard), so every filter change tore down and rebuilt the stream.
+    const scheduleReloadRef = useRef(scheduleReload);
+    useEffect(function () { scheduleReloadRef.current = scheduleReload; }, [scheduleReload]);
+
     useEffect(function () {
-      if (!boardData) return undefined;
-      wsClosedRef.current = false;
+      // Deliberately NOT gated on boardData. Gating the socket on a rendered
+      // board made a failed board load permanent: no render, no socket, and no
+      // socket meant nothing that could ever prompt a retry. The stream is how
+      // a board that could not render recovers, so it opens either way and the
+      // server's bootstrap frame supplies the position a render would have.
+      //
+      // Everything below belongs to THIS run of the effect. The previous code
+      // shared one `wsClosedRef` across runs: cleanup set it true, the next run
+      // set it false, and the old run's pending reconnect timer — never
+      // cleared — then fired, saw the flag reset, and opened a socket for the
+      // PREVIOUS board while overwriting `wsRef`. A generation object that only
+      // this run can cancel is what makes a stale callback identifiable.
+      const generation = { cancelled: false, timer: null, socket: null };
+
+      function reconnect() {
+        if (generation.cancelled) return;
+        const delay = Math.min(wsBackoffRef.current, 30000);
+        wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
+        generation.timer = setTimeout(function () {
+          generation.timer = null;
+          openWs();
+        }, delay);
+      }
+
       function openWs() {
-        if (wsClosedRef.current) return;
+        if (generation.cancelled) return;
         // Build the WS URL via the host SDK so the correct auth param is used
         // in BOTH modes: single-use ?ticket= in gated OAuth mode, ?token= in
         // loopback. Reading window.__HERMES_SESSION_TOKEN__ directly (the old
@@ -735,7 +777,18 @@
         // also applies the dashboard base-path prefix for reverse-proxied
         // deployments, which the old inline URL did not. It's async (gated
         // mode mints a fresh ticket per connect), so resolve then open.
-        const wsParams = { since: String(cursorRef.current || 0) };
+        const wsParams = {};
+        // `since` is sent ONLY when we hold a position for THIS board. Sending
+        // the previous board's cursor is what produced the connected-and-silent
+        // stream: the server only sends ids above the cursor, and the new
+        // board's ids start well below the old board's maximum, so the socket
+        // upgraded and then said nothing — indistinguishable from a dead one.
+        // Omitting it asks the server for this board's live position instead;
+        // it arrives in the bootstrap frame. Sending 0 would be worse still:
+        // that means "replay this board from the beginning".
+        if (cursorBoardRef.current === board && cursorRef.current !== null) {
+          wsParams.since = String(cursorRef.current);
+        }
         // Pin the WS stream to the currently-selected board so events
         // from other boards don't bleed in. Includes "default" so the
         // dashboard's own board pin always wins over the server-side
@@ -743,54 +796,75 @@
         // Regression: #20879.
         if (board) wsParams.board = board;
         SDK.buildWsUrl(`${API}/events`, wsParams).then(function (url) {
-          if (wsClosedRef.current) return;
+          if (generation.cancelled) return;
           let ws;
-          try { ws = new WebSocket(url); } catch (_e) { return; }
+          try { ws = new WebSocket(url); } catch (_e) { reconnect(); return; }
+          generation.socket = ws;
           wsRef.current = ws;
           ws.onopen = function () { wsBackoffRef.current = 1000; };
           ws.onmessage = function (ev) {
-            try {
-              const msg = JSON.parse(ev.data);
-              if (msg && Array.isArray(msg.events) && msg.events.length > 0) {
-                cursorRef.current = msg.cursor || cursorRef.current;
-                // Stamp per-task signal so the TaskDrawer can reload itself.
-                setTaskEventTick(function (prev) {
-                  const next = Object.assign({}, prev);
-                  for (const e of msg.events) {
-                    if (e && e.task_id) next[e.task_id] = (next[e.task_id] || 0) + 1;
-                  }
-                  return next;
-                });
-                scheduleReload();
+            if (generation.cancelled) return;
+            let msg;
+            try { msg = JSON.parse(ev.data); } catch (_e) { return; }
+            if (!msg) return;
+            // A frame naming a board other than the selected one came from a
+            // socket this generation has replaced. Applying it would move cards
+            // that are not on screen.
+            if (msg.board != null && board != null && msg.board !== board) return;
+            if (msg.type === "bootstrap") {
+              if (cursorRef.current === null || cursorBoardRef.current !== board) {
+                cursorRef.current = msg.cursor || 0;
+                cursorBoardRef.current = board;
               }
-            } catch (_e) { /* ignore */ }
+              // Reconcile against the position we are now anchored at. This is
+              // event-backed recovery, not a poll: it happens exactly once per
+              // connection, when the connection is established — so an initial
+              // 500, a dropped socket and a board switch all converge on a
+              // fresh board without anything running on a timer.
+              scheduleReloadRef.current();
+              return;
+            }
+            if (Array.isArray(msg.events) && msg.events.length > 0) {
+              if (typeof msg.cursor === "number") {
+                cursorRef.current = msg.cursor;
+                cursorBoardRef.current = board;
+              }
+              // Stamp per-task signal so the TaskDrawer can reload itself.
+              setTaskEventTick(function (prev) {
+                const next = Object.assign({}, prev);
+                for (const e of msg.events) {
+                  if (e && e.task_id) next[e.task_id] = (next[e.task_id] || 0) + 1;
+                }
+                return next;
+              });
+              scheduleReloadRef.current();
+            }
           };
           ws.onclose = function (ev) {
-            if (wsClosedRef.current) return;
+            if (generation.cancelled) return;
             if (ev && ev.code === 1008) {
               setError(tx(t, "wsAuthFailed",
                 "WebSocket auth failed — reload the page to refresh the session token."));
               return;
             }
-            const delay = Math.min(wsBackoffRef.current, 30000);
-            wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
-            setTimeout(openWs, delay);
+            reconnect();
           };
         }).catch(function () {
           // Ticket mint / URL build failed (e.g. session expired). Back off
           // and retry; a hard auth failure surfaces via the 1008 close path.
-          if (wsClosedRef.current) return;
-          const delay = Math.min(wsBackoffRef.current, 30000);
-          wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
-          setTimeout(openWs, delay);
+          reconnect();
         });
       }
       openWs();
       return function () {
-        wsClosedRef.current = true;
-        try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
+        generation.cancelled = true;
+        if (generation.timer) {
+          clearTimeout(generation.timer);
+          generation.timer = null;
+        }
+        try { generation.socket && generation.socket.close(); } catch (_e) { /* noop */ }
       };
-    }, [!!boardData, board, scheduleReload]);
+    }, [board]);
 
     // --- filtering ----------------------------------------------------------
     const filteredBoard = useMemo(function () {
@@ -1144,7 +1218,10 @@
       // event cursor so the WS reopens aligned to the new board's
       // latest_event_id on the next loadBoard.
       setBoardData(null);
-      cursorRef.current = 0;
+      // No position on the new board yet — `null`, not 0, which would ask the
+      // server to replay the new board from its first event.
+      cursorRef.current = null;
+      cursorBoardRef.current = null;
       setLoading(true);
       setBoard(nextSlug);
       writeSelectedBoard(nextSlug);

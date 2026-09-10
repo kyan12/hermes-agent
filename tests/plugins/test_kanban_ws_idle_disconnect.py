@@ -84,11 +84,21 @@ class _TrackingConnection:
         self.rows_by_poll = list(rows_by_poll or [])
         self.on_execute = on_execute
         self.execute_calls = 0
+        self.bootstrap_calls = 0
         self.close_calls = 0
         self.thread_ids: list[int] = []
         self._rows: list[dict] = []
+        self._row: dict = {"m": 0}
 
-    def execute(self, sql, params):
+    def execute(self, sql, params=()):
+        # The handler's first statement is the bootstrap's MAX(id) read, not a
+        # poll, so it is counted separately: ``execute_calls`` still means "how
+        # many times the tail queried", which is what these tests are about.
+        if "MAX(id)" in sql:
+            self.bootstrap_calls += 1
+            self.thread_ids.append(threading.get_ident())
+            self._row = {"m": 0}
+            return self
         self.execute_calls += 1
         self.thread_ids.append(threading.get_ident())
         if self.on_execute is not None:
@@ -104,6 +114,9 @@ class _TrackingConnection:
     def fetchall(self):
         return self._rows
 
+    def fetchone(self):
+        return self._row
+
     def close(self):
         self.close_calls += 1
         self.thread_ids.append(threading.get_ident())
@@ -114,6 +127,8 @@ async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
     mod = _load_plugin_module()
     monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
 
+    conn = _TrackingConnection()
+    monkeypatch.setattr(mod.kbc, "connect", lambda **kw: conn)
     ws = _IdleDisconnectingWebSocket()
 
     # The disconnect must terminate the handler even though the board is idle
@@ -123,7 +138,11 @@ async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
 
     assert ws.accepted
     assert ws.receive_calls == 1
-    assert ws.sent == []  # returned before any poll, no zombie loop
+    # The bootstrap frame is sent before the loop starts — it is how a client
+    # learns where the stream begins without a rendered board. Past it, the
+    # handler returned without polling: no zombie loop.
+    assert ws.sent == [{"type": "bootstrap", "cursor": 0, "board": None}]
+    assert conn.execute_calls == 0
 
 
 @pytest.mark.asyncio
@@ -168,19 +187,27 @@ async def test_stream_events_reuses_connection_and_closes_after_disconnect(
     assert ws.accepted
     assert len(connect_threads) == 1
     assert conn.execute_calls == 2
+    # The bootstrap read runs on the SAME connection and the SAME thread as the
+    # polls — that is the property this test exists for, and it must not be
+    # bought back by opening a second connection for it.
+    assert conn.bootstrap_calls == 1
     assert conn.close_calls == 1
     assert len(set(connect_threads + conn.thread_ids)) == 1
-    assert ws.sent == [{
-        "events": [{
-            "id": 7,
-            "task_id": "task-1",
-            "run_id": None,
-            "kind": "updated",
-            "payload": {"status": "running"},
-            "created_at": 1234,
-        }],
-        "cursor": 7,
-    }]
+    assert ws.sent == [
+        {"type": "bootstrap", "cursor": 0, "board": None},
+        {
+            "events": [{
+                "id": 7,
+                "task_id": "task-1",
+                "run_id": None,
+                "kind": "updated",
+                "payload": {"status": "running"},
+                "created_at": 1234,
+            }],
+            "cursor": 7,
+            "board": None,
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -222,5 +249,6 @@ async def test_stream_events_closes_connection_when_cancelled(monkeypatch):
 
     assert len(connect_threads) == 1
     assert conn.execute_calls == 1
+    assert conn.bootstrap_calls == 1
     assert conn.close_calls == 1
     assert len(set(connect_threads + conn.thread_ids)) == 1

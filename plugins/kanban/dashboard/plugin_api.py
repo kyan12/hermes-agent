@@ -278,7 +278,14 @@ def get_board(
     current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key")):
     """Full board grouped by status column; omitting ``board`` uses the active board
     (``HERMES_KANBAN_BOARD`` env → on-disk ``current`` pointer → ``default``)."""
-    with _board_conn(board) as (board, conn):
+    with _board_conn(board) as (board, conn), kbc.read_txn(conn):
+        # ONE read snapshot for the whole response. The tasks, the rollups and
+        # ``latest_event_id`` are separate statements, and the client treats the
+        # last of them as "where the stream continues from the board you just
+        # gave me". Read without a snapshot, a write landing between them was
+        # missing from the board AND already behind the cursor -- so the socket,
+        # which only sends ids greater than the cursor, would never mention it
+        # and the card stayed stale until someone reloaded the page.
         tasks = kanban_db.list_tasks(
             conn, tenant=tenant, include_archived=include_archived,
             workflow_template_id=workflow_template_id, current_step_key=current_step_key)
@@ -1614,11 +1621,24 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
 _EVENT_POLL_SECONDS = 0.3
 
 
-def _int_param(ws: WebSocket, name: str) -> int:
+def _since_param(ws: WebSocket) -> Optional[int]:
+    """``?since=`` as an int, or ``None`` when the client has no position.
+
+    ``None`` is not zero. Zero means "replay this board from the beginning",
+    which is what an absent parameter used to parse as -- so a client that had
+    lost its cursor was answered with the board's entire history. On a
+    long-lived board that is a flood, and avoiding it is why the UI refused to
+    open a socket at all until a board response had rendered. ``None`` instead
+    means "start from wherever the board is now", which the bootstrap frame
+    reports, so a client can hold a real position without rendering anything.
+    """
+    raw = ws.query_params.get("since")
+    if raw is None or raw == "":
+        return None
     try:
-        return int(ws.query_params.get(name, "0"))
+        return int(raw)
     except ValueError:
-        return 0
+        return None
 
 
 def _ws_board(raw: Optional[str]) -> Optional[str]:
@@ -1638,9 +1658,18 @@ class _EventTail:
         self._conn: Optional[sqlite3.Connection] = None
         self._executor: Optional[ThreadPoolExecutor] = None
 
-    def _fetch(self, cursor: int) -> tuple[int, list[dict]]:
+    def _connection(self) -> sqlite3.Connection:
         if self._conn is None:
             self._conn = kbc.connect(board=self._board)
+        return self._conn
+
+    def _latest(self) -> int:
+        row = self._connection().execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()
+        return int(row["m"])
+
+    def _fetch(self, cursor: int) -> tuple[int, list[dict]]:
+        self._connection()
         rows = self._conn.execute(
             "SELECT id, task_id, run_id, kind, payload, created_at "
             "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
@@ -1659,10 +1688,19 @@ class _EventTail:
             self._conn.close()
             self._conn = None
 
-    async def poll(self, cursor: int) -> tuple[int, list[dict]]:
+    def _ensure_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kanban-events")
-        return await asyncio.get_running_loop().run_in_executor(self._executor, self._fetch, cursor)
+        return self._executor
+
+    async def latest(self) -> int:
+        """The board's current event id, read on the tail's own thread."""
+        return await asyncio.get_running_loop().run_in_executor(
+            self._ensure_executor(), self._latest)
+
+    async def poll(self, cursor: int) -> tuple[int, list[dict]]:
+        return await asyncio.get_running_loop().run_in_executor(
+            self._ensure_executor(), self._fetch, cursor)
 
     async def shutdown(self) -> None:
         if self._executor is None:
@@ -1683,9 +1721,36 @@ async def stream_events(ws: WebSocket):
     await ws.accept()
     # Board is pinned at the handshake; the UI opens a new WS on board change
     # rather than reconciling two cursors mid-stream.
-    tail = _EventTail(_ws_board(ws.query_params.get("board")))
-    cursor = _int_param(ws, "since")
+    board = _ws_board(ws.query_params.get("board"))
+    tail = _EventTail(board)
+    cursor = _since_param(ws)
     try:
+        # One bootstrap frame before anything else, always. It carries the two
+        # things a client cannot otherwise know: where this board's stream is
+        # right now, and which board this socket is actually pinned to.
+        #
+        # The cursor makes an event-backed recovery possible. Previously the
+        # only source of one was a rendered board, so a board that 500s could
+        # not recover: no render, no cursor, no socket. Now the socket supplies
+        # the position and the client reconciles by reloading the board.
+        #
+        # The board slug makes a *stale* socket recognisable. A board switch
+        # leaves the previous socket's in-flight frames and its pending
+        # reconnect alive for a moment; a frame from the wrong board applied to
+        # the current one is a phantom update, and without the slug there is
+        # nothing in the frame that says so.
+        try:
+            latest = await tail.latest()
+        except Exception as exc:
+            # A board that cannot even be counted is not a board this socket can
+            # tail. Close rather than sit upgraded and silent, which is exactly
+            # the failure this frame exists to make visible.
+            log.warning("Kanban event stream bootstrap failed: %s", exc)
+            await ws.close()
+            return
+        if cursor is None:
+            cursor = latest
+        await ws.send_json({"type": "bootstrap", "cursor": cursor, "board": board})
         while True:
             # Race receive() against the poll interval so a disconnect is detected even when no
             # events flow (else idle boards leak poll tasks). Other client messages are ignored.
@@ -1697,7 +1762,7 @@ async def stream_events(ws: WebSocket):
                 pass  # no client message — poll the DB
             cursor, events = await tail.poll(cursor)
             if events:
-                await ws.send_json({"events": events, "cursor": cursor})
+                await ws.send_json({"events": events, "cursor": cursor, "board": board})
     except WebSocketDisconnect:
         return
     except asyncio.CancelledError:
