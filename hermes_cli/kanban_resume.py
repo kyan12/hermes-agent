@@ -240,7 +240,8 @@ def _pid_is_running(pid: Optional[int]) -> Optional[bool]:
     return True
 
 
-def _task_writer_state(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[str]:
+def _task_writer_state(conn: sqlite3.Connection, task_id: str, now: int, *,
+                       intended_claim: Optional[tuple[int, str]] = None) -> Optional[str]:
     """Why this task may still have a writer, or ``None`` when it provably does not.
 
     Unknown is not clear: a pid we cannot classify refuses, because terminal
@@ -252,19 +253,22 @@ def _task_writer_state(conn: sqlite3.Connection, task_id: str, now: int) -> Opti
     ).fetchone()
     if task is None:
         return "task does not exist on this board"
-    if task["status"] == "running":
-        return "the task is running"
-    if task["claim_lock"] is not None:
-        # ANY lock, expired or not. The claim CAS requires `claim_lock IS NULL`,
-        # so a stale lock is a claim that cannot succeed — and spending the
-        # receipt on it would destroy single-use authority for nothing. The
-        # reclaim passes own clearing it; this refuses until they have.
-        return f"the task is claimed by {task['claim_lock']}"
-    if task["current_run_id"] is not None:
-        return f"run {task['current_run_id']} is still open on the task"
+    own_claim = (intended_claim is not None and task["status"] == "running"
+                 and (task["current_run_id"], task["claim_lock"]) == intended_claim)
+    if not own_claim:
+        if task["status"] == "running":
+            return "the task is running"
+        if task["claim_lock"] is not None:
+            # ANY lock, expired or not. The claim CAS requires `claim_lock IS NULL`,
+            # so a stale lock is a claim that cannot succeed — and spending the
+            # receipt on it would destroy single-use authority for nothing. The
+            # reclaim passes own clearing it; this refuses until they have.
+            return f"the task is claimed by {task['claim_lock']}"
+        if task["current_run_id"] is not None:
+            return f"run {task['current_run_id']} is still open on the task"
     open_run = conn.execute(
-        "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
+        "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NULL AND id != ? "
+        "ORDER BY id DESC LIMIT 1", (task_id, intended_claim[0] if own_claim else -1),
     ).fetchone()
     if open_run is not None:
         return f"run {open_run['id']} has not ended"
@@ -364,6 +368,8 @@ def post_claim_matches(conn, task_id: str, bound, *, run_id: int, claim_lock: st
                 or claim["profile"] != bound["assignee"]
                 or claim["claim_expires"] != claim["task_expires"]
                 or claim["claim_expires"] <= int(time.time())):
+            return False
+        if _task_writer_state(conn, task_id, int(time.time()), intended_claim=(run_id, claim_lock)):
             return False
         placeholders = ','.join('?' for _ in OCCURRENCE_EVENT_KINDS)
         events = conn.execute(

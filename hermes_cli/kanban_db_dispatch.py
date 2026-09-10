@@ -1021,8 +1021,12 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
-        if expected_claim is not None and (row["current_run_id"], row["claim_lock"]) != expected_claim:
-            return False
+        if expected_claim is not None:
+            if (row["current_run_id"], row["claim_lock"]) != expected_claim:
+                return False
+            # Refusal must not erase the writer evidence that prevented spawn.
+            if _kb_resume._task_writer_state(conn, task_id, int(time.time()), intended_claim=expected_claim):
+                return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim

@@ -2169,9 +2169,12 @@ def claim_task(
             from hermes_cli.kanban_db_dispatch import check_respawn_guard
 
             guard_reason = check_respawn_guard(conn, task_id)
-            if (resume_receipt_id is None and pr_clearance is None
-                    and guard_reason in ("active_pr", "history_unresolved")):
-                return None
+            if resume_receipt_id is None and pr_clearance is None:
+                from hermes_cli import kanban_pr_association as association
+
+                # Earlier auth/cooldown reasons must not hide PR authority needs.
+                if association.classify(conn, task_id, window_seconds=0) != association.UNASSOCIATED:
+                    return None
             if resume_receipt_id is not None and guard_reason not in (
                     None, "active_pr", "history_unresolved"):
                 return None

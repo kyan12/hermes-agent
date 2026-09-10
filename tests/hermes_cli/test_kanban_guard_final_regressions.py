@@ -195,3 +195,75 @@ def test_fresh_structured_exact_pr_cannot_invent_resume_predecessor(board, check
     assert kb.claim_task(board, task) is None
     assert board.execute('SELECT id FROM task_runs WHERE task_id=?', (task,)).fetchone() is None
     assert board.execute('SELECT id FROM task_resume_receipts WHERE task_id=?', (task,)).fetchone() is None
+
+
+@pytest.mark.parametrize('history', ['active_pr', 'history_unresolved', 'fresh'])
+@pytest.mark.parametrize('earlier_guard', ['blocker_auth', 'rate_limit_cooldown', 'expired_cooldown', 'none'])
+def test_direct_claim_pr_authority_is_independent_of_guard_precedence(board, checkout, monkeypatch, history, earlier_guard):
+    if history == 'fresh':
+        task = kb.create_task(board, title='ordinary eligibility', assignee='a')
+        board.execute("UPDATE tasks SET status='ready' WHERE id=?", (task,))
+    else:
+        task = prepared(board, checkout, monkeypatch) if history == 'active_pr' else f._crashed_on_no_pr_of_its_own(board, f'I opened {f.PR}')
+    monkeypatch.setattr(kb, '_resolve_rate_limit_cooldown_seconds', lambda: 300)
+    if earlier_guard == 'blocker_auth':
+        board.execute("UPDATE tasks SET last_failure_error='403 forbidden quota exhausted' WHERE id=?", (task,))
+    elif earlier_guard in ('rate_limit_cooldown', 'expired_cooldown'):
+        now = int(time.time())
+        ended = now if earlier_guard == 'rate_limit_cooldown' else now - 600
+        board.execute("INSERT INTO task_runs(task_id,status,started_at,ended_at,outcome) "
+                      "VALUES (?, 'failed', ?, ?, 'rate_limited')", (task, ended, ended))
+        board.execute("UPDATE tasks SET last_failure_error='403 forbidden quota exhausted' WHERE id=?", (task,))
+    before = board.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (task,)).fetchone()[0]
+    monkeypatch.setattr(kpr, '_gh_api', lambda *a, **kw: pytest.fail('network inside claim transaction'))
+    allowed = history == 'fresh'
+    assert (kb.claim_task(board, task) is not None) == allowed
+    assert board.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (task,)).fetchone()[0] == before + allowed
+
+
+@pytest.mark.parametrize('unrelated', [False, True])
+@pytest.mark.parametrize('writer', ['task', 'current', 'predecessor', 'older', 'other'])
+@pytest.mark.parametrize('pid_state', ['live', 'unknown', 'absent'])
+def test_pre_spawn_checks_every_writer_pid(board, checkout, monkeypatch, unrelated, writer, pid_state):
+    task = prepared(board, checkout, monkeypatch, unrelated)
+    predecessor = board.execute('SELECT id FROM task_runs WHERE task_id=?', (task,)).fetchone()[0]
+    # An older terminal run is also disqualifying if its writer reappears.
+    older = board.execute("INSERT INTO task_runs(task_id,status,started_at,ended_at,outcome) "
+                          "VALUES (?, 'crashed', ?, ?, 'crashed')",
+                          (task, int(time.time())-1000, int(time.time())-900)).lastrowid
+    other = kb.create_task(board, title='other checkout owner', assignee='a')
+    board.execute("UPDATE tasks SET status='done', workspace_path=(SELECT workspace_path FROM tasks WHERE id=?) WHERE id=?", (task, other))
+    original = kb.claim_task
+    def claim(*args, **kwargs):
+        claimed = original(*args, **kwargs)
+        assert claimed is not None
+        pid = {'live': os.getpid(), 'unknown': -1, 'absent': None}[pid_state]
+        if writer in ('task', 'other'):
+            board.execute('UPDATE tasks SET worker_pid=? WHERE id=?', (pid, task if writer == 'task' else other))
+        else:
+            run = {'current': claimed.current_run_id, 'predecessor': predecessor, 'older': older}[writer]
+            board.execute('UPDATE task_runs SET worker_pid=? WHERE id=?', (pid, run))
+        return claimed
+    monkeypatch.setattr(kb, 'claim_task', claim)
+    _, spawned = f._dispatch(board)
+    assert bool(spawned) == (pid_state == 'absent')
+    if pid_state != 'absent' and writer == 'task':
+        assert kb.get_task(board, task).worker_pid == {'live': os.getpid(), 'unknown': -1}[pid_state]
+
+
+@pytest.mark.parametrize('unrelated', [False, True])
+def test_pre_spawn_refuses_reopened_old_run_without_pid(board, checkout, monkeypatch, unrelated):
+    task = prepared(board, checkout, monkeypatch, unrelated)
+    older = board.execute("INSERT INTO task_runs(task_id,status,started_at,ended_at,outcome) "
+                          "VALUES (?, 'crashed', ?, ?, 'crashed')",
+                          (task, int(time.time())-1000, int(time.time())-900)).lastrowid
+    older = board.execute('SELECT MIN(id) FROM task_runs WHERE task_id=?', (task,)).fetchone()[0]
+    original = kb.claim_task
+    def claim(*args, **kwargs):
+        claimed = original(*args, **kwargs)
+        assert claimed is not None
+        board.execute('UPDATE task_runs SET ended_at=NULL WHERE id=?', (older,))
+        return claimed
+    monkeypatch.setattr(kb, 'claim_task', claim)
+    _, spawned = f._dispatch(board)
+    assert not spawned
