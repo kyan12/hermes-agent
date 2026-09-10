@@ -647,9 +647,18 @@
     // either a full-history replay or a permanently silent socket.
     const cursorRef = useRef(null);
     const cursorBoardRef = useRef(null);
+    // The board that is selected NOW. `board` inside a callback is whatever was
+    // selected when that callback's render happened, so comparing it to another
+    // value from the same render answers nothing — both are stale together.
+    const selectedBoardRef = useRef(null);
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
+
+    // Written during render, not in an effect: `loadBoard` is called from the
+    // board-load effect, which runs before any effect that could update a ref
+    // afterwards, and from callbacks that can fire at any time.
+    selectedBoardRef.current = board;
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -682,10 +691,17 @@
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
-      const generation = ++boardRequestRef.current;
       const requestedBoard = board;
+      // A long-lived callback (a mutation's `.then(loadBoard)`, a toolbar
+      // handler) holds the `loadBoard` from the render it was created in. Left
+      // unchecked it would take a fresh generation number here and become the
+      // newest request — for a board the user left. Check the live selection
+      // BEFORE issuing, so a stale caller never starts a request at all.
+      if (requestedBoard !== selectedBoardRef.current) return Promise.resolve();
+      const generation = ++boardRequestRef.current;
       const current = function () {
-        return generation === boardRequestRef.current && requestedBoard === board;
+        return generation === boardRequestRef.current
+          && requestedBoard === selectedBoardRef.current;
       };
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
