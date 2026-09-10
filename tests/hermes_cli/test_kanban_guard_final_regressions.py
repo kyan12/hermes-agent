@@ -152,3 +152,46 @@ def test_transport_reaps_reader_when_descendant_holds_pipe(tmp_path, monkeypatch
     assert not leaked, f'live reader threads after transport returned: {leaked}'
     assert processes and all(process.stdout.closed for process in processes)
     assert done.exists(), 'the disposable descendant must exit cooperatively'
+
+
+def _fresh_worktree_with_parent_hint(board, checkout, *, contract=None):
+    task = kb.create_task(board, title='fresh follow-up to merged parent', assignee='a',
+                          completion_contract=contract)
+    branch = f'wt/{task}'
+    target, _ = f._worktree(checkout, branch)
+    board.execute("UPDATE tasks SET status='ready', workspace_kind='worktree', "
+                  "workspace_path=?, branch_name=? WHERE id=?", (str(target), branch, task))
+    kb.add_comment(board, task, 'owner', f'Inherited context: parent PR {f.OTHER_PR} already merged; unrelated to this work.')
+    assert board.execute('SELECT id FROM task_runs WHERE task_id=?', (task,)).fetchone() is None
+    assert kb.get_task(board, task).worker_pid is None
+    return task
+
+
+def test_fresh_worktree_parent_prose_allows_real_first_claim(board, checkout, monkeypatch):
+    task = _fresh_worktree_with_parent_hint(board, checkout)
+    monkeypatch.setattr(kpr, '_gh_api', lambda *a, **kw: pytest.fail('fresh prose must not trigger network reconciliation'))
+    for _ in range(3):
+        assert kbd.check_respawn_guard(board, task) is None
+        decision = kbd.evaluate_respawn_guard(board, task)
+        assert decision.reason is None
+        assert decision.resume_receipt_id is None and decision.pr_clearance is None
+    claimed = kb.claim_task(board, task)
+    assert claimed is not None
+    runs = board.execute('SELECT id, ended_at FROM task_runs WHERE task_id=?', (task,)).fetchall()
+    assert len(runs) == 1 and runs[0]['id'] == claimed.current_run_id
+    assert runs[0]['ended_at'] is None
+    assert board.execute('SELECT id FROM task_resume_receipts WHERE task_id=?', (task,)).fetchone() is None
+
+
+def test_fresh_structured_exact_pr_cannot_invent_resume_predecessor(board, checkout, monkeypatch):
+    from hermes_cli import kanban_resume as resume
+    task = _fresh_worktree_with_parent_hint(board, checkout, contract=f.PR)
+    monkeypatch.setattr(kpr, '_gh_api', lambda *a, **kw: pytest.fail('no past-run authority to reconcile'))
+    assert f.kba.classify(board, task, window_seconds=86400) == f.kba.ASSOCIATED
+    assert kbd.check_respawn_guard(board, task) == 'active_pr'
+    with pytest.raises(resume.ResumeAuthorityError):
+        kpr.capture(board, task, window_seconds=86400)
+    assert kbd._reconcile_active_pr(board, task, lane='ready').reason == 'active_pr'
+    assert kb.claim_task(board, task) is None
+    assert board.execute('SELECT id FROM task_runs WHERE task_id=?', (task,)).fetchone() is None
+    assert board.execute('SELECT id FROM task_resume_receipts WHERE task_id=?', (task,)).fetchone() is None
