@@ -78,6 +78,27 @@ def concurrent_same_cohort(report: dict) -> list:
     return overlaps
 
 
+def overlap_without_intervening_cohort_change(report: dict) -> list:
+    """Same-cohort overlaps that no board/filter change can excuse.
+
+    Switching away and back legitimately leaves two requests for one cohort in
+    flight: the second is issued because the first belongs to a board the user
+    had left, and an in-flight fetch cannot be recalled. What is NOT excusable
+    is starting a request while a request of the same cohort -- issued since the
+    last cohort change -- is still running. That can only happen if the slot was
+    handed back by a request that did not own it.
+    """
+    requests = report["boardRequests"]
+    offenders = []
+    for i, later in enumerate(requests):
+        for earlier in reversed(requests[:i]):
+            if cohort(earlier) != cohort(later):
+                break          # a cohort change stands between them
+            if later["t"] < earlier.get("respondedAt", float("inf")):
+                offenders.append((earlier["serial"], later["serial"], cohort(later)))
+    return offenders
+
+
 def assert_never_applied_out_of_order(report: dict) -> None:
     """A response may only reach the screen if it is newer than what is there.
 
@@ -238,3 +259,58 @@ def test_a_filter_change_supersedes_the_request_in_flight(tmp_path):
     assert archived_requests, report["boardRequests"]
     assert not concurrent_same_cohort(report)
     assert_never_applied_out_of_order(report)
+
+
+# ---------------------------------------------------------------------------
+# Which request owns the in-flight slot, and when the page stops asking at all
+# ---------------------------------------------------------------------------
+
+
+def test_an_older_answer_does_not_release_the_newer_requests_slot(tmp_path):
+    """A → B → A leaves two requests for A in flight. Only one owns the slot.
+
+    Switching away and back is the one way two requests for the SAME cohort are
+    legitimately outstanding: the second is issued because the first belongs to
+    a board the user had left, and an in-flight fetch cannot be recalled. When
+    the older one finishes it must not hand the slot back, because the slot
+    belongs to the request still running -- otherwise the next event starts a
+    third request alongside it, and the pair is exactly the same-cohort overlap
+    the coalescing exists to prevent.
+    """
+    report = run_scenario(
+        tmp_path, runMs=11000,
+        actions=[{"atMs": 700, "kind": "emitEvent"},
+                 # A1 is issued at 950 by that event's refresh and held to 3550.
+                 {"atMs": 800, "kind": "holdNextBoardResponse",
+                  "board": "default", "latencyMs": 2600},
+                 {"atMs": 1100, "kind": "switchBoard", "board": "beta"},
+                 # Back on A at 1600: A2 is issued while A1 still runs, held to 5600.
+                 {"atMs": 1560, "kind": "holdNextBoardResponse",
+                  "board": "default", "latencyMs": 4000},
+                 {"atMs": 1600, "kind": "switchBoard", "board": "default"},
+                 # A1 lands at 3550. If it released A2's slot, this event starts
+                 # A3 at 3850 alongside A2 -- and A2's answer is then thrown away.
+                 {"atMs": 3600, "kind": "emitEvent"}])
+
+    assert not overlap_without_intervening_cohort_change(report), report["boardRequests"]
+    assert_never_applied_out_of_order(report)
+    assert report["finalState"] == "board", report["renderStates"]
+
+
+def test_an_unmounted_page_starts_no_further_board_requests(tmp_path):
+    """Leaving the tab must end the work, including a refresh already promised.
+
+    A refresh asked for while a request was in flight is remembered and issued
+    when that request lands. If the page is gone by then, issuing it is a
+    megabyte read for a component that will never render it -- and a setState
+    on an unmounted tree.
+    """
+    # One slow request in flight, with a refresh already promised to it by the
+    # socket's bootstrap frame, when the tab goes away.
+    report = run_scenario(
+        tmp_path, runMs=5000, boardLatencyMs=1000,
+        actions=[{"atMs": 500, "kind": "unmount"}])
+
+    assert report["unmountedAtMs"] == 500
+    after = [r for r in report["boardRequests"] if r["t"] > 500]
+    assert not after, f"{len(after)} board requests started after unmount: {after}"

@@ -674,6 +674,18 @@
     selectedBoardRef.current = board;
     boardCohortRef.current = boardCohort(board, tenantFilter, includeArchived);
 
+    // Whether this page is still on screen. A request outlives the tab that
+    // asked for it, and its completion would otherwise start the refresh it
+    // promised — a megabyte read for a component that will never render it.
+    // Declared FIRST so it is armed before any effect below can issue one, and
+    // re-armed on mount rather than only at creation, so a remount (React
+    // StrictMode does exactly this) does not leave the page marked as gone.
+    const mountedRef = useRef(true);
+    useEffect(function () {
+      mountedRef.current = true;
+      return function () { mountedRef.current = false; };
+    }, []);
+
     // --- load config once ---------------------------------------------------
     useEffect(function () {
       SDK.fetchJSON(withBoard(`${API}/config`, board))
@@ -711,7 +723,13 @@
     // cohort in flight, and a refresh asked for while it runs is remembered and
     // issued once afterwards rather than racing it.
     const boardRequestRef = useRef(0);
-    const inFlightCohortRef = useRef(null);
+    // The request that OWNS the slot: `{cohort, generation}`, not a cohort on
+    // its own. Switching away and back leaves two requests for one cohort in
+    // flight — the second was issued because the first belonged to a board the
+    // user had left, and an in-flight fetch cannot be recalled. Keyed on the
+    // cohort alone, the older one's completion handed back a slot it no longer
+    // held, and the next event started a third request beside the second.
+    const inFlightRef = useRef(null);
     const pendingRefreshRef = useRef(false);
     const loadBoardRef = useRef(null);
     const loadBoard = useCallback(() => {
@@ -727,23 +745,25 @@
       // newest request — for a board the user left. Check the live selection
       // BEFORE issuing, so a stale caller never starts a request at all.
       if (cohort !== boardCohortRef.current) return Promise.resolve();
+      if (!mountedRef.current) return Promise.resolve();
       // The answer we are already waiting for is the answer this caller wants.
       // Starting a second request would only invalidate the first; remember the
       // refresh instead and run it once, when that one lands. Any number of
       // events arriving during a request therefore cost exactly one more.
-      if (inFlightCohortRef.current === cohort) {
+      if (inFlightRef.current && inFlightRef.current.cohort === cohort) {
         pendingRefreshRef.current = true;
         return Promise.resolve();
       }
       // A DIFFERENT cohort was in flight: this request supersedes it, and any
       // refresh remembered for it describes a board or filter we have left.
       pendingRefreshRef.current = false;
-      inFlightCohortRef.current = cohort;
       const generation = ++boardRequestRef.current;
+      inFlightRef.current = { cohort: cohort, generation: generation };
       const current = function () {
         return generation === boardRequestRef.current
           && requestedBoard === selectedBoardRef.current
-          && cohort === boardCohortRef.current;
+          && cohort === boardCohortRef.current
+          && mountedRef.current;
       };
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
@@ -767,9 +787,13 @@
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () {
-          // This request is done either way — release the slot before anything
-          // can return early, or the cohort would never be requestable again.
-          if (inFlightCohortRef.current === cohort) inFlightCohortRef.current = null;
+          // Release the slot only if THIS request still holds it. A request
+          // that has been superseded is finishing work nobody is waiting for:
+          // the slot belongs to whoever took it since, and handing it back
+          // would let the next event run beside them.
+          if (inFlightRef.current && inFlightRef.current.generation === generation) {
+            inFlightRef.current = null;
+          }
           if (!current()) return;
           setLoading(false);
           // Events that arrived while this was in flight collapse into one

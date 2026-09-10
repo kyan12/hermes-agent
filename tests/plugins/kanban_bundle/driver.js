@@ -187,8 +187,11 @@ function treeText(tree) {
   });
 }
 
+let unmounted = false;
+
 function flushRender() {
   let guard = 0;
+  if (unmounted) { renderScheduled = false; return; }
   while (renderScheduled && guard++ < 50) {
     renderScheduled = false;
     rendering = true;
@@ -234,7 +237,7 @@ let selectedBoardStorage = null;
 let inFlightBoard = 0;
 const sockets = [];
 let boardVersion = 0;      // bumped by every synthetic event; the marker on /board
-let responseHold = null;   // {board, releaseAtMs} -- a deliberately delayed reply
+const responseHolds = [];  // [{board, latencyMs}] consumed in request order
 
 let boardRequestSerial = 0;
 
@@ -270,10 +273,13 @@ function fetchJSON(url, opts) {
     inFlightBoard++;
     report.maxInFlightBoardRequests = Math.max(report.maxInFlightBoardRequests, inFlightBoard);
     let latency = cfg.boardLatencyMs;
-    if (responseHold && responseHold.board === asked) {
-      latency = responseHold.latencyMs;
-      responseHold = null;
-      req.held = true;
+    for (let i = 0; i < responseHolds.length; i++) {
+      if (responseHolds[i].board === asked) {
+        latency = responseHolds[i].latencyMs;
+        responseHolds.splice(i, 1);
+        req.held = true;
+        break;
+      }
     }
     const payload = boardPayload(asked || "(none)", serial);
     req.marker = payload.__marker;
@@ -456,8 +462,23 @@ function applyAction(action) {
     return;
   }
   if (action.kind === "holdNextBoardResponse") {
-    responseHold = { board: action.board === undefined ? null : action.board,
-                     latencyMs: action.latencyMs };
+    responseHolds.push({ board: action.board === undefined ? null : action.board,
+                         latencyMs: action.latencyMs });
+    return;
+  }
+  if (action.kind === "emitEvent") { emitEvent(); return; }
+  if (action.kind === "unmount") {
+    // What React does when the tab is left: every effect cleanup runs, and the
+    // component never renders again. Anything the page starts after this point
+    // is work nobody asked for.
+    unmounted = true;
+    report.unmountedAtMs = now;
+    for (const cell of cells) {
+      if (cell && typeof cell.cleanup === "function") {
+        try { cell.cleanup(); } catch (err) { report.errors.push("cleanup: " + String(err)); }
+        cell.cleanup = null;
+      }
+    }
     return;
   }
   if (action.kind === "includeArchived") {
