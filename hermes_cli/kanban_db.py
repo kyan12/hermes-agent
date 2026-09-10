@@ -848,6 +848,8 @@ class Event:
 
 # --- Schema ---
 
+from hermes_cli import kanban_resume as _kanban_resume  # noqa: E402
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
     id                   TEXT PRIMARY KEY,
@@ -1044,7 +1046,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
-"""
+""" + _kanban_resume.SCHEMA_SQL
 
 
 # --- ID generation ---
@@ -2124,12 +2126,20 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, resume_receipt_id: Optional[int] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
+
+    ``resume_receipt_id`` is the one-shot operator authority that let this task
+    past the ``active_pr`` respawn guard (``hermes_cli.kanban_resume``). It is
+    re-validated and spent HERE, inside this transaction, because the guard that
+    selected it ran outside one: between the two, a comment can land, another
+    dispatcher can spend the same receipt, or the operator can revoke it. A
+    receipt that no longer validates is a refusal to claim — never a claim
+    without authority.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -2145,6 +2155,23 @@ def claim_task(
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
+        # BEFORE the reclaim, deliberately. ``_reclaim_dangling_run`` marks an
+        # unfinished run terminal and clears its pid without proving its writer
+        # stopped — which is part of what the receipt's validation reads. Doing
+        # it first would erase the disqualifying evidence and then find none.
+        if resume_receipt_id is not None:
+            from hermes_cli import kanban_db_dispatch as _kbd
+            from hermes_cli import kanban_resume as _resume
+
+            if not _resume.consume(
+                conn, int(resume_receipt_id), task_id,
+                window_seconds=_kbd._RESPAWN_GUARD_PR_WINDOW, now=now,
+            ):
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "resume_authority_invalid", "receipt_id": int(resume_receipt_id)},
+                )
+                return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
@@ -2152,6 +2179,14 @@ def claim_task(
         run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
         if run_id is None:
             return None
+        if resume_receipt_id is not None:
+            from hermes_cli import kanban_resume as _resume
+
+            _resume.attach_run(conn, int(resume_receipt_id), run_id)
+            _append_event(
+                conn, task_id, "resumed_on_authority",
+                {"receipt_id": int(resume_receipt_id), "run_id": run_id}, run_id=run_id,
+            )
         claimed = get_task(conn, task_id)
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed

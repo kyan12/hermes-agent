@@ -309,6 +309,15 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("authorize-resume", [
+        _TASK_ID,
+        _arg("--run", type=int, required=True,
+             help="The finished run being resumed. Must belong to this task on this board."),
+        _arg("--pr", required=True,
+             help="The pull request the resumed run continues. Must be the ONE pull "
+                  "request this task's recent comments reference."),
+    ], help="Authorise ONE respawn of a task parked on an open pull request "
+            "(bypasses the active-PR guard only, once)"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

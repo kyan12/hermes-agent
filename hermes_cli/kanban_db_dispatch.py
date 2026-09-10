@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
 from typing import Any
+from typing import NamedTuple
 from typing import Callable
 from typing import Mapping
 from typing import Optional
@@ -1122,7 +1123,23 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
-def check_respawn_guard(
+class GuardDecision(NamedTuple):
+    """Why a task must not respawn, plus the authority that let it.
+
+    ``reason`` is the guard bucket (``None`` = spawn). ``resume_receipt_id`` is
+    set only when the ``active_pr`` guard WOULD have fired and an explicit
+    operator receipt authorised this one respawn; the caller must hand it to
+    ``claim_task``, which re-validates and spends it inside the claim's
+    transaction. Carrying it is what closes the window between deciding and
+    claiming — a bare ``None`` here would let a receipt that has since been
+    spent, revoked or invalidated still produce a spawn.
+    """
+
+    reason: Optional[str]
+    resume_receipt_id: Optional[int] = None
+
+
+def _respawn_guard_reason(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
@@ -1213,6 +1230,50 @@ def check_respawn_guard(
             return "active_pr"
 
     return None
+
+
+def check_respawn_guard(
+    conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+) -> Optional[str]:
+    """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
+
+    Reports the guard's own verdict, with no regard for operator authority: a
+    task parked on an open pull request answers ``"active_pr"`` even when a
+    resume receipt exists for it. Whether that verdict is *overridden* is
+    :func:`evaluate_respawn_guard`'s question, and only the spawn path asks it —
+    so this stays the plain "is this task held, and why" predicate that
+    diagnostics and tests read.
+    """
+    return _respawn_guard_reason(conn, task_id, lane=lane)
+
+
+def evaluate_respawn_guard(
+    conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+) -> GuardDecision:
+    """The guard's verdict, plus the operator authority (if any) that lifts it.
+
+    Only ``active_pr`` is liftable, and only by an explicit single-use receipt
+    (``hermes_cli.kanban_resume``). Every other reason is returned untouched: a
+    receipt is not a force flag, and it cannot make a rate-limited, quota-blocked
+    or dependency-gated task eligible.
+
+    The receipt id travels back to the caller so ``claim_task`` can spend it in
+    the same transaction that opens the run. Returning a bare ``None`` here
+    would let the authority evaporate in the gap between deciding and claiming,
+    and a spawn in that gap is a duplicate pull request authorised by nothing.
+    """
+    reason = check_respawn_guard(conn, task_id, lane=lane)
+    if reason != "active_pr":
+        return GuardDecision(reason, None)
+    # Evaluated over ALL the evidence, not the first hit that fired the guard: a
+    # receipt for PR #7 must not wave through a second comment linking PR #9.
+    # ``exempt_reason`` refuses whenever the card names more than one pull
+    # request, or when the evidence has moved since the receipt was issued.
+    receipt_id = _kb_resume.exempt_reason(
+        conn, task_id, window_seconds=_RESPAWN_GUARD_PR_WINDOW)
+    if receipt_id is None:
+        return GuardDecision("active_pr", None)
+    return GuardDecision(None, receipt_id)
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
@@ -1522,7 +1583,8 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    decision = evaluate_respawn_guard(conn, task_id, lane=lane)
+    guard_reason = decision.reason
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -1547,8 +1609,16 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    if lane == "review":
+        claimed = _kb.claim_review_task(conn, task_id, ttl_seconds=ttl_seconds)
+    else:
+        # The receipt travels from the guard decision straight into the claim, so
+        # it is spent in the same transaction that opens the run. Nothing else in
+        # this function may consume it, and a receipt that no longer validates
+        # returns None here rather than spawning.
+        claimed = _kb.claim_task(
+            conn, task_id, ttl_seconds=ttl_seconds,
+            resume_receipt_id=decision.resume_receipt_id)
     if claimed is None:
         return False
     try:
@@ -2347,3 +2417,4 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
+from hermes_cli import kanban_resume as _kb_resume  # noqa: E402

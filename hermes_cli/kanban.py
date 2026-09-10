@@ -215,7 +215,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "authorize-resume",
     "gc",
 })
 
@@ -952,6 +952,41 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_authorize_resume(args: argparse.Namespace) -> int:
+    """Grant ONE respawn of a task parked on an open pull request.
+
+    Orchestrator-only, like every other lifecycle command here: a worker holding
+    ``HERMES_KANBAN_TASK`` cannot authorise its own resumption, and the granting
+    identity is the active profile (``_profile_author``) rather than anything
+    passed in. A receipt records who asked, but nothing reads that back as
+    authority — the authority is the row, and it is spent by the claim that uses
+    it.
+
+    This bypasses the ``active_pr`` respawn guard and nothing else. Quota and
+    auth blockers, the rate-limit cooldown, the recent-success window,
+    dependency gating, review routing and every concurrency guard still apply,
+    so a card that is held for any other reason stays held. It is not ``--force``.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban authorize-resume is orchestrator-only; a worker cannot "
+                    "authorise its own respawn")
+    from hermes_cli import kanban_resume as kr
+
+    with kbc.connect_closing() as conn:
+        try:
+            with kbc.write_txn(conn):
+                receipt = kr.issue(
+                    conn, args.task_id, run_id=args.run, pr_url=args.pr,
+                    issued_by=_profile_author(),
+                    window_seconds=kbd._RESPAWN_GUARD_PR_WINDOW,
+                )
+        except kr.ResumeAuthorityError as exc:
+            return _err(str(exc))
+    print(f"Authorised one resume of {args.task_id} on {kr.normalize_pr_url(args.pr)} "
+          f"(receipt {receipt}; expires in {kr.RECEIPT_TTL_SECONDS // 60}m, single use)")
+    return 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1239,6 +1274,7 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "authorize-resume": _cmd_authorize_resume,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
