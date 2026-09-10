@@ -152,6 +152,33 @@ def latest_occurrence_event_id(conn: sqlite3.Connection, task_id: str) -> int:
     return int(row["m"])
 
 
+def occurrence_events_since(conn: sqlite3.Connection, task_id: str, after_id: int) -> list[str]:
+    placeholders = ", ".join("?" for _ in OCCURRENCE_EVENT_KINDS)
+    return [r["kind"] for r in conn.execute(
+        f"SELECT kind FROM task_events WHERE task_id = ? AND id > ? "
+        f"AND kind IN ({placeholders}) ORDER BY id ASC",
+        (task_id, int(after_id), *OCCURRENCE_EVENT_KINDS),
+    ).fetchall()]
+
+
+# The ONLY occurrence change a receipt survives: a card authorised while it was
+# waiting on a parent gets promoted the ordinary way, once, and is then claimed.
+# Anything else -- a block/unblock cycle, a review handoff, a second promotion --
+# is a different occurrence and must not reuse the authority.
+PERMITTED_TRANSITIONS = {
+    ("todo", "ready"): ("promoted",),
+    ("todo", "ready", "manual"): ("promoted_manual",),
+}
+
+
+def _transition_permitted(bound_lifecycle: str, lifecycle: str, kinds: list[str]) -> bool:
+    if bound_lifecycle == lifecycle:
+        return not kinds
+    if (bound_lifecycle, lifecycle) != ("todo", "ready"):
+        return False
+    return kinds in (["promoted"], ["promoted_manual"])
+
+
 def _pid_is_running(pid: Optional[int]) -> Optional[bool]:
     """True / False / None when it cannot be determined."""
     if pid is None:
@@ -188,9 +215,11 @@ def writer_state(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[s
     if task["status"] == "running":
         return "the task is running"
     if task["claim_lock"] is not None:
-        expires = task["claim_expires"]
-        if expires is None or int(expires) > now:
-            return f"the task is claimed by {task['claim_lock']}"
+        # ANY lock, expired or not. The claim CAS requires `claim_lock IS NULL`,
+        # so a stale lock is a claim that cannot succeed — and spending the
+        # receipt on it would destroy single-use authority for nothing. The
+        # reclaim passes own clearing it; this refuses until they have.
+        return f"the task is claimed by {task['claim_lock']}"
     if task["current_run_id"] is not None:
         return f"run {task['current_run_id']} is still open on the task"
     open_run = conn.execute(
@@ -263,6 +292,26 @@ _BOUND_FIELDS = ("board_identity", "task_id", "run_id", "occurrence_event_id",
                  "workspace_kind", "workspace_path")
 
 
+def _require_transition_permitted(
+    conn: sqlite3.Connection, task_id: str, current: dict[str, Any], expected: dict[str, Any],
+) -> None:
+    """The card may have been promoted, once, and nothing else."""
+    try:
+        bound_occurrence = int(expected["occurrence_event_id"])
+    except (KeyError, TypeError, ValueError):
+        raise ResumeAuthorityError("the confirmation is missing occurrence_event_id") from None
+    bound_lifecycle = expected.get("lifecycle")
+    kinds = occurrence_events_since(conn, task_id, bound_occurrence)
+    if bound_occurrence > current["occurrence_event_id"]:
+        raise ResumeAuthorityError(
+            "the confirmation names an occurrence later than the card's")
+    if not _transition_permitted(bound_lifecycle, current["lifecycle"], kinds):
+        raise ResumeAuthorityError(
+            f"the card moved on: it was {bound_lifecycle!r}, it is now "
+            f"{current['lifecycle']!r}"
+            + (f" via {', '.join(kinds)}" if kinds else ""))
+
+
 def preview(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     """What the operator must look at, plus the tuple they must echo back."""
     current = snapshot(conn, task_id)
@@ -273,6 +322,8 @@ def preview(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
 
 def _require_matches(current: dict[str, Any], expected: dict[str, Any]) -> None:
     for field in _BOUND_FIELDS:
+        if field in ("lifecycle", "occurrence_event_id"):
+            continue  # governed by _require_transition_permitted
         if field not in expected:
             raise ResumeAuthorityError(f"the confirmation is missing {field}")
         want, have = expected[field], current[field]
@@ -308,6 +359,7 @@ def issue(
             "exact run, occurrence and comment set")
     current = snapshot(conn, task_id)
     _require_matches(current, expected)
+    _require_transition_permitted(conn, task_id, current, expected)
     blocked = writer_state(conn, task_id, now)
     if blocked is not None:
         raise ResumeAuthorityError(f"cannot authorise a resume: {blocked}")
@@ -335,7 +387,9 @@ def _live_receipt(conn: sqlite3.Connection, task_id: str, now: int):
 def _receipt_matches_now(conn: sqlite3.Connection, task_id: str, receipt, now: int) -> bool:
     try:
         current = snapshot(conn, task_id)
-        _require_matches(current, {k: receipt[k] for k in _BOUND_FIELDS})
+        bound = {k: receipt[k] for k in _BOUND_FIELDS}
+        _require_matches(current, bound)
+        _require_transition_permitted(conn, task_id, current, bound)
     except (ResumeAuthorityError, KeyError, IndexError):
         return False
     return writer_state(conn, task_id, now) is None

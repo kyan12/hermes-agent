@@ -521,3 +521,146 @@ def test_there_is_no_cli_issuance_path():
 
     assert "authorize-resume" not in kcli._HANDLERS
     assert "authorize-resume" not in str(kanban_parser._SPECS)
+
+
+# --- one permitted promotion, and nothing else (cross-review finding 2) ------
+
+def _parked_todo(board):
+    task_id, run_id = _parked_on_a_pr(board)
+    board.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+    return task_id, run_id
+
+
+def test_a_todo_receipt_survives_an_ordinary_promotion(board):
+    """The advertised todo authorisation has to actually reach a claim.
+
+    A card authorised while waiting on a parent is promoted the ordinary way
+    before the dispatcher looks at it. Binding lifecycle and occurrence exactly
+    made that promotion invalidate the receipt, so the card stayed held by the
+    guard the receipt exists to lift.
+    """
+    task_id, run_id = _parked_todo(board)
+    receipt = _issue(board, task_id, run_id)
+    assert kr.exempt_reason(board, task_id) == receipt
+
+    board.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+    kb._append_event(board, task_id, "promoted", {"reason": "parents done"})
+
+    assert kr.exempt_reason(board, task_id) == receipt
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is not None
+
+
+def test_a_manual_promotion_is_also_permitted(board):
+    task_id, run_id = _parked_todo(board)
+    receipt = _issue(board, task_id, run_id)
+    board.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+    kb._append_event(board, task_id, "promoted_manual", {"actor": "op"})
+    assert kr.exempt_reason(board, task_id) == receipt
+
+
+def test_a_block_unblock_cycle_after_promotion_cannot_reuse_the_receipt(board):
+    """The permitted transition is one promotion — not any path back to ready."""
+    task_id, run_id = _parked_todo(board)
+    receipt = _issue(board, task_id, run_id)
+    board.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+    kb._append_event(board, task_id, "promoted", {"reason": "parents done"})
+    kb._append_event(board, task_id, "blocked", {"reason": "needs input"})
+    kb._append_event(board, task_id, "unblocked", {"status": "ready"})
+
+    assert kr.exempt_reason(board, task_id) is None
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+
+
+def test_a_promotion_twice_over_cannot_reuse_the_receipt(board):
+    task_id, run_id = _parked_todo(board)
+    receipt = _issue(board, task_id, run_id)
+    board.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+    kb._append_event(board, task_id, "promoted", {"reason": "one"})
+    kb._append_event(board, task_id, "promoted", {"reason": "two"})
+    assert kr.exempt_reason(board, task_id) is None
+
+
+def test_a_ready_receipt_still_refuses_any_occurrence_change(board):
+    """Promotion is permitted only out of todo; a ready card has nowhere to go."""
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    kb._append_event(board, task_id, "promoted", {"reason": "spurious"})
+    assert kr.exempt_reason(board, task_id) is None
+
+
+def test_promotion_does_not_loosen_the_rest_of_the_tuple(board):
+    task_id, run_id = _parked_todo(board)
+    receipt = _issue(board, task_id, run_id)
+    board.execute("UPDATE tasks SET status = 'ready', assignee = 'someone-else' WHERE id = ?",
+                  (task_id,))
+    kb._append_event(board, task_id, "promoted", {"reason": "parents done"})
+    assert kr.exempt_reason(board, task_id) is None
+
+
+# --- a failed claim never spends the receipt (cross-review finding 3) --------
+
+def test_a_lost_claim_cas_does_not_spend_the_receipt(board, monkeypatch):
+    """Forced CAS failure, independent of every precheck.
+
+    The consumption commits a few statements before the CAS. Returning None from
+    inside the write transaction committed it anyway: single-use authority
+    destroyed, no successor run, card still parked.
+    """
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    monkeypatch.setattr(kb, "_claim_and_open_run", lambda *a, **kw: None)
+
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+
+    row = board.execute(
+        "SELECT consumed_at, consumed_run_id FROM task_resume_receipts WHERE id = ?",
+        (receipt,)).fetchone()
+    assert row["consumed_at"] is None, "the lost claim spent the receipt anyway"
+    assert row["consumed_run_id"] is None
+    assert board.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] == "ready"
+    # Still usable: the authority survives a claim it never got to use.
+    assert kr.exempt_reason(board, task_id) == receipt
+    monkeypatch.undo()
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is not None
+
+
+def test_a_lost_claim_cas_does_not_reclaim_a_dangling_run(board, monkeypatch):
+    """The rollback takes the reclaim with it — it only ran to make room."""
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    cur = board.execute(
+        "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', ?)",
+        (task_id, int(time.time())))
+    dangling = int(cur.lastrowid)
+    board.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (dangling, task_id))
+    board.execute("UPDATE task_runs SET ended_at = ? WHERE id = ?", (int(time.time()), dangling))
+    monkeypatch.setattr(kb, "_claim_and_open_run", lambda *a, **kw: None)
+
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+    assert board.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] == dangling
+
+
+def test_a_stale_claim_lock_refuses_before_the_receipt_is_spent(board):
+    """The claim CAS requires ``claim_lock IS NULL``; an expired lock is not null.
+
+    Issuing against one would guarantee a lost CAS, so it refuses at issuance
+    rather than spending authority on a claim that cannot succeed.
+    """
+    task_id, run_id = _parked_on_a_pr(board)
+    board.execute("UPDATE tasks SET claim_lock = 'ghost', claim_expires = ? WHERE id = ?",
+                  (int(time.time()) - 3600, task_id))
+    with pytest.raises(kr.ResumeAuthorityError, match="claimed by ghost"):
+        _issue(board, task_id, run_id)
+
+
+def test_a_claim_lock_appearing_after_issuance_refuses_the_claim(board):
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    board.execute("UPDATE tasks SET claim_lock = 'ghost', claim_expires = ? WHERE id = ?",
+                  (int(time.time()) - 3600, task_id))
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+    assert board.execute(
+        "SELECT consumed_at FROM task_resume_receipts WHERE id = ?",
+        (receipt,)).fetchone()["consumed_at"] is None

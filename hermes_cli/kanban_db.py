@@ -2124,6 +2124,10 @@ def _claim_and_open_run(
     return run_id
 
 
+class _ClaimLost(Exception):
+    """The claim CAS lost after authority was spent; roll the whole txn back."""
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, resume_receipt_id: Optional[int] = None,
@@ -2144,51 +2148,62 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
-        # Single enforcement point: never ready -> running with an undone
-        # parent, whichever writer set 'ready'. Demote to 'todo';
-        # recompute_ready re-promotes when the parents finish.
-        if not _parents_satisfied(conn, task_id):
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'", (task_id,),
-            )
-            _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
-            return None
-        # BEFORE the reclaim, deliberately. ``_reclaim_dangling_run`` marks an
-        # unfinished run terminal and clears its pid without proving its writer
-        # stopped — which is exactly what the receipt's writer check reads. Doing
-        # it first would erase the disqualifying evidence and then find none.
-        lineage = None
-        if resume_receipt_id is not None:
-            from hermes_cli import kanban_resume as _resume
-
-            lineage = _resume.consume(conn, int(resume_receipt_id), task_id, now=now)
-            if lineage is None:
-                _append_event(
-                    conn, task_id, "claim_rejected",
-                    {"reason": "resume_authority_invalid", "receipt_id": int(resume_receipt_id)},
+    try:
+        with write_txn(conn):
+            # Single enforcement point: never ready -> running with an undone
+            # parent, whichever writer set 'ready'. Demote to 'todo';
+            # recompute_ready re-promotes when the parents finish.
+            if not _parents_satisfied(conn, task_id):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'", (task_id,),
                 )
+                _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
                 return None
-        # Close a leaked prior run so the CAS below doesn't strand it.
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
-        )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
-        if run_id is None:
-            return None
-        if lineage is not None:
-            from hermes_cli import kanban_resume as _resume
+            # BEFORE the reclaim, deliberately. ``_reclaim_dangling_run`` marks an
+            # unfinished run terminal and clears its pid without proving its writer
+            # stopped — which is exactly what the receipt's writer check reads. Doing
+            # it first would erase the disqualifying evidence and then find none.
+            lineage = None
+            if resume_receipt_id is not None:
+                from hermes_cli import kanban_resume as _resume
 
-            _resume.attach_run(conn, int(resume_receipt_id), run_id)
-            _append_event(
-                conn, task_id, "resumed_on_authority",
-                {"receipt_id": lineage["receipt_id"], "run_id": run_id,
-                 "pr_url": lineage["pr_url"],
-                 "predecessor_run_id": lineage["predecessor_run_id"]},
-                run_id=run_id,
+                lineage = _resume.consume(conn, int(resume_receipt_id), task_id, now=now)
+                if lineage is None:
+                    _append_event(
+                        conn, task_id, "claim_rejected",
+                        {"reason": "resume_authority_invalid", "receipt_id": int(resume_receipt_id)},
+                    )
+                    return None
+            # Close a leaked prior run so the CAS below doesn't strand it.
+            _reclaim_dangling_run(
+                conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
             )
-        claimed = get_task(conn, task_id)
+            run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+            if run_id is None:
+                if lineage is not None:
+                    # The receipt was spent a few statements ago and there is no
+                    # successor to spend it on. Returning here would COMMIT that:
+                    # single-use authority destroyed, card still parked. Unwind the
+                    # whole transaction instead — the reclaim above goes with it,
+                    # which is also correct, since it only ran to make room for a
+                    # claim that did not happen.
+                    raise _ClaimLost()
+                return None
+            if lineage is not None:
+                from hermes_cli import kanban_resume as _resume
+
+                _resume.attach_run(conn, int(resume_receipt_id), run_id)
+                _append_event(
+                    conn, task_id, "resumed_on_authority",
+                    {"receipt_id": lineage["receipt_id"], "run_id": run_id,
+                     "pr_url": lineage["pr_url"],
+                     "predecessor_run_id": lineage["predecessor_run_id"]},
+                    run_id=run_id,
+                )
+            claimed = get_task(conn, task_id)
+    except _ClaimLost:
+        return None
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
 
