@@ -451,7 +451,7 @@ def observe(
                 raise TransportError("invalid PR identity")
             candidate_repo, candidate_number = parsed
             detail = budget.call(api, f"repos/{candidate_repo}/pulls/{candidate_number}")
-            fields = _fields(detail)
+            fields = _fields(detail, expected_number=candidate_number)
             _, _, ref, _, head_repository, _, base_repository = fields
             if not head_repository or not base_repository or base_repository.lower() != candidate_repo.lower():
                 raise TransportError("missing or inconsistent repository identity")
@@ -482,7 +482,7 @@ def observe(
 
     evidence = {
         "pr_url": pr_url, "repo": repo, "number": number, "state": state,
-        "merged": bool(merged), "head_repo": head_repo, "head_ref": head_ref,
+        "merged": merged, "head_repo": head_repo, "head_ref": head_ref,
         "head_sha": head_sha, "base_repo": base_repo, "base_ref": base_ref,
         "checkout": checkout, "branch": snapshot.branch_name,
         "observed_at": int(time.time()), "requests": budget.used,
@@ -508,7 +508,7 @@ def observe(
              "provenance": [list(p) for p in snapshot.provenance],
              "principal": principal, **evidence},
             principal, int(time.time()))
-    if str(state).lower() != "open":
+    if state != "open":
         return _unresolved(
             CLOSED_UNMERGED,
             f"the pull request is {state} and was not merged",
@@ -526,14 +526,14 @@ def observe(
     # than the one we are about to authorise.
     try:
         fresh = budget.call(api, f"repos/{repo}/pulls/{number}")
-        fresh_fields = _fields(fresh)
+        fresh_fields = _fields(fresh, expected_number=number)
         f_state, f_merged, f_head_ref, f_head_sha, *_ = fresh_fields
     except (TransportError, KeyError, TypeError, ValueError, AttributeError) as exc:
         return _unresolved(
             UNAVAILABLE, f"the confirming re-read failed ({type(exc).__name__})",
             "Retry; the dispatcher does this on a bounded schedule.",
             snapshot, principal, pr_url, evidence)
-    if fresh_fields[4:] != (head_repo, base_ref, base_repo) or (f_head_sha, f_head_ref, bool(f_merged), str(f_state).lower()) != (
+    if fresh_fields[4:] != (head_repo, base_ref, base_repo) or (f_head_sha, f_head_ref, f_merged, f_state) != (
             head_sha, head_ref, False, "open"):
         return _unresolved(
             UNAVAILABLE, "the pull request changed while it was being observed",
@@ -551,11 +551,29 @@ def observe(
         principal, int(time.time()))
 
 
-def _fields(detail: dict[str, Any]):
+def _fields(detail: dict[str, Any], *, expected_number: int):
+    """Only literal GitHub detail identity/lifecycle fields can authorize a run."""
+    if not isinstance(detail, dict):
+        raise TransportError("invalid pull request detail")
+    state, merged, number = detail.get("state"), detail.get("merged"), detail.get("number")
+    if (type(state) is not str or state not in ("open", "closed")
+            or type(merged) is not bool or (merged and state != "closed")
+            or type(number) is not int or number != expected_number):
+        raise TransportError("invalid pull request lifecycle or number")
+    for side in ("head", "base"):
+        value = detail.get(side)
+        if not isinstance(value, dict) or not isinstance(value.get("repo"), dict):
+            raise TransportError("invalid pull request branch identity")
+        ref, sha, repo = value.get("ref"), value.get("sha"), value["repo"].get("full_name")
+        if (type(ref) is not str or not ref or ref == "@" or ".." in ref or "@{" in ref
+                or ref.endswith(".") or re.search(r"[\x00-\x20\x7f~^:?*\[\\]", ref)
+                or any(not part or part.startswith(".") or part.endswith(".lock") for part in ref.split("/"))
+                or type(sha) is not str or re.fullmatch(r"[0-9a-f]{40}", sha) is None
+                or type(repo) is not str or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None):
+            raise TransportError("invalid pull request ref, SHA or repository")
     head, base = detail["head"], detail["base"]
-    return (detail["state"], detail.get("merged", False), head["ref"], head["sha"],
-            (head.get("repo") or {}).get("full_name"), base["ref"],
-            (base.get("repo") or {}).get("full_name"))
+    return (state, merged, head["ref"], head["sha"], head["repo"]["full_name"],
+            base["ref"], base["repo"]["full_name"])
 
 
 class _Budget:

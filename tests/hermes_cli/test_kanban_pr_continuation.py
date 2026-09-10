@@ -189,12 +189,12 @@ def _worktree(origin, branch):
     return target, head
 
 
-def _pr_payload(*, state="open", merged=False, head_ref, head_sha,
+def _pr_payload(*, state="open", merged=False, number=4242, draft=False, head_ref, head_sha,
                 head_repo="NousResearch/hermes-agent",
                 base_repo="NousResearch/hermes-agent", base_ref="main"):
-    return {"state": state, "merged": merged,
+    return {"number": number, "state": state, "merged": merged, "draft": draft,
             "head": {"ref": head_ref, "sha": head_sha, "repo": {"full_name": head_repo}},
-            "base": {"ref": base_ref, "repo": {"full_name": base_repo}}}
+            "base": {"ref": base_ref, "sha": head_sha, "repo": {"full_name": base_repo}}}
 
 
 def _fake_api(payloads):
@@ -301,9 +301,9 @@ def test_a_merged_pr_continues_closeout_without_marking_done(board, checkout):
 @pytest.mark.parametrize("payloads,expected", [
     pytest.param(
         {"repos/nousresearch/hermes-agent/pulls/4242":
-         {"state": "closed", "merged": False,
+         {"number": 4242, "state": "closed", "merged": False,
           "head": {"ref": "BRANCH", "sha": "HEAD", "repo": {"full_name": "NousResearch/hermes-agent"}},
-          "base": {"ref": "main", "repo": {"full_name": "NousResearch/hermes-agent"}}}},
+          "base": {"ref": "main", "sha": "HEAD", "repo": {"full_name": "NousResearch/hermes-agent"}}}},
         "closed_unmerged", id="closed_unmerged"),
     pytest.param({}, "unavailable", id="unavailable"),
 ])
@@ -337,7 +337,7 @@ def test_two_associated_pull_requests_stay_ambiguous(board, checkout):
     observation = kpr.observe(snapshot, deadline=time.time() + 5,
         principal="hermes:dispatcher", api=_fake_api({
             "repos/nousresearch/hermes-agent/pulls/4242": _pr_payload(head_ref=branch, head_sha=head),
-            "repos/nousresearch/hermes-agent/pulls/9999": _pr_payload(head_ref=branch, head_sha=head)}))
+            "repos/nousresearch/hermes-agent/pulls/9999": _pr_payload(number=9999, head_ref=branch, head_sha=head)}))
     assert observation.classification == kpr.AMBIGUOUS
     assert kpr.admit(board, snapshot, observation) is None
 
@@ -786,7 +786,7 @@ def test_hint_filtering_precedes_ownership_ambiguity(board, checkout, case, expe
     kb.add_comment(board, task_id, "worker", f"another reference {OTHER_PR}")
     payloads = {
         "repos/nousresearch/hermes-agent/pulls/4242": _pr_payload(head_ref=branch if case != "unrelated" else "elsewhere", head_sha=head),
-        "repos/nousresearch/hermes-agent/pulls/9999": _pr_payload(head_ref=branch if case == "owned" else "elsewhere", head_sha=head),
+        "repos/nousresearch/hermes-agent/pulls/9999": _pr_payload(number=9999, head_ref=branch if case == "owned" else "elsewhere", head_sha=head),
     }
     if case == "limit":
         for number in range(10, 10 + kpr.MAX_REQUESTS):

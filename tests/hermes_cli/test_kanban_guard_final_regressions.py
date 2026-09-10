@@ -267,3 +267,58 @@ def test_pre_spawn_refuses_reopened_old_run_without_pid(board, checkout, monkeyp
     monkeypatch.setattr(kb, 'claim_task', claim)
     _, spawned = f._dispatch(board)
     assert not spawned
+
+
+@pytest.mark.parametrize('boundary', ['initial', 'confirming'])
+def test_pr_detail_schema_rejects_malformed_authority(board, checkout, boundary):
+    import copy
+    task, branch, head = f._mid_pr_crash(board, checkout)
+    snapshot = kpr.capture(board, task, window_seconds=86400)
+    valid = f._pr_payload(head_ref=branch, head_sha=head)
+    missing = object()
+    mutations = [
+        (('merged',), v) for v in (missing, None, 'false', 'true', 0, 1, [], {})
+    ] + [
+        (('state',), v) for v in (missing, None, 'OPEN', 'merged', '', 1)
+    ] + [
+        (('number',), v) for v in (missing, None, True, '4242', 4242.0, 9999)
+    ] + [(('merged',), True)]  # open + merged is inconsistent
+    for side in ('head', 'base'):
+        mutations.extend([((side,), v) for v in (missing, None, [], 'invalid')])
+        mutations.extend([((side, 'ref'), v) for v in (missing, None, 1, '', 'bad ref')])
+        mutations.extend([((side, 'sha'), v) for v in (missing, None, 1, '', 'not-a-sha')])
+        mutations.extend([((side, 'repo'), v) for v in (missing, None, [], 'owner/repo')])
+        mutations.extend([((side, 'repo', 'full_name'), v) for v in (missing, None, 1, '', 'invalid')])
+    failures = []
+    for path, value in mutations:
+        malformed = copy.deepcopy(valid)
+        target = malformed
+        for key in path[:-1]:
+            target = target[key]
+        if value is missing:
+            del target[path[-1]]
+        else:
+            target[path[-1]] = value
+        calls = []
+        def api(endpoint):
+            calls.append(endpoint)
+            return malformed if boundary == 'initial' or len(calls) > 1 else valid
+        observation = kpr.observe(snapshot, deadline=time.time()+5, principal='github:123', api=api)
+        receipt = kpr.admit(board, snapshot, observation)
+        if observation.classification != kpr.UNAVAILABLE or receipt is not None:
+            failures.append((path, repr(value), observation.classification, receipt))
+    assert not failures, failures
+    assert board.execute('SELECT id FROM task_resume_receipts WHERE task_id=?', (task,)).fetchone() is None
+
+
+@pytest.mark.parametrize('state,merged,draft,expected', [
+    ('open', False, False, 'open'), ('open', False, True, 'open'),
+    ('closed', True, False, 'merged'), ('closed', False, False, 'closed_unmerged'),
+])
+def test_pr_detail_valid_lifecycle_remains_typed(board, checkout, state, merged, draft, expected):
+    task, branch, head = f._mid_pr_crash(board, checkout)
+    snapshot = kpr.capture(board, task, window_seconds=86400)
+    payload = f._pr_payload(state=state, merged=merged, draft=draft, head_ref=branch, head_sha=head)
+    observation = kpr.observe(snapshot, deadline=time.time()+5, principal='github:123', api=lambda _: payload)
+    assert observation.classification == expected
+    assert (kpr.admit(board, snapshot, observation) is not None) == (expected in ('open', 'merged'))
