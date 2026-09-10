@@ -667,13 +667,29 @@
     }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
     // --- fetch full board ---------------------------------------------------
+    // Every board request gets a generation. Responses are applied only if no
+    // later request has started since: HTTP completion order is not request
+    // order, so request A (board X) finishing after request B (board Y) would
+    // otherwise repaint Y's board with X's cards AND point cursorBoardRef back
+    // at X — after which the socket, still pinned to Y, is talking about a board
+    // the cursor no longer claims. Out-of-order responses for the SAME board are
+    // equally unsafe: the older one restores data whose events the stream has
+    // already consumed. Success, error and completion are all guarded; a stale
+    // error would clear a live board's state just as badly.
+    const boardRequestRef = useRef(0);
     const loadBoard = useCallback(() => {
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
+      const generation = ++boardRequestRef.current;
+      const requestedBoard = board;
+      const current = function () {
+        return generation === boardRequestRef.current && requestedBoard === board;
+      };
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
+          if (!current()) return;
           setBoardData(data);
           // `latest_event_id` is a SNAPSHOT cursor: the board response and that
           // id describe one moment (the server reads them under one read
@@ -682,16 +698,20 @@
           // reload triggered mid-stream would then step over events the socket
           // has not delivered yet. Their effects are already in the snapshot,
           // but the per-task signals the drawer reloads on are not.
-          if (cursorRef.current === null || cursorBoardRef.current !== board) {
+          if (cursorRef.current === null || cursorBoardRef.current !== requestedBoard) {
             cursorRef.current = data.latest_event_id || 0;
-            cursorBoardRef.current = board;
+            cursorBoardRef.current = requestedBoard;
           }
           setError(null);
         })
         .catch(function (err) {
+          if (!current()) return;
           setError(String(err && err.message ? err.message : err));
         })
-        .finally(function () { setLoading(false); });
+        .finally(function () {
+          if (!current()) return;
+          setLoading(false);
+        });
     }, [tenantFilter, includeArchived, board]);
 
     // --- load list of boards for the switcher ------------------------------
