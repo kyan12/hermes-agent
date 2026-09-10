@@ -1,89 +1,73 @@
 """Explicit, single-use authority to resume ONE task on ONE existing pull request.
 
-The dispatcher refuses to respawn a task once a recent comment carries a GitHub
-PR URL (``check_respawn_guard`` -> ``"active_pr"``). That guard is load-bearing:
-without it a crashed worker's successor opens a second PR for the same work, and
-the duplicate-PR cluster is the single most expensive failure this repo has had.
+The dispatcher refuses to respawn a task whose recent comments carry a GitHub PR
+URL (``check_respawn_guard`` -> ``"active_pr"``). Without that guard a crashed
+worker's successor opens a second PR for the same work. With it, a worker that
+died mid-PR parks its card forever.
 
-But it has no exit. When a worker dies *mid-PR* — the branch is pushed, the PR is
-open, the work is unfinished — the card is parked permanently, and the only ways
-out are to weaken the guard for everyone or to hand-run the work outside the
-board. This module is the third option: an operator states, once, "resume THIS
-task, continuing THAT pull request", and the dispatcher honours it exactly once.
+A receipt is the narrow exit. It bypasses ``active_pr`` and nothing else, and it
+is authority only because an authenticated operator confirmed an exact snapshot:
 
-What the receipt is, precisely
-------------------------------
+    board identity, task, latest terminal run BY ID, current occurrence, current
+    lifecycle/assignee/workspace, the PR, and a digest of every comment's full
+    content.
 
-A receipt names a **board, task, terminal run and pull request**, and carries a
-digest of *all* the PR evidence that existed when it was issued. It bypasses
-``active_pr`` and **nothing else**. Quota and auth blockers, the rate-limit
-cooldown, the recent-success window, dependency gating, review routing, the
-failure counter and every concurrency guard are untouched — a receipt is not a
-force flag, and it cannot make an ineligible task eligible.
+Provenance is **attested, not reconstructed**. ``task_comments`` has no run id,
+so comment ownership by a historical run cannot be proven and is not claimed.
+The operator states, now, that this PR is the continuation target for this run
+and this occurrence, having seen this exact comment set. Legacy evidence without
+that explicit binding stays refused.
 
-Why the digest, and not an author or a timestamp
-------------------------------------------------
-
-Comments record an author, a body and a time. Their ``commented`` events record
-an author and a body *length*. None of that identifies a particular run's
-comment: two workers commenting in the same second are indistinguishable, and an
-author string is submitted data, not authority. So a receipt binds to comment
-**ids** and to the exact URLs those comments contain. If a comment is added,
-removed, or carries a different PR, the digest changes and the receipt stops
-matching — which is the behaviour we want, because the operator authorised the
-situation they looked at, not a later one.
-
-Evidence the receipt does not cover is never exempted. A receipt for PR #7 does
-not clear a second comment linking PR #9; the guard still fires, and it should —
-that card now has two live PRs and a human should say which one continues.
-
-Legacy ambiguity fails closed: a board whose comment rows predate ids, or whose
-PR evidence cannot be enumerated, produces no digest and therefore no receipt.
-
-Single use, consumed inside the claim
--------------------------------------
-
-Validating a receipt and then claiming is two steps, and anything can happen
-between them — a comment arrives, a worker starts, another dispatcher claims
-first. So the receipt is re-validated and consumed **inside** the claim's write
-transaction, before ``_reclaim_dangling_run`` touches anything: reclaiming first
-would erase the very run state the validation reads. Consumption is a CAS, so
-two dispatchers racing the same receipt produce one run, not two.
+The whole snapshot and the writer state are revalidated inside the claim
+transaction, before any run is reclaimed.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
-from typing import Iterable, Optional
+from typing import Any, Optional
 
-# Same shape the dispatcher's guard matches, kept here so a receipt is written
-# against exactly the evidence the guard reads.
 PR_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+", re.IGNORECASE)
 
-# A receipt is a statement about a situation the operator just looked at. Well
-# past a dispatcher tick and a spawn, nowhere near "standing permission".
-RECEIPT_TTL_SECONDS = 3600  # 1 hour
+RECEIPT_TTL_SECONDS = 3600
+
+# Events that open or close an occurrence. Deliberately excludes ``commented``
+# and ``respawn_guarded``: those are traffic, not a new attempt, and the comment
+# digest already covers the former.
+OCCURRENCE_EVENT_KINDS = (
+    "claimed", "blocked", "unblocked", "scheduled", "status", "reclaimed",
+    "gave_up", "completed", "promoted", "promoted_manual", "review_requested",
+    "changes_requested", "reopened",
+)
+
+# The only lifecycle positions a resume may be authorised from: the card is
+# waiting, not running. No transition is manufactured to get here.
+RESUMABLE_STATUSES = ("ready", "todo")
 
 SCHEMA_SQL = """
--- One-shot authority to bypass the ``active_pr`` respawn guard for a single
--- task, continuing a single named pull request. Never a general force flag; see
--- hermes_cli/kanban_resume.py for the full contract.
 CREATE TABLE IF NOT EXISTS task_resume_receipts (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id        TEXT NOT NULL,
-    run_id         INTEGER NOT NULL,
-    pr_url         TEXT NOT NULL,
-    evidence_digest TEXT NOT NULL,
-    issued_by      TEXT NOT NULL,
-    issued_at      INTEGER NOT NULL,
-    expires_at     INTEGER NOT NULL,
-    consumed_at    INTEGER,
-    consumed_run_id INTEGER,
-    revoked_at     INTEGER
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT NOT NULL,
+    board_identity      TEXT NOT NULL,
+    run_id              INTEGER NOT NULL,
+    occurrence_event_id INTEGER NOT NULL,
+    pr_url              TEXT NOT NULL,
+    comment_digest      TEXT NOT NULL,
+    lifecycle           TEXT NOT NULL,
+    assignee            TEXT,
+    workspace_kind      TEXT,
+    workspace_path      TEXT,
+    issued_by           TEXT NOT NULL,
+    issued_at           INTEGER NOT NULL,
+    expires_at          INTEGER NOT NULL,
+    consumed_at         INTEGER,
+    consumed_run_id     INTEGER,
+    revoked_at          INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_resume_receipts_task
     ON task_resume_receipts(task_id, consumed_at, revoked_at);
@@ -95,145 +79,105 @@ class ResumeAuthorityError(Exception):
 
 
 def normalize_pr_url(raw: str) -> str:
-    """Lowercase the origin, keep the path: PR identity is case-insensitive in
-    host and owner/repo, and a trailing slash or fragment is not a different PR."""
     match = PR_URL_RE.search(raw or "")
     if match is None:
         raise ResumeAuthorityError(f"not a GitHub pull request URL: {raw!r}")
     return match.group(0).lower().rstrip("/")
 
 
-def pr_evidence(conn: sqlite3.Connection, task_id: str, *, window_seconds: int,
-                now: Optional[int] = None) -> list[tuple[int, tuple[str, ...]]]:
-    """Every PR-bearing comment the guard can see, as ``(comment_id, urls)``.
+# --- the snapshot a receipt binds -------------------------------------------
 
-    Ordered and de-duplicated so the digest is a function of the evidence rather
-    than of row order. A comment carrying two different PRs contributes both:
-    "one URL matched" is not "this comment is about the authorised PR".
+def board_identity(conn: sqlite3.Connection) -> str:
+    """The resolved database this connection is actually attached to."""
+    row = conn.execute("PRAGMA database_list").fetchone()
+    path = row[2] if row is not None and len(row) > 2 else None
+    if not path:
+        raise ResumeAuthorityError("this board has no resolvable database identity")
+    return os.path.realpath(str(path))
+
+
+def comments(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+    """EVERY comment on the task, full content, deterministic id order.
+
+    Not just the PR-bearing ones: a comment saying "do not resume this" changes
+    what the operator is agreeing to, and a digest that ignored it would let the
+    receipt survive it.
     """
-    now = int(time.time()) if now is None else now
     rows = conn.execute(
-        "SELECT id, body FROM task_comments WHERE task_id = ? AND created_at >= ? "
-        "ORDER BY id ASC",
-        (task_id, now - window_seconds),
+        "SELECT id, task_id, author, body, created_at FROM task_comments "
+        "WHERE task_id = ? ORDER BY id ASC", (task_id,),
     ).fetchall()
-    evidence: list[tuple[int, tuple[str, ...]]] = []
+    out = []
     for row in rows:
-        urls = tuple(sorted({
-            match.group(0).lower().rstrip("/")
-            for match in PR_URL_RE.finditer(row["body"] or "")
-        }))
-        if not urls:
-            continue
-        comment_id = row["id"]
-        if comment_id is None:
-            # Pre-id evidence cannot be bound to, and an unbindable receipt is
-            # exactly the ambiguous provenance this module refuses to invent.
+        if row["id"] is None:
             raise ResumeAuthorityError(
-                "this board has PR evidence that cannot be identified by comment id; "
+                "this board has comments without ids; they cannot be bound and "
                 "resume authority is refused rather than guessed")
-        evidence.append((int(comment_id), urls))
-    return evidence
+        out.append({
+            "id": int(row["id"]), "task_id": row["task_id"], "author": row["author"],
+            "body": row["body"] or "", "created_at": row["created_at"],
+        })
+    return out
 
 
-def evidence_digest(evidence: Iterable[tuple[int, tuple[str, ...]]]) -> str:
-    """A stable digest of the whole evidence set.
-
-    Any change — a comment added, a comment removed, a different PR linked —
-    changes this, and a receipt whose digest no longer matches is not honoured.
-    """
-    canonical = json.dumps(
-        [[comment_id, list(urls)] for comment_id, urls in evidence],
-        separators=(",", ":"), sort_keys=False,
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+def comment_digest(entries: list[dict[str, Any]]) -> str:
+    return hashlib.sha256(json.dumps(
+        [[e["id"], e["task_id"], e["author"], e["body"], e["created_at"]] for e in entries],
+        separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
 
 
-def authorized_pr_urls(evidence: Iterable[tuple[int, tuple[str, ...]]]) -> set[str]:
-    """Every distinct PR named anywhere in the evidence."""
-    return {url for _, urls in evidence for url in urls}
+def pr_urls(entries: list[dict[str, Any]]) -> set[str]:
+    return {m.group(0).lower().rstrip("/")
+            for e in entries for m in PR_URL_RE.finditer(e["body"])}
 
 
-def exempt_reason(
-    conn: sqlite3.Connection, task_id: str, *, window_seconds: int,
-    now: Optional[int] = None,
-) -> Optional[int]:
-    """The id of a live receipt that authorises today's evidence, or ``None``.
-
-    Read-only, and deliberately strict. Returning an id here does not consume
-    anything: the claim re-runs this inside its own transaction and consumes the
-    receipt there, because between this read and that claim a comment can land.
-    """
-    now = int(time.time()) if now is None else now
-    try:
-        evidence = pr_evidence(conn, task_id, window_seconds=window_seconds, now=now)
-    except ResumeAuthorityError:
-        return None
-    if not evidence:
-        return None
-    digest = evidence_digest(evidence)
-    urls = authorized_pr_urls(evidence)
-    if len(urls) != 1:
-        # More than one live PR on the card. A receipt names one lineage, and
-        # exempting it would leave the other unexamined.
-        return None
-    (only_url,) = tuple(urls)
-
-    row = conn.execute(
-        """
-        SELECT id FROM task_resume_receipts
-         WHERE task_id = ? AND pr_url = ? AND evidence_digest = ?
-           AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ?
-         ORDER BY id DESC LIMIT 1
-        """,
-        (task_id, only_url, digest, now),
+def latest_terminal_run(conn: sqlite3.Connection, task_id: str):
+    """The newest ended run BY ID. ``latest_run()`` orders by timestamp, which
+    cannot break a tie between two runs that ended in the same second."""
+    return conn.execute(
+        "SELECT id, profile, outcome, ended_at, worker_pid FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (task_id,),
     ).fetchone()
-    return None if row is None else int(row["id"])
 
 
-def consume(
-    conn: sqlite3.Connection, receipt_id: int, task_id: str, *,
-    window_seconds: int, now: Optional[int] = None,
-) -> bool:
-    """Re-validate and atomically spend ``receipt_id``. Caller holds the write txn.
+def latest_occurrence_event_id(conn: sqlite3.Connection, task_id: str) -> int:
+    placeholders = ", ".join("?" for _ in OCCURRENCE_EVENT_KINDS)
+    row = conn.execute(
+        f"SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
+        f"WHERE task_id = ? AND kind IN ({placeholders})",
+        (task_id, *OCCURRENCE_EVENT_KINDS),
+    ).fetchone()
+    return int(row["m"])
 
-    Called from inside ``claim_task``'s transaction and BEFORE any run is
-    reclaimed. Revalidation here is the whole point: the guard check that
-    selected this receipt ran outside a transaction, and the evidence may have
-    moved since.
 
-    The UPDATE is the CAS. Two dispatchers reaching this line with the same
-    receipt both re-validate successfully; exactly one of them changes a row.
-    """
-    now = int(time.time()) if now is None else now
-    if exempt_reason(conn, task_id, window_seconds=window_seconds, now=now) != int(receipt_id):
+def _pid_is_running(pid: Optional[int]) -> Optional[bool]:
+    """True / False / None when it cannot be determined."""
+    if pid is None:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
-    cur = conn.execute(
-        "UPDATE task_resume_receipts SET consumed_at = ? "
-        " WHERE id = ? AND task_id = ? AND consumed_at IS NULL AND revoked_at IS NULL "
-        "   AND expires_at > ?",
-        (now, int(receipt_id), task_id, now),
-    )
-    return cur.rowcount == 1
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
 
 
-def attach_run(conn: sqlite3.Connection, receipt_id: int, run_id: int) -> None:
-    """Record which run the spent receipt actually opened (audit, not authority)."""
-    conn.execute(
-        "UPDATE task_resume_receipts SET consumed_run_id = ? WHERE id = ?",
-        (int(run_id), int(receipt_id)),
-    )
+def writer_state(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[str]:
+    """Why this task may still have a writer, or ``None`` when it provably does not.
 
-
-# --- issuing -----------------------------------------------------------------
-
-def _live_writer_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[str]:
-    """Why this task still has a writer, or ``None`` when it plainly does not.
-
-    "No active writer" is checked over the task row AND the run rows, because
-    they can disagree: a crashed worker leaves an unfinished run behind while the
-    task has already been released. Either one is a reason to refuse — resuming a
-    card someone is still working is how two workers end up on one PR.
+    Unknown is not clear: a pid we cannot classify refuses, because terminal
+    bookkeeping does not prove a process stopped.
     """
     task = conn.execute(
         "SELECT status, claim_lock, claim_expires, worker_pid, current_run_id "
@@ -255,70 +199,209 @@ def _live_writer_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Opt
     ).fetchone()
     if open_run is not None:
         return f"run {open_run['id']} has not ended"
+
+    pids = [("the task", task["worker_pid"])]
+    pids += [(f"run {r['id']}", r["worker_pid"]) for r in conn.execute(
+        "SELECT id, worker_pid FROM task_runs "
+        "WHERE task_id = ? AND worker_pid IS NOT NULL", (task_id,)).fetchall()]
+    for label, pid in pids:
+        if pid is None:
+            continue
+        alive = _pid_is_running(pid)
+        if alive is None:
+            return f"{label} records pid {pid}, which could not be classified"
+        if alive:
+            return f"{label} records pid {pid}, which is still running"
     return None
 
 
-def issue(
-    conn: sqlite3.Connection, task_id: str, *, run_id: int, pr_url: str,
-    issued_by: str, window_seconds: int, now: Optional[int] = None,
-    ttl_seconds: int = RECEIPT_TTL_SECONDS,
-) -> int:
-    """Record one-shot authority to resume ``task_id`` on ``pr_url``; return its id.
-
-    ``issued_by`` is the *authenticated operator context* of the surface that
-    called this — never an author string carried on a request body, and never
-    read back out as authority. It is an audit field.
-
-    ``conn`` is the board. There is no board parameter because there is no
-    cross-board receipt: a receipt lives in the same database as the task it
-    authorises, so a receipt issued on one board cannot be spent on another.
-
-    Every check here is re-run at consumption time. Doing them here as well is
-    what makes a refusal legible to the operator at the moment they ask, instead
-    of a card that silently keeps not spawning.
-    """
-    now = int(time.time()) if now is None else now
-    normalized = normalize_pr_url(pr_url)
-
-    blocked = _live_writer_reason(conn, task_id, now)
-    if blocked is not None:
-        raise ResumeAuthorityError(f"cannot authorise a resume: {blocked}")
-
-    run = conn.execute(
-        "SELECT id, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
-        (int(run_id), task_id),
+def snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """The exact tuple a receipt binds. Raises when the card cannot be resumed."""
+    task = conn.execute(
+        "SELECT status, assignee, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
+    if task is None:
+        raise ResumeAuthorityError(f"task {task_id} does not exist on this board")
+    if task["status"] not in RESUMABLE_STATUSES:
+        raise ResumeAuthorityError(
+            f"task {task_id} is {task['status']}; a resume is authorised from "
+            f"{' or '.join(RESUMABLE_STATUSES)}, and no transition is manufactured to get there")
+    run = latest_terminal_run(conn, task_id)
     if run is None:
-        # Includes the wrong-task and wrong-board cases: a run id from another
-        # card does not name a run of this one, and a run id from another board
-        # is not in this database at all.
+        raise ResumeAuthorityError(f"task {task_id} has no finished run to resume")
+    entries = comments(conn, task_id)
+    urls = pr_urls(entries)
+    if not urls:
         raise ResumeAuthorityError(
-            f"run {run_id} does not belong to task {task_id} on this board")
-    if run["ended_at"] is None:
-        raise ResumeAuthorityError(
-            f"run {run_id} has not ended; resume authority is for a finished attempt")
-
-    evidence = pr_evidence(conn, task_id, window_seconds=window_seconds, now=now)
-    if not evidence:
-        raise ResumeAuthorityError(
-            f"task {task_id} has no recent pull-request evidence to resume; "
-            "the respawn guard this authorises is not what is holding it")
-    urls = authorized_pr_urls(evidence)
-    if normalized not in urls:
-        raise ResumeAuthorityError(
-            f"{normalized} is not among this task's recent pull requests: "
-            f"{', '.join(sorted(urls))}")
+            f"task {task_id} references no pull request; the guard this "
+            "authorises is not what is holding it")
     if len(urls) > 1:
         raise ResumeAuthorityError(
             "this task references more than one pull request "
             f"({', '.join(sorted(urls))}); a receipt exempts one lineage and "
             "would leave the others unexamined")
+    return {
+        "board_identity": board_identity(conn),
+        "task_id": task_id,
+        "run_id": int(run["id"]),
+        "run_profile": run["profile"],
+        "run_outcome": run["outcome"],
+        "occurrence_event_id": latest_occurrence_event_id(conn, task_id),
+        "pr_url": next(iter(urls)),
+        "comment_digest": comment_digest(entries),
+        "comments": entries,
+        "lifecycle": task["status"],
+        "assignee": task["assignee"],
+        "workspace_kind": task["workspace_kind"],
+        "workspace_path": task["workspace_path"],
+    }
 
+
+_BOUND_FIELDS = ("board_identity", "task_id", "run_id", "occurrence_event_id",
+                 "pr_url", "comment_digest", "lifecycle", "assignee",
+                 "workspace_kind", "workspace_path")
+
+
+def preview(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """What the operator must look at, plus the tuple they must echo back."""
+    current = snapshot(conn, task_id)
+    blocked = writer_state(conn, task_id, int(time.time()))
+    return {**current, "resumable": blocked is None, "blocked_reason": blocked,
+            "expected": {k: current[k] for k in _BOUND_FIELDS}}
+
+
+def _require_matches(current: dict[str, Any], expected: dict[str, Any]) -> None:
+    for field in _BOUND_FIELDS:
+        if field not in expected:
+            raise ResumeAuthorityError(f"the confirmation is missing {field}")
+        want, have = expected[field], current[field]
+        if field in ("run_id", "occurrence_event_id"):
+            try:
+                want = int(want)
+            except (TypeError, ValueError):
+                raise ResumeAuthorityError(f"{field} must be an integer") from None
+        if field == "pr_url":
+            want = normalize_pr_url(str(want))
+        if want != have:
+            raise ResumeAuthorityError(
+                f"the card changed while it was being reviewed: {field} is "
+                f"{have!r}, the confirmation named {want!r}")
+
+
+def issue(
+    conn: sqlite3.Connection, task_id: str, *, expected: dict[str, Any],
+    issued_by: str, attested: bool, now: Optional[int] = None,
+    ttl_seconds: int = RECEIPT_TTL_SECONDS,
+) -> int:
+    """Record one-shot authority; return its id.
+
+    ``issued_by`` is the verified session identity of the calling surface, never
+    a value carried on the request body. ``attested`` is the operator's explicit
+    statement that this PR continues this run for this occurrence, having read
+    this comment set; without it there is no lineage and no receipt.
+    """
+    now = int(time.time()) if now is None else now
+    if not attested:
+        raise ResumeAuthorityError(
+            "resume authority requires an explicit lineage attestation for this "
+            "exact run, occurrence and comment set")
+    current = snapshot(conn, task_id)
+    _require_matches(current, expected)
+    blocked = writer_state(conn, task_id, now)
+    if blocked is not None:
+        raise ResumeAuthorityError(f"cannot authorise a resume: {blocked}")
     cur = conn.execute(
         "INSERT INTO task_resume_receipts "
-        "(task_id, run_id, pr_url, evidence_digest, issued_by, issued_at, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (task_id, int(run_id), normalized, evidence_digest(evidence),
-         issued_by, now, now + int(ttl_seconds)),
+        "(task_id, board_identity, run_id, occurrence_event_id, pr_url, comment_digest,"
+        " lifecycle, assignee, workspace_kind, workspace_path, issued_by, issued_at, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, current["board_identity"], current["run_id"],
+         current["occurrence_event_id"], current["pr_url"], current["comment_digest"],
+         current["lifecycle"], current["assignee"], current["workspace_kind"],
+         current["workspace_path"], issued_by, now, now + int(ttl_seconds)),
     )
     return int(cur.lastrowid)
+
+
+def _live_receipt(conn: sqlite3.Connection, task_id: str, now: int):
+    return conn.execute(
+        "SELECT * FROM task_resume_receipts WHERE task_id = ? AND consumed_at IS NULL "
+        "AND revoked_at IS NULL AND expires_at > ? ORDER BY id DESC LIMIT 1",
+        (task_id, now),
+    ).fetchone()
+
+
+def _receipt_matches_now(conn: sqlite3.Connection, task_id: str, receipt, now: int) -> bool:
+    try:
+        current = snapshot(conn, task_id)
+        _require_matches(current, {k: receipt[k] for k in _BOUND_FIELDS})
+    except (ResumeAuthorityError, KeyError, IndexError):
+        return False
+    return writer_state(conn, task_id, now) is None
+
+
+def exempt_reason(
+    conn: sqlite3.Connection, task_id: str, *, window_seconds: Optional[int] = None,
+    now: Optional[int] = None,
+) -> Optional[int]:
+    """The id of a receipt that authorises the card as it is right now, or None.
+
+    Read-only. Returning an id consumes nothing: the claim re-runs all of this
+    inside its own transaction, because a comment, a run or a writer can arrive
+    in between.
+    """
+    now = int(time.time()) if now is None else now
+    receipt = _live_receipt(conn, task_id, now)
+    if receipt is None:
+        return None
+    return int(receipt["id"]) if _receipt_matches_now(conn, task_id, receipt, now) else None
+
+
+def consume(
+    conn: sqlite3.Connection, receipt_id: int, task_id: str, *,
+    window_seconds: Optional[int] = None, now: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Revalidate the whole tuple and the writer state, then spend the receipt.
+
+    Caller holds the write transaction and has NOT reclaimed anything yet:
+    ``_reclaim_dangling_run`` clears the pid this validation reads.
+
+    Returns the bound lineage on success, ``None`` on refusal. The UPDATE is the
+    CAS, so two dispatchers racing one receipt produce one run.
+    """
+    now = int(time.time()) if now is None else now
+    receipt = conn.execute(
+        "SELECT * FROM task_resume_receipts WHERE id = ? AND task_id = ? "
+        "AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ?",
+        (int(receipt_id), task_id, now),
+    ).fetchone()
+    if receipt is None:
+        return None
+    if not _receipt_matches_now(conn, task_id, receipt, now):
+        return None
+    cur = conn.execute(
+        "UPDATE task_resume_receipts SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL "
+        "AND revoked_at IS NULL AND expires_at > ?",
+        (now, int(receipt_id), now),
+    )
+    if cur.rowcount != 1:
+        return None
+    return {"receipt_id": int(receipt["id"]), "pr_url": receipt["pr_url"],
+            "predecessor_run_id": int(receipt["run_id"]),
+            "occurrence_event_id": int(receipt["occurrence_event_id"]),
+            "issued_by": receipt["issued_by"]}
+
+
+def attach_run(conn: sqlite3.Connection, receipt_id: int, run_id: int) -> None:
+    conn.execute("UPDATE task_resume_receipts SET consumed_run_id = ? WHERE id = ?",
+                 (int(run_id), int(receipt_id)))
+
+
+def lineage_for_run(conn: sqlite3.Connection, task_id: str, run_id: int):
+    """The authority a run was opened under, for the worker's own instructions."""
+    return conn.execute(
+        "SELECT pr_url, run_id AS predecessor_run_id, issued_by, consumed_at "
+        "FROM task_resume_receipts WHERE task_id = ? AND consumed_run_id = ?",
+        (task_id, int(run_id)),
+    ).fetchone()

@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from fastapi import (
-    APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
+    APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket,
+    WebSocketDisconnect, status as http_status)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -952,6 +953,85 @@ def reclaim_task_endpoint(task_id: str, payload: ReclaimBody, board: Optional[st
         if not kanban_db.reclaim_task(conn, task_id, reason=payload.reason):
             raise _conflict(f"cannot reclaim {task_id}: not in a claimable state (not running, or unknown id)")
         return {"ok": True, "task_id": task_id}
+
+
+# --- Resume authority -------------------------------------------------------
+#
+# Under the dashboard's OWN authentication boundary (``web_server._require_token``:
+# a verified session in gated mode, the dashboard token in loopback). No new
+# credential, no new gate. The granting identity comes from that verified
+# session; ``issued_by`` is never accepted from a request body, because a caller
+# naming itself is not authority.
+
+
+def _operator_identity(request: "Request") -> str:
+    """Who the authenticated boundary says this is."""
+    from hermes_cli import web_server as _ws
+
+    _ws._require_token(request)
+    session = getattr(request.state, "session", None)
+    if session is None:
+        return "dashboard:loopback-token"
+    user = getattr(session, "user_id", None) or "unknown"
+    provider = getattr(session, "provider", None) or "session"
+    return f"dashboard:{provider}:{user}"
+
+
+class ResumeAuthorizeBody(BaseModel):
+    """The tuple the operator confirms, echoed back from the preview.
+
+    Every field is compared against the card as it is at issuance; the receipt
+    is refused if any of them moved while it was being reviewed.
+    """
+
+    board_identity: str
+    task_id: str
+    run_id: int
+    occurrence_event_id: int
+    pr_url: str
+    comment_digest: str
+    lifecycle: str
+    assignee: Optional[str] = None
+    workspace_kind: Optional[str] = None
+    workspace_path: Optional[str] = None
+    attest_lineage: bool = False
+
+
+@router.get("/tasks/{task_id}/resume-preview")
+def resume_preview(request: Request, task_id: str, board: Optional[str] = _BOARD_Q):
+    """Everything the operator must read before authorising a resume."""
+    _operator_identity(request)
+    from hermes_cli import kanban_resume as kr
+
+    with _board_conn(board) as (board, conn):
+        with _map_errors(409, kr.ResumeAuthorityError):
+            return kr.preview(conn, task_id)
+
+
+@router.post("/tasks/{task_id}/resume-authorize")
+def resume_authorize(request: Request, task_id: str, payload: ResumeAuthorizeBody,
+                     board: Optional[str] = _BOARD_Q):
+    """Issue one-shot authority to respawn ``task_id`` on its existing PR.
+
+    Lifts the ``active_pr`` respawn guard once and nothing else: quota and auth
+    blockers, the rate-limit cooldown, the recent-success window, dependency
+    gating, review routing and every concurrency guard keep their behaviour.
+    """
+    issued_by = _operator_identity(request)
+    from hermes_cli import kanban_resume as kr
+
+    if payload.task_id != task_id:
+        raise HTTPException(status_code=400, detail="confirmation names a different task")
+    expected = payload.model_dump(exclude={"attest_lineage"})
+    with _board_conn(board) as (board, conn):
+        with _map_errors(409, kr.ResumeAuthorityError):
+            with kbc.write_txn(conn):
+                receipt_id = kr.issue(
+                    conn, task_id, expected=expected, issued_by=issued_by,
+                    attested=bool(payload.attest_lineage))
+        return {"ok": True, "receipt_id": receipt_id, "task_id": task_id,
+                "pr_url": kr.normalize_pr_url(payload.pr_url), "issued_by": issued_by,
+                "expires_in_seconds": kr.RECEIPT_TTL_SECONDS}
 
 
 class SpecifyBody(BaseModel):

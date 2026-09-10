@@ -2157,16 +2157,14 @@ def claim_task(
             return None
         # BEFORE the reclaim, deliberately. ``_reclaim_dangling_run`` marks an
         # unfinished run terminal and clears its pid without proving its writer
-        # stopped — which is part of what the receipt's validation reads. Doing
+        # stopped — which is exactly what the receipt's writer check reads. Doing
         # it first would erase the disqualifying evidence and then find none.
+        lineage = None
         if resume_receipt_id is not None:
-            from hermes_cli import kanban_db_dispatch as _kbd
             from hermes_cli import kanban_resume as _resume
 
-            if not _resume.consume(
-                conn, int(resume_receipt_id), task_id,
-                window_seconds=_kbd._RESPAWN_GUARD_PR_WINDOW, now=now,
-            ):
+            lineage = _resume.consume(conn, int(resume_receipt_id), task_id, now=now)
+            if lineage is None:
                 _append_event(
                     conn, task_id, "claim_rejected",
                     {"reason": "resume_authority_invalid", "receipt_id": int(resume_receipt_id)},
@@ -2179,13 +2177,16 @@ def claim_task(
         run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
         if run_id is None:
             return None
-        if resume_receipt_id is not None:
+        if lineage is not None:
             from hermes_cli import kanban_resume as _resume
 
             _resume.attach_run(conn, int(resume_receipt_id), run_id)
             _append_event(
                 conn, task_id, "resumed_on_authority",
-                {"receipt_id": int(resume_receipt_id), "run_id": run_id}, run_id=run_id,
+                {"receipt_id": lineage["receipt_id"], "run_id": run_id,
+                 "pr_url": lineage["pr_url"],
+                 "predecessor_run_id": lineage["predecessor_run_id"]},
+                run_id=run_id,
             )
         claimed = get_task(conn, task_id)
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
@@ -3613,8 +3614,33 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
+    _ctx_resume_lineage(lines, conn, task)
     _ctx_comments(lines, list_comments(conn, task_id), now)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _ctx_resume_lineage(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
+    """State the authorised PR outright when this run exists because of a receipt.
+
+    Comments are tail-capped and char-capped, so the PR this run was authorised
+    to continue can be absent from the rendering below — and a successor that
+    cannot see it opens a second PR, which is the whole failure the guard exists
+    to prevent.
+    """
+    if task.current_run_id is None:
+        return
+    from hermes_cli import kanban_resume as _resume
+
+    lineage = _resume.lineage_for_run(conn, task.id, task.current_run_id)
+    if lineage is None:
+        return
+    lines.append("## Authorised resume")
+    lines.append(
+        f"This run continues the EXISTING pull request {lineage['pr_url']} "
+        f"(predecessor run {lineage['predecessor_run_id']}, authorised by "
+        f"{lineage['issued_by']}).")
+    lines.append("Push to that pull request's branch. Do NOT open a new one.")
+    lines.append("")
 
 
 def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:

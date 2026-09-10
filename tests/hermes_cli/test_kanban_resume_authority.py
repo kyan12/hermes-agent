@@ -17,6 +17,7 @@ second PR appearing, a writer still running — and each must refuse.
 
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
@@ -28,7 +29,6 @@ from hermes_cli import kanban_resume as kr
 
 PR = "https://github.com/NousResearch/hermes-agent/pull/4242"
 OTHER_PR = "https://github.com/NousResearch/hermes-agent/pull/9999"
-WINDOW = kbd._RESPAWN_GUARD_PR_WINDOW
 
 
 @pytest.fixture
@@ -62,9 +62,17 @@ def _finished_run(conn, task_id: str, *, outcome: str = "crashed") -> int:
     return int(cur.lastrowid)
 
 
-def _issue(conn, task_id, run_id, pr=PR, **kw):
-    return kr.issue(conn, task_id, run_id=run_id, pr_url=pr,
-                    issued_by="operator:test", window_seconds=WINDOW, **kw)
+def _issue(conn, task_id, run_id=None, pr=PR, *, attested=True, mutate=None, **kw):
+    """Issue the way the authenticated surface does: preview, then confirm it."""
+    expected = dict(kr.preview(conn, task_id)["expected"])
+    if run_id is not None:
+        expected["run_id"] = run_id
+    if pr is not None:
+        expected["pr_url"] = pr
+    if mutate:
+        expected.update(mutate)
+    return kr.issue(conn, task_id, expected=expected,
+                    issued_by="dashboard:test:operator", attested=attested, **kw)
 
 
 # --- the guard this authorises ----------------------------------------------
@@ -166,13 +174,13 @@ def test_another_tasks_run_cannot_be_authorised(board):
     task_id, _ = _parked_on_a_pr(board)
     other_id = kb.create_task(board, title="unrelated", assignee="a")
     other_run = _finished_run(board, other_id)
-    with pytest.raises(kr.ResumeAuthorityError, match="does not belong"):
+    with pytest.raises(kr.ResumeAuthorityError, match="run_id"):
         _issue(board, task_id, other_run)
 
 
 def test_a_pr_the_task_never_mentioned_cannot_be_authorised(board):
     task_id, run_id = _parked_on_a_pr(board)
-    with pytest.raises(kr.ResumeAuthorityError, match="not among"):
+    with pytest.raises(kr.ResumeAuthorityError, match="confirmation named"):
         _issue(board, task_id, run_id, pr=OTHER_PR)
 
 
@@ -189,7 +197,7 @@ def test_a_task_with_no_pr_evidence_cannot_be_authorised(board):
     task_id = kb.create_task(board, title="no pr", assignee="a")
     run_id = _finished_run(board, task_id)
     board.execute("UPDATE tasks SET status='ready', current_run_id=NULL WHERE id=?", (task_id,))
-    with pytest.raises(kr.ResumeAuthorityError, match="no recent pull-request"):
+    with pytest.raises(kr.ResumeAuthorityError, match="no pull request"):
         _issue(board, task_id, run_id, pr=PR)
 
 
@@ -228,7 +236,7 @@ def test_an_expired_receipt_is_not_authority(board):
     task_id, run_id = _parked_on_a_pr(board)
     _issue(board, task_id, run_id, ttl_seconds=1)
     later = int(time.time()) + 60
-    assert kr.exempt_reason(board, task_id, window_seconds=WINDOW, now=later) is None
+    assert kr.exempt_reason(board, task_id, now=later) is None
 
 
 def test_a_revoked_receipt_is_not_authority(board):
@@ -356,108 +364,160 @@ def test_a_normal_claim_is_unchanged_by_the_receipt_parameter(board):
     assert kb.claim_task(board, task_id) is not None
 
 
-# --- the operator surface ----------------------------------------------------
+# --- claim-time revalidation (review findings 1 and 2) -----------------------
+
+def test_an_intervening_writer_refuses_the_claim_without_touching_evidence(board):
+    """A writer arriving after issuance must refuse the claim on its own.
+
+    Deliberately no new PR comment: an evidence change would refuse for a
+    different reason and hide whether the writer was ever looked at.
+    """
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    board.execute(
+        "INSERT INTO task_runs (task_id, status, started_at, worker_pid) "
+        "VALUES (?, 'running', ?, ?)", (task_id, int(time.time()), os.getpid()))
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+
+
+def test_a_newer_terminal_run_refuses_the_claim(board):
+    """The receipt names one attempt; a later one is a different situation."""
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    _finished_run(board, task_id)
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+
+
+def test_the_authorized_run_becoming_unfinished_refuses_the_claim(board):
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    board.execute("UPDATE task_runs SET ended_at = NULL WHERE id = ?", (run_id,))
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+
+
+def test_a_live_pid_on_a_terminal_run_refuses_issuance(board):
+    """Terminal bookkeeping does not prove the process stopped."""
+    task_id, run_id = _parked_on_a_pr(board)
+    board.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (os.getpid(), run_id))
+    with pytest.raises(kr.ResumeAuthorityError, match="still running"):
+        _issue(board, task_id, run_id)
+
+
+def test_an_unclassifiable_pid_refuses_issuance(board, monkeypatch):
+    """Unknown is not clear."""
+    task_id, run_id = _parked_on_a_pr(board)
+    board.execute("UPDATE tasks SET worker_pid = 424242 WHERE id = ?", (task_id,))
+    monkeypatch.setattr(kr, "_pid_is_running", lambda pid: None)
+    with pytest.raises(kr.ResumeAuthorityError, match="could not be classified"):
+        _issue(board, task_id, run_id)
+
+
+def test_a_dead_pid_does_not_block_issuance(board, monkeypatch):
+    task_id, run_id = _parked_on_a_pr(board)
+    board.execute("UPDATE tasks SET worker_pid = 424242 WHERE id = ?", (task_id,))
+    monkeypatch.setattr(kr, "_pid_is_running", lambda pid: False)
+    assert _issue(board, task_id, run_id) > 0
+
+
+# --- content and occurrence binding (review finding 3) -----------------------
+
+def test_editing_a_comment_body_invalidates_the_receipt(board):
+    """The digest covers full content, not just the URL it contains.
+
+    "opened <PR>" and "DO NOT RESUME <PR>" are the same URL and opposite
+    instructions.
+    """
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    board.execute("UPDATE task_comments SET body = ? WHERE task_id = ?",
+                  (f"DO NOT RESUME {PR}", task_id))
+    assert kr.exempt_reason(board, task_id) is None
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+
+
+def test_a_non_pr_comment_is_part_of_the_binding(board):
+    """A comment with no URL still changes what the operator agreed to."""
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    kb.add_comment(board, task_id, "human", "hold off, the design changed")
+    assert kr.exempt_reason(board, task_id) is None
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+
+
+def test_an_older_run_cannot_be_authorized(board):
+    """Only the latest terminal attempt, resolved by id."""
+    task_id, older = _parked_on_a_pr(board)
+    _finished_run(board, task_id)
+    with pytest.raises(kr.ResumeAuthorityError, match="run_id"):
+        _issue(board, task_id, older)
+
+
+def test_a_block_unblock_cycle_invalidates_the_receipt(board):
+    """A new occurrence is a new situation; the receipt bound the old one."""
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    kb._append_event(board, task_id, "unblocked", {"status": "ready"})
+    assert kr.exempt_reason(board, task_id) is None
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+
+
+def test_a_lifecycle_or_assignee_change_invalidates_the_receipt(board):
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    board.execute("UPDATE tasks SET assignee = 'someone-else' WHERE id = ?", (task_id,))
+    assert kr.exempt_reason(board, task_id) is None
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+
+
+def test_issuance_requires_an_explicit_lineage_attestation(board):
+    task_id, run_id = _parked_on_a_pr(board)
+    with pytest.raises(kr.ResumeAuthorityError, match="attestation"):
+        _issue(board, task_id, run_id, attested=False)
+
+
+def test_a_confirmation_naming_another_board_is_refused(board):
+    task_id, run_id = _parked_on_a_pr(board)
+    with pytest.raises(kr.ResumeAuthorityError, match="board_identity"):
+        _issue(board, task_id, run_id, mutate={"board_identity": "/elsewhere/kanban.db"})
+
+
+def test_a_running_card_has_no_preview(board):
+    """No transition is manufactured to make a card resumable."""
+    task_id, _ = _parked_on_a_pr(board)
+    board.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,))
+    with pytest.raises(kr.ResumeAuthorityError, match="running"):
+        kr.preview(board, task_id)
+
+
+# --- the successor's own instructions (review finding 5) ---------------------
+
+def test_the_resumed_worker_is_told_which_pr_it_continues(board):
+    """Comments are tail- and char-capped, so the URL can vanish from context."""
+    task_id, run_id = _parked_on_a_pr(board)
+    receipt = _issue(board, task_id, run_id)
+    claimed = kb.claim_task(board, task_id, resume_receipt_id=receipt)
+    assert claimed is not None
+    context = kb.build_worker_context(board, task_id)
+    assert PR in context
+    assert "Do NOT open a new one." in context
+
+
+def test_an_ordinary_run_says_nothing_about_resume_lineage(board):
+    task_id = kb.create_task(board, title="ordinary", assignee="a")
+    board.execute("UPDATE tasks SET status='ready', current_run_id=NULL WHERE id=?", (task_id,))
+    assert kb.claim_task(board, task_id) is not None
+    assert "Authorised resume" not in kb.build_worker_context(board, task_id)
+
+
+# --- the authenticated operator surface (review finding 6) -------------------
 #
-# Authority comes from *who is running the command*, not from a field in a
-# request. The CLI is orchestrator-only (a worker carries HERMES_KANBAN_TASK and
-# is refused), and the granting identity is the active profile.
+# Authority is the dashboard's existing authentication boundary. There is no CLI
+# issuance path: absence of a worker environment marker is not operator consent,
+# and a process deny-list is not authentication.
 
-def _run_cli(argv, monkeypatch, db_path):
-    """Drive the real argparse tree and the real handler table."""
-    import argparse
-
+def test_there_is_no_cli_issuance_path():
     from hermes_cli import kanban as kcli
-    from hermes_cli.kanban_parser import build_parser
+    from hermes_cli import kanban_parser
 
-    monkeypatch.setattr(kb, "kanban_db_path", lambda **kw: db_path)
-    root = argparse.ArgumentParser()
-    build_parser(root.add_subparsers(dest="command"))
-    args = root.parse_args(["kanban", *argv])
-    return kcli._HANDLERS[args.kanban_action](args)
-
-
-@pytest.fixture
-def cli_board(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    db_path = tmp_path / "kanban.db"
-    monkeypatch.setattr(kb, "kanban_db_path", lambda **kw: db_path)
-    kb.init_db()
-    return db_path
-
-
-def test_the_cli_authorises_a_parked_card(cli_board, monkeypatch, capsys):
-    conn = kbc.connect(cli_board)
-    try:
-        task_id, run_id = _parked_on_a_pr(conn)
-        assert kbd.evaluate_respawn_guard(conn, task_id).reason == "active_pr"
-    finally:
-        conn.close()
-
-    rc = _run_cli(["authorize-resume", task_id, "--run", str(run_id), "--pr", PR],
-                  monkeypatch, cli_board)
-    assert rc == 0
-    assert "receipt" in capsys.readouterr().out
-
-    conn = kbc.connect(cli_board)
-    try:
-        decision = kbd.evaluate_respawn_guard(conn, task_id)
-        assert decision.reason is None and decision.resume_receipt_id is not None
-        issued_by = conn.execute(
-            "SELECT issued_by FROM task_resume_receipts WHERE task_id = ?", (task_id,)
-        ).fetchone()["issued_by"]
-        assert issued_by, "the receipt recorded no granting identity"
-    finally:
-        conn.close()
-
-
-def test_a_worker_cannot_authorise_its_own_respawn(cli_board, monkeypatch):
-    """The one identity that must never hold this authority is the card itself."""
-    conn = kbc.connect(cli_board)
-    try:
-        task_id, run_id = _parked_on_a_pr(conn)
-    finally:
-        conn.close()
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
-
-    rc = _run_cli(["authorize-resume", task_id, "--run", str(run_id), "--pr", PR],
-                  monkeypatch, cli_board)
-    assert rc != 0
-
-    conn = kbc.connect(cli_board)
-    try:
-        assert conn.execute("SELECT COUNT(*) FROM task_resume_receipts").fetchone()[0] == 0
-        assert kbd.evaluate_respawn_guard(conn, task_id).reason == "active_pr"
-    finally:
-        conn.close()
-
-
-def test_the_cli_refusal_leaves_the_card_untouched(cli_board, monkeypatch, capsys):
-    """A refused authorisation writes nothing — no receipt, no comment, no event."""
-    conn = kbc.connect(cli_board)
-    try:
-        task_id, run_id = _parked_on_a_pr(conn)
-        events_before = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0]
-    finally:
-        conn.close()
-
-    rc = _run_cli(["authorize-resume", task_id, "--run", str(run_id), "--pr", OTHER_PR],
-                  monkeypatch, cli_board)
-    assert rc != 0
-
-    conn = kbc.connect(cli_board)
-    try:
-        assert conn.execute("SELECT COUNT(*) FROM task_resume_receipts").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id = ?",
-            (task_id,)).fetchone()[0] == events_before
-    finally:
-        conn.close()
-
-
-def test_a_delegated_child_is_denied_the_command():
-    """Delegated children are denied at the command boundary, before any board read."""
-    from hermes_cli import kanban as kcli
-
-    assert "authorize-resume" in kcli._DELEGATED_CHILD_DENIED_ACTIONS
+    assert "authorize-resume" not in kcli._HANDLERS
+    assert "authorize-resume" not in str(kanban_parser._SPECS)
