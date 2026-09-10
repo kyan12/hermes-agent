@@ -44,11 +44,21 @@ def board(tmp_path, monkeypatch):
 
 
 def _parked_on_a_pr(conn, *, pr: str = PR) -> tuple[str, int]:
-    """A task whose worker opened ``pr`` and then died: run ended, task ready."""
+    """A task whose worker opened ``pr`` and then died: run ended, task ready.
+
+    The card owns a worktree and a branch, because that is what a worker that
+    got as far as opening a pull request has. Ownership is no longer inferred
+    from the comment alone (``kanban_pr_association``): prose on a card with no
+    branch of its own is somebody else's link, and holds nothing.
+    """
     task_id = kb.create_task(conn, title="mid-PR crash", assignee="a")
     run_id = _finished_run(conn, task_id)
     kb.add_comment(conn, task_id, "worker", f"opened {pr}")
-    conn.execute("UPDATE tasks SET status = 'ready', current_run_id = NULL WHERE id = ?", (task_id,))
+    conn.execute(
+        "UPDATE tasks SET status = 'ready', current_run_id = NULL, "
+        "workspace_kind = 'worktree', branch_name = ? WHERE id = ?",
+        (f"wt/{task_id}", task_id),
+    )
     return task_id, run_id
 
 
@@ -274,7 +284,10 @@ def test_a_receipt_from_another_board_is_not_visible(tmp_path, monkeypatch):
         task_b = kb.create_task(conn_b, title="mid-PR crash", assignee="a")
         _finished_run(conn_b, task_b)
         kb.add_comment(conn_b, task_b, "worker", f"opened {PR}")
-        conn_b.execute("UPDATE tasks SET status='ready', current_run_id=NULL WHERE id=?", (task_b,))
+        conn_b.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "workspace_kind='worktree', branch_name=? WHERE id=?",
+            (f"wt/{task_b}", task_b))
         assert kbd.evaluate_respawn_guard(conn_b, task_b).reason == "active_pr"
     finally:
         conn_a.close()

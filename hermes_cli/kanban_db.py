@@ -849,6 +849,7 @@ class Event:
 # --- Schema ---
 
 from hermes_cli import kanban_resume as _kanban_resume  # noqa: E402
+from hermes_cli import kanban_pr_reconcile as _kanban_reconcile  # noqa: E402
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -1046,7 +1047,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
-""" + _kanban_resume.SCHEMA_SQL
+""" + _kanban_resume.SCHEMA_SQL + _kanban_reconcile.SCHEMA_SQL
 
 
 # --- ID generation ---
@@ -3645,16 +3646,31 @@ def _ctx_resume_lineage(lines: list[str], conn: sqlite3.Connection, task: Task) 
     if task.current_run_id is None:
         return
     from hermes_cli import kanban_resume as _resume
+    from hermes_cli import kanban_pr_reconcile as _resume_reconcile
 
     lineage = _resume.lineage_for_run(conn, task.id, task.current_run_id)
     if lineage is None:
         return
+    mode = _resume._optional(lineage, "continuation_mode")
     lines.append("## Authorised resume")
-    lines.append(
-        f"This run continues the EXISTING pull request {lineage['pr_url']} "
-        f"(predecessor run {lineage['predecessor_run_id']}, authorised by "
-        f"{lineage['issued_by']}).")
-    lines.append("Push to that pull request's branch. Do NOT open a new one.")
+    if mode == _resume_reconcile.MERGED_CLOSEOUT:
+        # A merged PR has no branch left to push to, and the merge is not the
+        # finish line: acceptance, deploy and closeout are still outstanding.
+        lines.append(
+            f"This run continues work whose pull request {lineage['pr_url']} is "
+            f"already MERGED (predecessor run {lineage['predecessor_run_id']}, "
+            f"authorised by {lineage['issued_by']}).")
+        lines.append(
+            "Finish the remaining deploy/acceptance/closeout work only. The merge "
+            "does not complete this task, and it is not a substitute for the "
+            "task's own completion evidence. Do not reopen or re-push that pull "
+            "request; if new code is genuinely needed, that is a new change.")
+    else:
+        lines.append(
+            f"This run continues the EXISTING pull request {lineage['pr_url']} "
+            f"(predecessor run {lineage['predecessor_run_id']}, authorised by "
+            f"{lineage['issued_by']}).")
+        lines.append("Push to that pull request's branch. Do NOT open a new one.")
     lines.append("")
 
 

@@ -67,10 +67,11 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
-_RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
-    re.IGNORECASE,
-)
+# Reconciliations attempted per tick. Each one is a bounded set of authenticated
+# requests, and a tick that spent its whole budget on pull requests would starve
+# every other lane; the rest are picked up next tick under their own backoff.
+MAX_RECONCILE_PER_TICK = 2
+
 
 
 @dataclass
@@ -122,7 +123,8 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
-    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    within guard window), ``"active_pr"`` (the task owns a pull request that
+    could not be reconciled into an authorised resume this tick)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -1152,7 +1154,9 @@ def _respawn_guard_reason(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
+    (the task OWNS a pull request — structured provenance, or a mention plus its
+    own branch; re-spawning risks a duplicate PR. A PR URL quoted or reposted
+    onto a card that owns no branch is not ownership and holds nothing). The review
     lane skips the last two: they are the *inputs* to a review handoff. Stale /
     dead claim locks are NOT a guard reason — the reclaim passes own those.
     """
@@ -1220,14 +1224,15 @@ def _respawn_guard_reason(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    # 4. A pull request this task actually owns — re-spawning risks a duplicate.
+    #    Ownership is structured provenance (contract / published_pr /
+    #    acceptance receipt), or a mention plus a checkout whose branch GitHub
+    #    can be asked about. A PR URL quoted, reposted or cited in prose on a
+    #    card that owns no branch is somebody else's link and holds nothing.
+    if _kb_assoc.classify(
+        conn, task_id, window_seconds=_RESPAWN_GUARD_PR_WINDOW, now=now,
+    ) != _kb_assoc.UNASSOCIATED:
+        return "active_pr"
 
     return None
 
@@ -1237,9 +1242,9 @@ def check_respawn_guard(
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
-    Reports the guard's own verdict, with no regard for operator authority: a
-    task parked on an open pull request answers ``"active_pr"`` even when a
-    resume receipt exists for it. Whether that verdict is *overridden* is
+    Reports the guard's own verdict, with no regard for authority: a task parked
+    on an open pull request answers ``"active_pr"`` even when a resume receipt
+    (operator-attested or dispatcher-reconciled) exists for it. Whether that verdict is *overridden* is
     :func:`evaluate_respawn_guard`'s question, and only the spawn path asks it —
     so this stays the plain "is this task held, and why" predicate that
     diagnostics and tests read.
@@ -1252,10 +1257,13 @@ def evaluate_respawn_guard(
 ) -> GuardDecision:
     """The guard's verdict, plus the operator authority (if any) that lifts it.
 
-    Only ``active_pr`` is liftable, and only by an explicit single-use receipt
-    (``hermes_cli.kanban_resume``). Every other reason is returned untouched: a
-    receipt is not a force flag, and it cannot make a rate-limited, quota-blocked
-    or dependency-gated task eligible.
+    Only ``active_pr`` is liftable, and only by a single-use receipt
+    (``hermes_cli.kanban_resume``) — either an operator's attestation or the
+    dispatcher's own reconciliation (:func:`_reconcile_active_pr`). Every other
+    reason is returned untouched: a receipt is not a force flag, and it cannot
+    make a rate-limited, quota-blocked or dependency-gated task eligible. That
+    ordering is why reconciliation never runs for a quota-blocked card — it
+    never sees ``active_pr`` in the first place.
 
     The receipt id travels back to the caller so ``claim_task`` can spend it in
     the same transaction that opens the run. Returning a bare ``None`` here
@@ -1274,6 +1282,65 @@ def evaluate_respawn_guard(
     if receipt_id is None:
         return GuardDecision("active_pr", None)
     return GuardDecision(None, receipt_id)
+
+
+def _reconcile_active_pr(
+    conn: sqlite3.Connection, task_id: str, *, lane: str,
+    budget: Optional[dict[str, int]] = None,
+) -> GuardDecision:
+    """Try to turn an ``active_pr`` hold into an authorised resume, or keep it.
+
+    This is the "no click" path. It never *weakens* the hold: the only way out
+    is a receipt issued from an observation that proved the pull request is this
+    task's and still continuable, and that receipt is re-validated and spent
+    inside ``claim_task`` like any other.
+
+    Failure here is ordinary. An unreachable API, a closed pull request or an
+    ambiguous card leaves ``active_pr`` exactly where it was, records a
+    classified attempt with a backoff, and touches no failure counter — a pull
+    request we could not read is not a task that failed.
+    """
+    if budget is not None and budget.get("left", 0) <= 0:
+        return GuardDecision("active_pr", None)
+    try:
+        snapshot = _kb_reconcile.capture(
+            conn, task_id, window_seconds=_RESPAWN_GUARD_PR_WINDOW)
+    except _kb_resume.ResumeAuthorityError:
+        # Not in a position to resume at all (running, no terminal run, gone).
+        return GuardDecision("active_pr", None)
+    if not _kb_reconcile.due(conn, snapshot):
+        return GuardDecision("active_pr", None)
+    if budget is not None:
+        budget["left"] = budget.get("left", 0) - 1
+
+    observation = _kb_reconcile.observe(
+        snapshot,
+        deadline=time.time() + _kb_reconcile.TOTAL_DEADLINE_SECONDS,
+        principal=_reconcile_principal(),
+    )
+    receipt_id = _kb_reconcile.admit(conn, snapshot, observation)
+    if receipt_id is None:
+        _kb_reconcile.record_unresolved(conn, snapshot, observation)
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task_id, "pr_reconcile", {
+                "classification": observation.classification,
+                "pr_url": observation.pr_url,
+                "detail": observation.detail,
+                "recovery": observation.recovery,
+            })
+        return GuardDecision("active_pr", None)
+    # Re-ask the guard rather than trusting the id: between admission and here
+    # the receipt could already have been invalidated by a new comment.
+    return evaluate_respawn_guard(conn, task_id, lane=lane)
+
+
+def _reconcile_principal() -> str:
+    """The dispatcher's own execution identity, for the receipt's audit trail.
+
+    Never a task field or a request body: those are worker-supplied, and a
+    worker naming its own granting identity is not authentication.
+    """
+    return f"hermes:dispatcher:{os.getpid()}"
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
@@ -1562,6 +1629,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    reconcile_budget: Optional[dict[str, int]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -1584,6 +1652,13 @@ def _dispatch_lane_task(
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
     decision = evaluate_respawn_guard(conn, task_id, lane=lane)
+    if decision.reason == "active_pr" and not dry_run:
+        # The card is held on a pull request it owns. Ask GitHub whether that
+        # PR is still open on this task's own branch and head, and resume it if
+        # so. A dry run deliberately never gets here: a preview must not spend
+        # an authenticated request budget or issue authority.
+        decision = _reconcile_active_pr(
+            conn, task_id, lane=lane, budget=reconcile_budget)
     guard_reason = decision.reason
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -1881,6 +1956,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        reconcile_budget={"left": MAX_RECONCILE_PER_TICK},
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2418,3 +2494,5 @@ from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
 from hermes_cli import kanban_resume as _kb_resume  # noqa: E402
+from hermes_cli import kanban_pr_association as _kb_assoc  # noqa: E402
+from hermes_cli import kanban_pr_reconcile as _kb_reconcile  # noqa: E402

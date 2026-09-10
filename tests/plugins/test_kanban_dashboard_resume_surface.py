@@ -75,7 +75,12 @@ def parked():
             "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome) "
             "VALUES (?, 'crashed', ?, ?, 'crashed')", (task_id, now - 600, now - 300))
         kb.add_comment(conn, task_id, "worker", f"opened {PR}")
-        conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL WHERE id=?", (task_id,))
+        # A worker that got as far as opening a PR owns a worktree and a branch;
+        # the guard reads ownership from that, not from the comment alone.
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "workspace_kind='worktree', branch_name=? WHERE id=?",
+            (f"wt/{task_id}", task_id))
         assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
         return task_id
     finally:

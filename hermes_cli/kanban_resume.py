@@ -1,22 +1,35 @@
-"""Explicit, single-use authority to resume ONE task on ONE existing pull request.
+"""Single-use authority to resume ONE task on ONE existing pull request.
 
-The dispatcher refuses to respawn a task whose recent comments carry a GitHub PR
-URL (``check_respawn_guard`` -> ``"active_pr"``). Without that guard a crashed
+The dispatcher refuses to respawn a task that owns a pull request
+(``check_respawn_guard`` -> ``"active_pr"``). Without that guard a crashed
 worker's successor opens a second PR for the same work. With it, a worker that
 died mid-PR parks its card forever.
 
-A receipt is the narrow exit. It bypasses ``active_pr`` and nothing else, and it
-is authority only because an authenticated operator confirmed an exact snapshot:
+A receipt is the narrow exit. It bypasses ``active_pr`` and nothing else. There
+are two ways to earn one, and they are kept apart on purpose:
+
+``attested``
+    An authenticated operator confirmed an exact snapshot (below). This is the
+    original path and it is unchanged.
+``reconciled``
+    The dispatcher's own principal verified against GitHub that the pull request
+    is open (or merged) on this task's own branch and head — see
+    :mod:`hermes_cli.kanban_pr_reconcile` and :func:`issue_reconciled`. Routine
+    recovery must not require a human to click through an attestation, but a
+    machine decision must never be *recorded* as one.
+
+Either way the receipt names the same exact snapshot:
 
     board identity, task, latest terminal run BY ID, current occurrence, current
     lifecycle/assignee/workspace, the PR, and a digest of every comment's full
     content.
 
-Provenance is **attested, not reconstructed**. ``task_comments`` has no run id,
-so comment ownership by a historical run cannot be proven and is not claimed.
-The operator states, now, that this PR is the continuation target for this run
-and this occurrence, having seen this exact comment set. Legacy evidence without
-that explicit binding stays refused.
+Provenance is never **reconstructed from prose**. ``task_comments`` has no run
+id, so comment ownership by a historical run cannot be proven and is not
+claimed. An operator states, now, that this PR is the continuation target for
+this run and this occurrence, having seen this exact comment set; the reconciler
+instead proves it from structured provenance or from the branch and head of the
+task's own checkout. Neither reads ownership out of who a comment says wrote it.
 
 The whole snapshot and the writer state are revalidated inside the claim
 transaction, before any run is reclaimed.
@@ -67,11 +80,38 @@ CREATE TABLE IF NOT EXISTS task_resume_receipts (
     expires_at          INTEGER NOT NULL,
     consumed_at         INTEGER,
     consumed_run_id     INTEGER,
-    revoked_at          INTEGER
+    revoked_at          INTEGER,
+    -- 'attested' (an operator confirmed this exact tuple) or 'reconciled' (the
+    -- dispatcher's own principal verified the pull request against the task's
+    -- checkout). Kept apart on purpose: automatic authority must never be
+    -- readable as a human attestation in an audit.
+    authority_kind      TEXT NOT NULL DEFAULT 'attested',
+    -- Versioned JSON evidence for a reconciled receipt; NULL when attested.
+    reconciliation      TEXT,
+    -- 'resume_open_pr' or 'merged_closeout'. NULL = ordinary resume.
+    continuation_mode   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_resume_receipts_task
     ON task_resume_receipts(task_id, consumed_at, revoked_at);
 """
+
+
+# ``CREATE TABLE IF NOT EXISTS`` does nothing to a board that already has the
+# table, so boards created before these columns existed need them added
+# explicitly. ``kanban_db_connect._migrate_add_optional_columns`` reads this.
+ADDITIVE_RECEIPT_COLUMNS = (
+    ("authority_kind", "authority_kind TEXT NOT NULL DEFAULT 'attested'"),
+    ("reconciliation", "reconciliation TEXT"),
+    ("continuation_mode", "continuation_mode TEXT"),
+)
+
+ATTESTED = "attested"
+RECONCILED = "reconciled"
+
+# A reconciled receipt is only as good as the observation behind it, and remote
+# state moves. Much shorter than the attested TTL: the dispatcher re-observes
+# rather than leaning on a stale look.
+RECONCILED_TTL_SECONDS = 300
 
 
 class ResumeAuthorityError(Exception):
@@ -244,8 +284,16 @@ def writer_state(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[s
     return None
 
 
-def snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
-    """The exact tuple a receipt binds. Raises when the card cannot be resumed."""
+def base_snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """Everything a receipt binds except the pull request itself.
+
+    The PR comes from different places depending on who is asking: an operator
+    confirms the one their card's comments name, while the dispatcher resumes
+    the one the card's structured provenance (or its own branch) proves. The
+    board, run, occurrence, comment digest, lifecycle and workspace binding are
+    identical for both, and are the reason a receipt stops being authority the
+    moment any of them moves.
+    """
     task = conn.execute(
         "SELECT status, assignee, workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
@@ -260,7 +308,30 @@ def snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     if run is None:
         raise ResumeAuthorityError(f"task {task_id} has no finished run to resume")
     entries = comments(conn, task_id)
-    urls = pr_urls(entries)
+    return {
+        "board_identity": board_identity(conn),
+        "task_id": task_id,
+        "run_id": int(run["id"]),
+        "run_profile": run["profile"],
+        "run_outcome": run["outcome"],
+        "occurrence_event_id": latest_occurrence_event_id(conn, task_id),
+        "comment_digest": comment_digest(entries),
+        "comments": entries,
+        "lifecycle": task["status"],
+        "assignee": task["assignee"],
+        "workspace_kind": task["workspace_kind"],
+        "workspace_path": task["workspace_path"],
+    }
+
+
+def snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """The exact tuple an ATTESTED receipt binds, PR taken from the comments.
+
+    Unchanged: the operator surface confirms what it can see, and what it can
+    see is the card's comments.
+    """
+    current = base_snapshot(conn, task_id)
+    urls = pr_urls(current["comments"])
     if not urls:
         raise ResumeAuthorityError(
             f"task {task_id} references no pull request; the guard this "
@@ -270,21 +341,20 @@ def snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
             "this task references more than one pull request "
             f"({', '.join(sorted(urls))}); a receipt exempts one lineage and "
             "would leave the others unexamined")
-    return {
-        "board_identity": board_identity(conn),
-        "task_id": task_id,
-        "run_id": int(run["id"]),
-        "run_profile": run["profile"],
-        "run_outcome": run["outcome"],
-        "occurrence_event_id": latest_occurrence_event_id(conn, task_id),
-        "pr_url": next(iter(urls)),
-        "comment_digest": comment_digest(entries),
-        "comments": entries,
-        "lifecycle": task["status"],
-        "assignee": task["assignee"],
-        "workspace_kind": task["workspace_kind"],
-        "workspace_path": task["workspace_path"],
-    }
+    return {**current, "pr_url": next(iter(urls))}
+
+
+def reconciled_snapshot(
+    conn: sqlite3.Connection, task_id: str, *, pr_url: str,
+) -> dict[str, Any]:
+    """The tuple a RECONCILED receipt binds, PR supplied by the reconciler.
+
+    The caller has already proved ownership of ``pr_url`` from structured
+    provenance or from this task's own branch and head; prose is not consulted
+    for identity here, only bound (via the comment digest) so that a comment
+    arriving mid-flight still invalidates the authority.
+    """
+    return {**base_snapshot(conn, task_id), "pr_url": normalize_pr_url(pr_url)}
 
 
 _BOUND_FIELDS = ("board_identity", "task_id", "run_id", "occurrence_event_id",
@@ -376,6 +446,47 @@ def issue(
     return int(cur.lastrowid)
 
 
+def issue_reconciled(
+    conn: sqlite3.Connection, task_id: str, *, pr_url: str, principal: str,
+    evidence: dict[str, Any], continuation_mode: str,
+    now: Optional[int] = None, ttl_seconds: int = RECONCILED_TTL_SECONDS,
+) -> int:
+    """Record one-shot authority derived from a verified observation, not consent.
+
+    Deliberately NOT ``issue(attested=True)``. Fabricating an operator
+    attestation for a machine decision would make the audit log lie about who
+    agreed to what, and would let a bug in the reconciler pass itself off as a
+    human. The two authorities share every binding and every refusal — board,
+    task, run, occurrence, comment digest, lifecycle, assignee, workspace,
+    writer state — and differ only in where the pull request came from and in
+    what the receipt says about itself.
+
+    ``principal`` is the dispatcher's verified execution identity. It is never
+    read off a request body or a task field.
+    """
+    now = int(time.time()) if now is None else now
+    if not principal:
+        raise ResumeAuthorityError("a reconciled receipt requires a verified principal")
+    current = reconciled_snapshot(conn, task_id, pr_url=pr_url)
+    blocked = writer_state(conn, task_id, now)
+    if blocked is not None:
+        raise ResumeAuthorityError(f"cannot authorise a resume: {blocked}")
+    cur = conn.execute(
+        "INSERT INTO task_resume_receipts "
+        "(task_id, board_identity, run_id, occurrence_event_id, pr_url, comment_digest,"
+        " lifecycle, assignee, workspace_kind, workspace_path, issued_by, issued_at,"
+        " expires_at, authority_kind, reconciliation, continuation_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, current["board_identity"], current["run_id"],
+         current["occurrence_event_id"], current["pr_url"], current["comment_digest"],
+         current["lifecycle"], current["assignee"], current["workspace_kind"],
+         current["workspace_path"], principal, now, now + int(ttl_seconds),
+         RECONCILED, json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+         continuation_mode),
+    )
+    return int(cur.lastrowid)
+
+
 def _live_receipt(conn: sqlite3.Connection, task_id: str, now: int):
     return conn.execute(
         "SELECT * FROM task_resume_receipts WHERE task_id = ? AND consumed_at IS NULL "
@@ -384,15 +495,52 @@ def _live_receipt(conn: sqlite3.Connection, task_id: str, now: int):
     ).fetchone()
 
 
+def _authority_kind(receipt) -> str:
+    """``authority_kind`` if the board has been migrated, else ``attested``.
+
+    Every receipt written before the column existed was an operator
+    attestation, so that is the only safe reading of a missing value.
+    """
+    try:
+        return receipt["authority_kind"] or ATTESTED
+    except (KeyError, IndexError):
+        return ATTESTED
+
+
 def _receipt_matches_now(conn: sqlite3.Connection, task_id: str, receipt, now: int) -> bool:
     try:
-        current = snapshot(conn, task_id)
         bound = {k: receipt[k] for k in _BOUND_FIELDS}
+        if _authority_kind(receipt) == RECONCILED:
+            # The PR was proved by provenance, not read off the comments, so the
+            # comment set no longer has to name exactly one. It still has to be
+            # unchanged (comment_digest) and the card must still own this PR --
+            # a contract rewritten to another pull request revokes the authority
+            # even though every comment stayed put.
+            current = reconciled_snapshot(conn, task_id, pr_url=receipt["pr_url"])
+            if not _still_owns(conn, task_id, current["pr_url"]):
+                return False
+        else:
+            current = snapshot(conn, task_id)
         _require_matches(current, bound)
         _require_transition_permitted(conn, task_id, current, bound)
     except (ResumeAuthorityError, KeyError, IndexError):
         return False
     return writer_state(conn, task_id, now) is None
+
+
+def _still_owns(conn: sqlite3.Connection, task_id: str, pr_url: str) -> bool:
+    """The card's structured provenance and prose still point at ``pr_url``.
+
+    Local import: ``kanban_pr_association`` is a leaf, but keeping the import
+    here documents that this module's authority rules do not depend on it for
+    anything an operator does.
+    """
+    from hermes_cli import kanban_pr_association as _assoc
+
+    urls = {a.pr_url for a in _assoc.structured_associations(conn, task_id)}
+    if urls:
+        return urls == {pr_url}
+    return pr_url in pr_urls(comments(conn, task_id))
 
 
 def exempt_reason(
@@ -444,7 +592,9 @@ def consume(
     return {"receipt_id": int(receipt["id"]), "pr_url": receipt["pr_url"],
             "predecessor_run_id": int(receipt["run_id"]),
             "occurrence_event_id": int(receipt["occurrence_event_id"]),
-            "issued_by": receipt["issued_by"]}
+            "issued_by": receipt["issued_by"],
+            "authority_kind": _authority_kind(receipt),
+            "continuation_mode": _optional(receipt, "continuation_mode")}
 
 
 def attach_run(conn: sqlite3.Connection, receipt_id: int, run_id: int) -> None:
@@ -452,10 +602,19 @@ def attach_run(conn: sqlite3.Connection, receipt_id: int, run_id: int) -> None:
                  (int(run_id), int(receipt_id)))
 
 
+def _optional(row, column: str):
+    """``row[column]`` on a board that has the column, else None."""
+    try:
+        return row[column]
+    except (KeyError, IndexError):
+        return None
+
+
 def lineage_for_run(conn: sqlite3.Connection, task_id: str, run_id: int):
     """The authority a run was opened under, for the worker's own instructions."""
     return conn.execute(
-        "SELECT pr_url, run_id AS predecessor_run_id, issued_by, consumed_at "
+        "SELECT pr_url, run_id AS predecessor_run_id, issued_by, consumed_at, "
+        "authority_kind, continuation_mode "
         "FROM task_resume_receipts WHERE task_id = ? AND consumed_run_id = ?",
         (task_id, int(run_id)),
     ).fetchone()

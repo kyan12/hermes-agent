@@ -448,8 +448,12 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
             conn, review_id, summary="PR ready",
             expected_run_id=claimed.current_run_id,
         )
-        # Ready-lane task with the same fresh PR comment.
-        ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
+        # Ready-lane task that owns the same pull request. Ownership comes from
+        # its contract, not from the comment: prose alone is a mention, and a
+        # mention no longer defers anything (``kanban_pr_association``).
+        ready_id = kb.create_task(
+            conn, title="already PRed", assignee="worker",
+            completion_contract="https://github.com/example/repo/pull/123")
         kb.add_comment(conn, ready_id, author="worker", body=pr_comment)
 
         assert kbd.check_respawn_guard(conn, ready_id) == "active_pr"

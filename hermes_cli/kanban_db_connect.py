@@ -875,6 +875,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
 
+    # Resume receipts predate their reconciliation payload. ``CREATE TABLE IF
+    # NOT EXISTS`` is a no-op on a board that already has the table, so an
+    # existing board never gains these columns without an explicit ALTER.
+    if _table_exists(conn, "task_resume_receipts"):
+        from hermes_cli.kanban_resume import ADDITIVE_RECEIPT_COLUMNS
+
+        receipt_cols = _column_names(conn, "task_resume_receipts")
+        for name, ddl in ADDITIVE_RECEIPT_COLUMNS:
+            if name not in receipt_cols:
+                _add_column_if_missing(conn, "task_resume_receipts", name, ddl)
+
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).
     if "run_id" not in _column_names(conn, "task_events"):
