@@ -2132,6 +2132,7 @@ class _ClaimLost(Exception):
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, resume_receipt_id: Optional[int] = None,
+    pr_clearance=None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2166,6 +2167,11 @@ def claim_task(
             # stopped — which is exactly what the receipt's writer check reads. Doing
             # it first would erase the disqualifying evidence and then find none.
             lineage = None
+            if pr_clearance is not None:
+                from hermes_cli.kanban_pr_reconcile import validate_clearance
+
+                if resume_receipt_id is not None or not validate_clearance(conn, task_id, pr_clearance):
+                    return None
             if resume_receipt_id is not None:
                 from hermes_cli import kanban_resume as _resume
 

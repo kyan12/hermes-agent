@@ -16,6 +16,7 @@ computed for.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -68,7 +69,11 @@ def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
     )
     conn.commit()
     kb.claim_task(conn, tid, claimer=f"{host}:B")
-    sleeper = subprocess.Popen(["sleep", "30"])
+    # EOF is an owned lifetime signal; cleanup needs no process-tree inference.
+    sleeper = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+        stdin=subprocess.PIPE,
+    )
     try:
         kbd._set_worker_pid(conn, tid, sleeper.pid)
 
@@ -89,7 +94,8 @@ def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
         assert final["status"] == "running"
         assert final["claim_lock"] == f"{host}:B"
     finally:
-        sleeper.terminate()
+        sleeper.communicate(timeout=5)
+        assert sleeper.returncode == 0
 
 
 def test_genuine_crash_still_reclaims(conn):

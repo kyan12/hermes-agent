@@ -30,6 +30,7 @@ from hermes_cli import kanban_pr_association as kba
 from hermes_cli import kanban_pr_reconcile as kpr
 
 PR = "https://github.com/NousResearch/hermes-agent/pull/4242"
+REAL_GH_API = kpr._gh_api
 OTHER_PR = "https://github.com/NousResearch/hermes-agent/pull/9999"
 
 
@@ -40,6 +41,7 @@ def board(tmp_path, monkeypatch):
     # The dispatcher refuses to spawn an assignee that is not a real profile.
     (tmp_path / "profiles" / "a").mkdir(parents=True, exist_ok=True)
     kb.init_db()
+    monkeypatch.setattr(kpr, "_gh_api", lambda endpoint, **kw: _fake_api({})(endpoint))
     conn = kbc.connect()
     try:
         yield conn
@@ -77,7 +79,8 @@ def _crashed_on_no_pr_of_its_own(conn, body: str) -> str:
                  id="unrelated_reference"),
 ])
 def test_unassociated_pr_prose_does_not_park_the_card(board, body):
-    task_id = _crashed_on_no_pr_of_its_own(board, body)
+    task_id = kb.create_task(board, title="fresh unrelated reference", assignee="a")
+    kb.add_comment(board, task_id, "worker", body)
 
     # The premise: nothing on this card claims that pull request.
     assert board.execute(
@@ -85,7 +88,7 @@ def test_unassociated_pr_prose_does_not_park_the_card(board, body):
     ).fetchone()["completion_contract"] == "local-only"
     assert board.execute(
         "SELECT metadata FROM task_runs WHERE task_id = ?", (task_id,)
-    ).fetchone()["metadata"] is None
+    ).fetchone() is None
     assert board.execute(
         "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'pr_acceptance'",
         (task_id,),
@@ -174,6 +177,7 @@ def checkout(tmp_path):
     (origin / "README").write_text("x")
     _git(origin, "add", "README")
     _git(origin, "commit", "-qm", "base")
+    _git(origin, "remote", "add", "origin", "git@github.com:NousResearch/hermes-agent.git")
     return origin
 
 
@@ -199,7 +203,7 @@ def _fake_api(payloads):
 
     def api(endpoint):
         calls.append(endpoint)
-        value = payloads.get(endpoint)
+        value = payloads.get(endpoint, {"id": 123, "login": "test-owner"} if endpoint == "user" else None)
         if isinstance(value, Exception):
             raise value
         if value is None:
@@ -331,7 +335,9 @@ def test_two_associated_pull_requests_stay_ambiguous(board, checkout):
     kb.add_comment(board, task_id, "worker", f"and {OTHER_PR}")
     snapshot = kpr.capture(board, task_id, window_seconds=86400)
     observation = kpr.observe(snapshot, deadline=time.time() + 5,
-                              principal="hermes:dispatcher", api=_fake_api({}))
+        principal="hermes:dispatcher", api=_fake_api({
+            "repos/nousresearch/hermes-agent/pulls/4242": _pr_payload(head_ref=branch, head_sha=head),
+            "repos/nousresearch/hermes-agent/pulls/9999": _pr_payload(head_ref=branch, head_sha=head)}))
     assert observation.classification == kpr.AMBIGUOUS
     assert kpr.admit(board, snapshot, observation) is None
 
@@ -352,13 +358,14 @@ def test_a_pr_this_checkout_did_not_push_is_not_this_tasks_pr(board, checkout, m
     observation = kpr.observe(snapshot, deadline=time.time() + 5,
                               principal="hermes:dispatcher", api=_fake_api(
                                   {"repos/nousresearch/hermes-agent/pulls/4242": payload}))
-    assert observation.classification == kpr.UNAVAILABLE
+    assert observation.classification == (kpr.NO_ASSOCIATED_PR if reason == "branch" else kpr.UNAVAILABLE)
     assert reason in observation.detail.lower()
     assert kpr.admit(board, snapshot, observation) is None
 
 
 def test_a_fork_head_is_not_confused_with_the_base_repository(board, checkout):
-    """A PR from a fork is still this branch's PR, and both identities persist."""
+    """A PR from a configured fork preserves both repository identities."""
+    _git(checkout, "remote", "add", "fork", "https://github.com/contributor/hermes-agent.git")
     task_id, branch, head = _mid_pr_crash(board, checkout)
     api = _fake_api({"repos/nousresearch/hermes-agent/pulls/4242": _pr_payload(
         head_ref=branch, head_sha=head, head_repo="contributor/hermes-agent")})
@@ -498,7 +505,7 @@ def test_an_unresolvable_card_stays_held_and_records_a_bounded_retry(
     state = board.execute(
         "SELECT classification, attempts, next_at FROM task_pr_reconcile_state "
         "WHERE task_id = ?", (task_id,)).fetchone()
-    assert state["classification"] == kpr.UNAVAILABLE
+    assert state["classification"] == "auth_unavailable"
     assert state["attempts"] == 1
     # An unreadable pull request is not a task failure: the breaker is untouched.
     task = board.execute(
@@ -541,7 +548,8 @@ def test_a_quota_blocked_card_is_never_reconciled(board, checkout, monkeypatch):
 
 def test_an_unassociated_card_is_never_reconciled(board, monkeypatch):
     """Nothing is held, so there is nothing to spend a request on."""
-    _crashed_on_no_pr_of_its_own(board, f"see {PR} for the pattern")
+    task_id = kb.create_task(board, title="fresh unrelated reference", assignee="a")
+    kb.add_comment(board, task_id, "worker", f"see {PR} for the pattern")
     calls = []
     monkeypatch.setattr(kpr, "_gh_api", lambda endpoint, **kw: calls.append(endpoint))
     _dispatch(board)
@@ -593,3 +601,286 @@ def test_a_board_that_predates_the_reconciliation_payload_is_migrated(tmp_path, 
             "WHERE name = 'authority_kind'").fetchone()[0] == "'attested'"
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("head_repo,base_repo,allowed", [
+    ("attacker/fork", "NousResearch/hermes-agent", False),
+    ("NousResearch/hermes-agent", "attacker/fork", False),
+    ("NousResearch/hermes-agent", "NousResearch/hermes-agent", True),
+])
+def test_remote_identity_controls_pr_ownership(board, checkout, head_repo, base_repo, allowed):
+    task_id, branch, head = _mid_pr_crash(board, checkout)
+    snapshot = kpr.capture(board, task_id, window_seconds=86400)
+    observation = kpr.observe(snapshot, deadline=time.time() + 5,
+        principal="hermes:dispatcher", api=_fake_api({
+            "repos/nousresearch/hermes-agent/pulls/4242": _pr_payload(
+                head_ref=branch, head_sha=head, head_repo=head_repo, base_repo=base_repo)}))
+    assert (observation.classification == kpr.OPEN) is allowed
+    assert (kpr.admit(board, snapshot, observation) is not None) is allowed
+
+
+@pytest.mark.parametrize("mutation", ["branch_record", "head", "remote", "spawn_head"])
+def test_resume_rechecks_checkout_at_claim_and_spawn(board, checkout, monkeypatch, mutation):
+    task_id, branch, head = _mid_pr_crash(board, checkout)
+    snapshot = kpr.capture(board, task_id, window_seconds=86400)
+    payload = _pr_payload(head_ref=branch, head_sha=head)
+    api = _fake_api({"repos/nousresearch/hermes-agent/pulls/4242": payload})
+    receipt = kpr.admit(board, snapshot, kpr.observe(snapshot,
+        deadline=time.time() + 5, principal="hermes:dispatcher", api=api))
+    assert receipt is not None
+    if mutation == "branch_record":
+        board.execute("UPDATE tasks SET branch_name='changed' WHERE id=?", (task_id,))
+    elif mutation == "remote":
+        _git(checkout, "remote", "set-url", "origin", "https://github.com/attacker/fork.git")
+    elif mutation == "head":
+        _git(snapshot.workspace_path, "commit", "--allow-empty", "-qm", "changed")
+    else:
+        original = kb.claim_task
+        def claim(*args, **kwargs):
+            task = original(*args, **kwargs)
+            _git(snapshot.workspace_path, "commit", "--allow-empty", "-qm", "changed")
+            return task
+        monkeypatch.setattr(kb, "claim_task", claim)
+        result, spawned = _dispatch(board)
+        assert spawned == []
+        assert result.spawned == []
+        return
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+    assert board.execute("SELECT consumed_at FROM task_resume_receipts WHERE id=?",
+                         (receipt,)).fetchone()[0] is None
+
+
+@pytest.mark.parametrize("writer", ["running", "claim", "terminal_pid"])
+def test_other_task_sharing_checkout_excludes_resume(board, checkout, writer):
+    task_id, branch, head = _mid_pr_crash(board, checkout)
+    snapshot = kpr.capture(board, task_id, window_seconds=86400)
+    receipt = kpr.admit(board, snapshot, kpr.observe(snapshot,
+        deadline=time.time() + 5, principal="hermes:dispatcher", api=_fake_api({
+            "repos/nousresearch/hermes-agent/pulls/4242": _pr_payload(head_ref=branch, head_sha=head)})))
+    assert receipt is not None
+    other = kb.create_task(board, title="same checkout writer", assignee="a")
+    board.execute("UPDATE tasks SET workspace_path=? WHERE id=?",
+                  (snapshot.workspace_path + "/.", other))
+    if writer == "running":
+        board.execute("UPDATE tasks SET status='running' WHERE id=?", (other,))
+    elif writer == "claim":
+        board.execute("UPDATE tasks SET claim_lock='another-worker' WHERE id=?", (other,))
+    else:
+        board.execute("INSERT INTO task_runs (task_id, status, started_at, ended_at, worker_pid) "
+                      "VALUES (?, 'crashed', ?, ?, ?)",
+                      (other, int(time.time()) - 60, int(time.time()), os.getpid()))
+    assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+    assert board.execute("SELECT consumed_at FROM task_resume_receipts WHERE id=?",
+                         (receipt,)).fetchone()[0] is None
+
+
+@pytest.mark.parametrize("cooldown", [0, 60])
+def test_expired_quota_cooldown_still_requires_pr_reconciliation(board, checkout, monkeypatch, cooldown):
+    task_id, branch, head = _mid_pr_crash(board, checkout)
+    board.execute("UPDATE task_runs SET outcome='rate_limited', ended_at=? WHERE task_id=?",
+                  (int(time.time()) - 600, task_id))
+    board.execute("UPDATE tasks SET last_failure_error='quota exhausted' WHERE id=?", (task_id,))
+    monkeypatch.setattr(kb, "_resolve_rate_limit_cooldown_seconds", lambda: cooldown)
+    assert kbd.evaluate_respawn_guard(board, task_id).reason == "active_pr"
+    monkeypatch.setattr(kpr, "_gh_api", lambda endpoint, **kw: (_ for _ in ()).throw(kpr.TransportError("offline")))
+    result, spawned = _dispatch(board)
+    assert spawned == []
+    assert board.execute("SELECT attempts FROM task_pr_reconcile_state WHERE task_id=?",
+                         (task_id,)).fetchone()[0] == 1
+
+
+# The transport must terminate its own disposable gh child at the bound.
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("case", ["deadline", "utf8_bytes"])
+def test_real_gh_transport_enforces_total_deadline_and_bytes(tmp_path, monkeypatch, case):
+    import sys
+    shim = tmp_path / "gh"
+    shim.write_text("#!" + sys.executable + "\nimport time, json\n" + (
+        "time.sleep(0.4)\nprint('{}')\n" if case == "deadline" else
+        "print(json.dumps('é' * 80, ensure_ascii=False))\n"))
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    if case == "utf8_bytes":
+        monkeypatch.setattr(kpr, "MAX_RESPONSE_BYTES", 100)
+    budget = kpr._Budget(time.time() + (0.15 if case == "deadline" else 3))
+    with pytest.raises(kpr.TransportError):
+        budget.call(kpr._gh_api, "user")
+
+
+@pytest.mark.parametrize("changed", ["checkout_head", "principal"])
+def test_retry_exhaustion_is_invalidated_by_checkout_and_principal(board, checkout, changed):
+    from dataclasses import replace
+    task_id, branch, head = _mid_pr_crash(board, checkout)
+    snapshot = kpr.capture(board, task_id, window_seconds=86400)
+    if changed == "principal":
+        # Same API used by the dispatcher to supply trusted execution identity.
+        snapshot = replace(snapshot, principal="github:123")
+    observation = kpr.observe(snapshot, deadline=time.time() + 5,
+        principal="github:123", api=_fake_api({}))
+    for attempt in range(4):
+        kpr.record_unresolved(board, snapshot, observation, now=1000 + attempt * 400)
+    assert not kpr.due(board, snapshot, now=2201)
+    if changed == "checkout_head":
+        _git(snapshot.workspace_path, "commit", "--allow-empty", "-qm", "recovered head")
+        recovered = kpr.capture(board, task_id, window_seconds=86400)
+    else:
+        recovered = replace(snapshot, principal="github:456")
+    assert kpr.due(board, recovered, now=10000)
+
+
+@pytest.mark.parametrize("boundary", ["admit_checkout", "claim_provenance"])
+def test_reconciliation_preserves_source_and_checkout_evidence(board, checkout, boundary):
+    task_id, branch, head = _mid_pr_crash(board, checkout)
+    run_id = board.execute("SELECT id FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0]
+    board.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps({"published_pr": PR}), run_id))
+    snapshot = kpr.capture(board, task_id, window_seconds=86400)
+    observation = kpr.observe(snapshot, deadline=time.time() + 5, principal="hermes:dispatcher",
+        api=_fake_api({"repos/nousresearch/hermes-agent/pulls/4242": _pr_payload(head_ref=branch, head_sha=head)}))
+    if boundary == "admit_checkout":
+        _git(snapshot.workspace_path, "commit", "--allow-empty", "-qm", "changed")
+        assert kpr.admit(board, snapshot, observation) is None
+    else:
+        receipt = kpr.admit(board, snapshot, observation)
+        assert receipt is not None
+        board.execute("UPDATE task_runs SET metadata=NULL WHERE id=?", (run_id,))
+        board.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (PR, task_id))
+        assert kb.claim_task(board, task_id, resume_receipt_id=receipt) is None
+
+
+@pytest.mark.parametrize("case", ["crashed_unknown", "fresh_quote", "recorded_dir", "recorded_scratch"])
+def test_scratch_history_requires_evidence_not_prose(board, checkout, monkeypatch, case):
+    if case == "crashed_unknown":
+        task_id = _crashed_on_no_pr_of_its_own(board, f"I opened {PR}")
+        board.execute("UPDATE task_comments SET created_at=1 WHERE task_id=?", (task_id,))
+        expected = "history_unresolved"
+    elif case == "fresh_quote":
+        task_id = kb.create_task(board, title="fresh work", assignee="a")
+        kb.add_comment(board, task_id, "worker", f"> unrelated example: {PR}")
+        board.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        assert kbd.evaluate_respawn_guard(board, task_id).reason is None
+        return
+    else:
+        task_id, branch, head = _mid_pr_crash(board, checkout)
+        board.execute("UPDATE tasks SET workspace_kind=? WHERE id=?",
+                      (case.removeprefix("recorded_"), task_id))
+        expected = None
+        monkeypatch.setattr(kpr, "_gh_api", lambda endpoint, **kw:
+                            {"id": 123} if endpoint == "user" else _pr_payload(head_ref=branch, head_sha=head))
+    result, spawned = _dispatch(board)
+    if expected:
+        assert spawned == []
+        state = board.execute("SELECT classification, next_at FROM task_pr_reconcile_state WHERE task_id=?",
+                              (task_id,)).fetchone()
+        assert state is not None and state["classification"] == expected
+        assert int(time.time()) < state["next_at"] < int(time.time()) + 600
+        assert board.execute("SELECT COUNT(*) FROM task_resume_receipts WHERE task_id=?", (task_id,)).fetchone()[0] == 0
+    else:
+        assert [t for t, _, _ in result.spawned] == [task_id]
+        assert board.execute("SELECT COUNT(*) FROM task_resume_receipts WHERE task_id=?", (task_id,)).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("case,expected", [("unrelated", "no_associated_pr"),
+    ("mixed", "open"), ("owned", "ambiguous"), ("limit", "inspection_limit")])
+def test_hint_filtering_precedes_ownership_ambiguity(board, checkout, case, expected):
+    task_id, branch, head = _mid_pr_crash(board, checkout)
+    kb.add_comment(board, task_id, "worker", f"another reference {OTHER_PR}")
+    payloads = {
+        "repos/nousresearch/hermes-agent/pulls/4242": _pr_payload(head_ref=branch if case != "unrelated" else "elsewhere", head_sha=head),
+        "repos/nousresearch/hermes-agent/pulls/9999": _pr_payload(head_ref=branch if case == "owned" else "elsewhere", head_sha=head),
+    }
+    if case == "limit":
+        for number in range(10, 10 + kpr.MAX_REQUESTS):
+            kb.add_comment(board, task_id, "worker", f"https://github.com/NousResearch/hermes-agent/pull/{number}")
+    snapshot = kpr.capture(board, task_id, window_seconds=86400)
+    api = _fake_api(payloads)
+    observation = kpr.observe(snapshot, deadline=time.time() + 10, principal="test-owner", api=api)
+    assert observation.classification == expected
+    assert len(api.calls) <= kpr.MAX_REQUESTS
+    if expected == "no_associated_pr":
+        assert observation.pr_url is None
+        assert kpr.admit(board, snapshot, observation) is None
+
+
+@pytest.mark.parametrize("mutation", ["none", "comment", "head", "auth", "other_writer"])
+def test_unrelated_clearance_is_atomic_and_has_no_owned_pr_lineage(board, checkout, monkeypatch, mutation):
+    task_id, branch, head = _mid_pr_crash(board, checkout)
+    monkeypatch.setattr(kpr, "_gh_api", lambda endpoint, **kw:
+        {"id": 123} if endpoint == "user" else _pr_payload(head_ref="unrelated-branch", head_sha=head))
+    decision = kbd._reconcile_active_pr(board, task_id, lane="ready")
+    assert decision.reason is None
+    assert decision.resume_receipt_id is None
+    assert board.execute("SELECT COUNT(*) FROM task_resume_receipts").fetchone()[0] == 0
+    snapshot_path = board.execute("SELECT workspace_path FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+    if mutation == "comment":
+        kb.add_comment(board, task_id, "owner", "new evidence")
+    elif mutation == "head":
+        _git(snapshot_path, "commit", "--allow-empty", "-qm", "new evidence")
+    elif mutation == "auth":
+        board.execute("UPDATE tasks SET last_failure_error='403 forbidden quota exhausted' WHERE id=?", (task_id,))
+    elif mutation == "other_writer":
+        other = kb.create_task(board, title="another writer", assignee="a")
+        board.execute("UPDATE tasks SET workspace_path=?, status='running' WHERE id=?", (snapshot_path, other))
+    claimed = kb.claim_task(board, task_id, pr_clearance=decision.pr_clearance)
+    assert (claimed is not None) == (mutation == "none")
+    if claimed:
+        assert kb.claim_task(board, task_id, pr_clearance=decision.pr_clearance) is None
+        context = kb.build_worker_context(board, task_id)
+        assert "Do NOT open a new one." not in context
+    assert board.execute("SELECT COUNT(*) FROM task_resume_receipts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("recovery", ["account_changed", "auth_repaired"])
+def test_authenticated_recovery_uses_shared_budget_and_renews_exhaustion(board, checkout, tmp_path, monkeypatch, recovery):
+    import sys
+    task_id, branch, head = _mid_pr_crash(board, checkout)
+    monkeypatch.setattr(kpr, "_gh_api", REAL_GH_API)
+    routes = tmp_path / "responses.json"
+    calls = tmp_path / "requests.txt"
+    shim = tmp_path / "gh"
+    db = board.execute("PRAGMA database_list").fetchone()[2]
+    shim.write_text("#!" + sys.executable + "\n" +
+        "import json, sqlite3, sys\n" +
+        f"db = sqlite3.connect({db!r}, timeout=0.2)\n" +
+        f"db.execute('UPDATE tasks SET priority=priority WHERE id=?', ({task_id!r},))\ndb.commit()\ndb.close()\n" +
+        f"with open({str(calls)!r}, 'a') as f: f.write(sys.argv[2] + '\\n')\n" +
+        f"routes = json.load(open({str(routes)!r}))\n" +
+        "value = routes.get(sys.argv[2])\nif value is None: sys.exit(1)\nprint(json.dumps(value))\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    payload = _pr_payload(head_ref=branch, head_sha=head)
+    for attempt in range(4):
+        routes.write_text(json.dumps({"user": {"id": 101, "login": "old-owner"}} if recovery == "account_changed" else {}))
+        result, spawned = _dispatch(board)
+        assert not spawned
+        state = board.execute("SELECT * FROM task_pr_reconcile_state WHERE task_id=? ORDER BY last_at DESC LIMIT 1", (task_id,)).fetchone()
+        assert state is not None
+        if attempt < 3:
+            board.execute("UPDATE task_pr_reconcile_state SET next_at=0 WHERE task_id=?", (task_id,))
+    snapshot = kpr.capture(board, task_id, window_seconds=86400)
+    assert kpr.due(board, snapshot, now=int(state["next_at"]) + 1), "exhaustion must schedule authenticated recovery"
+    board.execute("UPDATE task_pr_reconcile_state SET next_at=0 WHERE task_id=?", (task_id,))
+    routes.write_text(json.dumps({"user": {"id": 202, "login": "recovered-owner"},
+        "repos/nousresearch/hermes-agent/pulls/4242": payload}))
+    before = len(calls.read_text().splitlines())
+    result, spawned = _dispatch(board)
+    assert [t for t, _, _ in result.spawned] == [task_id]
+    receipt = board.execute("SELECT issued_by, reconciliation FROM task_resume_receipts WHERE task_id=?", (task_id,)).fetchone()
+    assert receipt["issued_by"] == "github:202"
+    assert json.loads(receipt["reconciliation"])["principal"] == "github:202"
+    requests = calls.read_text().splitlines()[before:]
+    assert requests[0] == "user" and len(requests) <= kpr.MAX_REQUESTS
+    assert json.loads(receipt["reconciliation"])["requests"] == len(requests)
+
+
+@pytest.mark.parametrize("kind", ["dir", "scratch"])
+def test_recorded_checkout_without_branch_column_uses_real_git_lineage(board, checkout, monkeypatch, kind):
+    task_id, branch, head = _mid_pr_crash(board, checkout)
+    board.execute("UPDATE tasks SET workspace_kind=?, branch_name=NULL WHERE id=?", (kind, task_id))
+    path = board.execute("SELECT workspace_path FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+    monkeypatch.setattr(kpr, "_gh_api", lambda endpoint, **kw:
+        {"id": 123} if endpoint == "user" else _pr_payload(head_ref=branch, head_sha=head))
+    result, spawned = _dispatch(board)
+    assert [t for t, _, workspace in result.spawned if workspace == path] == [task_id]
+    receipt = board.execute("SELECT reconciliation FROM task_resume_receipts WHERE task_id=?", (task_id,)).fetchone()
+    assert json.loads(receipt[0])["checkout"]["branch"] == branch
+    assert json.loads(receipt[0])["checkout"]["head"] == head

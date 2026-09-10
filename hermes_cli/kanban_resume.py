@@ -240,7 +240,7 @@ def _pid_is_running(pid: Optional[int]) -> Optional[bool]:
     return True
 
 
-def writer_state(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[str]:
+def _task_writer_state(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[str]:
     """Why this task may still have a writer, or ``None`` when it provably does not.
 
     Unknown is not clear: a pid we cannot classify refuses, because terminal
@@ -282,6 +282,26 @@ def writer_state(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[s
         if alive:
             return f"{label} records pid {pid}, which is still running"
     return None
+
+
+def shared_checkout_writer(conn, task_id: str, now: int) -> Optional[str]:
+    row = conn.execute("SELECT workspace_path FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row is None or not row["workspace_path"]:
+        return None
+    checkout = os.path.realpath(row["workspace_path"])
+    for other in conn.execute(
+            "SELECT id, workspace_path FROM tasks WHERE id!=? AND workspace_path IS NOT NULL",
+            (task_id,)).fetchall():
+        if os.path.realpath(other["workspace_path"]) == checkout:
+            reason = _task_writer_state(conn, other["id"], now)
+            if reason:
+                return f"shared checkout task {other['id']}: {reason}"
+    return None
+
+
+def writer_state(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[str]:
+    return (_task_writer_state(conn, task_id, now)
+            or shared_checkout_writer(conn, task_id, now))
 
 
 def base_snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
@@ -516,6 +536,10 @@ def _receipt_matches_now(conn: sqlite3.Connection, task_id: str, receipt, now: i
             # unchanged (comment_digest) and the card must still own this PR --
             # a contract rewritten to another pull request revokes the authority
             # even though every comment stayed put.
+            from hermes_cli import kanban_pr_reconcile as reconcile
+            evidence = json.loads(receipt["reconciliation"])
+            if not reconcile.checkout_matches(conn, task_id, evidence):
+                return False
             current = reconciled_snapshot(conn, task_id, pr_url=receipt["pr_url"])
             if not _still_owns(conn, task_id, current["pr_url"]):
                 return False
@@ -523,7 +547,7 @@ def _receipt_matches_now(conn: sqlite3.Connection, task_id: str, receipt, now: i
             current = snapshot(conn, task_id)
         _require_matches(current, bound)
         _require_transition_permitted(conn, task_id, current, bound)
-    except (ResumeAuthorityError, KeyError, IndexError):
+    except (ResumeAuthorityError, KeyError, IndexError, ValueError, TypeError):
         return False
     return writer_state(conn, task_id, now) is None
 

@@ -1139,6 +1139,7 @@ class GuardDecision(NamedTuple):
 
     reason: Optional[str]
     resume_receipt_id: Optional[int] = None
+    pr_clearance: Optional[_kb_reconcile.PRClearance] = None
 
 
 def _respawn_guard_reason(
@@ -1178,22 +1179,15 @@ def _respawn_guard_reason(
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if latest_run is not None and latest_run["outcome"] == "rate_limited":
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
-            return None
+    rate_limit_retry = latest_run is not None and latest_run["outcome"] == "rate_limited"
+    if rate_limit_retry:
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        if rl_cooldown > 0 and ended_at is not None and (now - int(ended_at)) < rl_cooldown:
             return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
-        return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # Expiry exempts the stamped quota error, never the independent PR guard.
     err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    if not rate_limit_retry and err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -1229,9 +1223,11 @@ def _respawn_guard_reason(
     #    acceptance receipt), or a mention plus a checkout whose branch GitHub
     #    can be asked about. A PR URL quoted, reposted or cited in prose on a
     #    card that owns no branch is somebody else's link and holds nothing.
-    if _kb_assoc.classify(
-        conn, task_id, window_seconds=_RESPAWN_GUARD_PR_WINDOW, now=now,
-    ) != _kb_assoc.UNASSOCIATED:
+    association = _kb_assoc.classify(
+        conn, task_id, window_seconds=_RESPAWN_GUARD_PR_WINDOW, now=now)
+    if association == _kb_assoc.HISTORY_UNRESOLVED:
+        return association
+    if association != _kb_assoc.UNASSOCIATED:
         return "active_pr"
 
     return None
@@ -1313,11 +1309,11 @@ def _reconcile_active_pr(
     if budget is not None:
         budget["left"] = budget.get("left", 0) - 1
 
-    observation = _kb_reconcile.observe(
-        snapshot,
-        deadline=time.time() + _kb_reconcile.TOTAL_DEADLINE_SECONDS,
-        principal=_reconcile_principal(),
-    )
+    snapshot, observation = _kb_reconcile.collect(
+        snapshot, deadline=time.time() + _kb_reconcile.TOTAL_DEADLINE_SECONDS)
+    if observation.classification == _kb_reconcile.NO_ASSOCIATED_PR:
+        clearance = _kb_reconcile.PRClearance(snapshot, observation)
+        return GuardDecision(None, None, clearance)
     receipt_id = _kb_reconcile.admit(conn, snapshot, observation)
     if receipt_id is None:
         _kb_reconcile.record_unresolved(conn, snapshot, observation)
@@ -1332,15 +1328,6 @@ def _reconcile_active_pr(
     # Re-ask the guard rather than trusting the id: between admission and here
     # the receipt could already have been invalidated by a new comment.
     return evaluate_respawn_guard(conn, task_id, lane=lane)
-
-
-def _reconcile_principal() -> str:
-    """The dispatcher's own execution identity, for the receipt's audit trail.
-
-    Never a task field or a request body: those are worker-supplied, and a
-    worker naming its own granting identity is not authentication.
-    """
-    return f"hermes:dispatcher:{os.getpid()}"
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
@@ -1652,7 +1639,7 @@ def _dispatch_lane_task(
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
     decision = evaluate_respawn_guard(conn, task_id, lane=lane)
-    if decision.reason == "active_pr" and not dry_run:
+    if decision.reason in ("active_pr", _kb_assoc.HISTORY_UNRESOLVED) and not dry_run:
         # The card is held on a pull request it owns. Ask GitHub whether that
         # PR is still open on this task's own branch and head, and resume it if
         # so. A dry run deliberately never gets here: a preview must not spend
@@ -1693,12 +1680,19 @@ def _dispatch_lane_task(
         # returns None here rather than spawning.
         claimed = _kb.claim_task(
             conn, task_id, ttl_seconds=ttl_seconds,
-            resume_receipt_id=decision.resume_receipt_id)
+            resume_receipt_id=decision.resume_receipt_id, pr_clearance=decision.pr_clearance)
     if claimed is None:
         return False
     try:
         resolved_branch_name = None
-        if claimed.workspace_kind == "worktree":
+        if decision.resume_receipt_id is not None:
+            workspace = _kb_reconcile.resume_workspace(
+                conn, claimed.id, decision.resume_receipt_id)
+            resolved_branch_name = claimed.branch_name
+        elif decision.pr_clearance is not None:
+            workspace = _kb_reconcile.clearance_workspace(conn, claimed.id, decision.pr_clearance)
+            resolved_branch_name = claimed.branch_name
+        elif claimed.workspace_kind == "worktree":
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
@@ -1718,6 +1712,11 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
+        if decision.resume_receipt_id is not None:
+            workspace = _kb_reconcile.resume_workspace(
+                conn, claimed.id, decision.resume_receipt_id)
+        if decision.pr_clearance is not None:
+            workspace = _kb_reconcile.clearance_workspace(conn, claimed.id, decision.pr_clearance)
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))

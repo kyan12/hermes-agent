@@ -91,7 +91,10 @@ def test_a_parked_card_is_guarded_without_a_receipt(board):
     """The premise. If this ever stops firing, everything below tests nothing."""
     task_id, _ = _parked_on_a_pr(board)
     assert kbd.check_respawn_guard(board, task_id) == "active_pr"
-    assert kbd.evaluate_respawn_guard(board, task_id) == (("active_pr"), None)
+    decision = kbd.evaluate_respawn_guard(board, task_id)
+    assert decision.reason == "active_pr"
+    assert decision.resume_receipt_id is None
+    assert decision.pr_clearance is None
 
 
 def test_the_guards_own_verdict_ignores_the_receipt(board):

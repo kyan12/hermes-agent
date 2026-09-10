@@ -52,6 +52,7 @@ PR_URL_RE = re.compile(
 
 # Verdicts of :func:`classify`.
 ASSOCIATED = "associated"   # structured provenance names a PR: this card owns it
+HISTORY_UNRESOLVED = "history_unresolved"
 CANDIDATE = "candidate"     # prose + a task-specific checkout: ask GitHub
 UNASSOCIATED = "unassociated"  # prose only, or nothing at all: not this card's
 
@@ -154,18 +155,16 @@ def prose_urls(
 
 
 def checkout_claim(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
-    """The task's own checkout identity, when it has one that GitHub can be
-    asked about; ``None`` for a scratch card that owns no branch.
+    """Recorded checkout coordinates, independent of workspace kind.
 
-    A scratch task has no branch of its own, so there is no head ref that could
-    make a pull request its own — no amount of prose can be reconciled into
-    ownership, and there is nothing for the network path to check.
+    A path is an inspection target, not PR ownership. Git and remote evidence
+    must establish its actual branch, head and repositories before admission.
     """
     row = conn.execute(
         "SELECT workspace_kind, workspace_path, branch_name, project_id "
         "FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
-    if row is None or row["workspace_kind"] != "worktree":
+    if row is None:
         return None
     branch = (row["branch_name"] or "").strip()
     path = (row["workspace_path"] or "").strip()
@@ -187,9 +186,21 @@ def classify(
     """
     if structured_associations(conn, task_id):
         return ASSOCIATED
-    if not prose_urls(conn, task_id, window_seconds=window_seconds, now=now):
+    interrupted = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+        "AND (outcome IN ('crashed', 'timed_out', 'gave_up', 'reclaimed', 'rate_limited') "
+        "OR status IN ('crashed', 'timed_out', 'failed', 'released')) LIMIT 1",
+        (task_id,)).fetchone()
+    if interrupted is None or not historical_hints(conn, task_id):
         return UNASSOCIATED
-    return CANDIDATE if checkout_claim(conn, task_id) is not None else UNASSOCIATED
+    return CANDIDATE if checkout_claim(conn, task_id) is not None else HISTORY_UNRESOLVED
+
+
+def historical_hints(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """History cannot become safe just because a discovery hint aged out."""
+    return {match.group(0).lower().rstrip("/")
+            for row in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (task_id,))
+            for match in PR_URL_RE.finditer(row["body"] or "")}
 
 
 def associated_pr(conn: sqlite3.Connection, task_id: str) -> Optional[str]:

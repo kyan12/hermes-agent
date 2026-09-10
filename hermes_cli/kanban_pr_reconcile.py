@@ -23,9 +23,8 @@ receipt is spent, because a comment, a run or a writer can arrive in either gap.
 
 Ownership rules, in one place:
 
-* One candidate pull request. Two is ambiguity, and ambiguity never resolves to
-  automatic authority — a receipt exempts one lineage and would leave the other
-  unexamined.
+* Inspect bounded hints before deciding ownership. Multiple verified lineages
+  are ambiguous; unrelated-only observations use separate atomic claim evidence.
 * The PR's head ref must be exactly this task's branch (**case-sensitive**: Git
   branch names are), and the PR's head SHA must be exactly what this task's own
   checkout has. That pair is what makes it *this task's* PR rather than a PR
@@ -46,10 +45,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import queue
+import threading
 import sqlite3
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_pr_association as _assoc
@@ -63,6 +65,8 @@ MERGED = "merged"
 CLOSED_UNMERGED = "closed_unmerged"
 AMBIGUOUS = "ambiguous"
 UNAVAILABLE = "unavailable"
+NO_ASSOCIATED_PR = "no_associated_pr"
+INSPECTION_LIMIT = "inspection_limit"
 
 # Continuation modes carried on the receipt and into the worker's instructions.
 RESUME_OPEN_PR = "resume_open_pr"
@@ -76,10 +80,10 @@ TOTAL_DEADLINE_SECONDS = 30
 MAX_RESPONSE_BYTES = 1 << 20
 
 # Attempt N waits this long before attempt N+1. After the last one the card
-# stays unresolved and is retried only when its evidence changes (a new
-# comment, a new run, a new head) or an operator asks again — retrying a
-# permanently closed PR every five minutes forever is event spam, not recovery.
+# retries on changed evidence or a slower scheduled authenticated observation.
+# The slower interval permits auth/remote recovery without a per-attempt click.
 RETRY_BACKOFF_SECONDS = (60, 120, 300)
+RENEWED_OBSERVATION_SECONDS = 3600
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS task_pr_reconcile_state (
@@ -118,8 +122,10 @@ class Snapshot:
     association_kind: str
     provenance: tuple[tuple[str, str, str], ...]
     captured_at: int
+    checkout: Optional[dict[str, Any]] = None
+    principal: str = ""
 
-    def evidence_key(self) -> str:
+    def evidence_key(self, *, include_principal: bool = True) -> str:
         """Identity of the situation this snapshot describes.
 
         A changed key is a different situation, so its retry schedule starts
@@ -132,8 +138,12 @@ class Snapshot:
             self.board_identity, self.task_id, self.run_id, self.occurrence_event_id,
             self.comment_digest, self.lifecycle, self.assignee, self.workspace_kind,
             self.workspace_path, self.branch_name, sorted(self.candidates),
+            self.checkout, self.provenance,
         ], separators=(",", ":"), sort_keys=True)
-        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+        local_key = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        if not include_principal:
+            return local_key
+        return local_key + ":" + hashlib.sha256(self.principal.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -157,11 +167,40 @@ class Observation:
         return None
 
 
+@dataclass(frozen=True)
+class PRClearance:
+    """A no-associated-PR observation; never an owned-PR resume receipt."""
+
+    snapshot: Snapshot
+    observation: Observation
+
+
+def validate_clearance(conn, task_id: str, clearance: PRClearance) -> bool:
+    from hermes_cli.kanban_db_dispatch import check_respawn_guard
+
+    snapshot, observation = clearance.snapshot, clearance.observation
+    return (snapshot.task_id == task_id
+            and observation.classification == NO_ASSOCIATED_PR
+            and observation.pr_url is None
+            and observation.principal == snapshot.principal
+            and _tuple_unchanged(conn, snapshot)
+            and checkout_matches(conn, task_id, observation.evidence)
+            and _resume.writer_state(conn, task_id, int(time.time())) is None
+            and check_respawn_guard(conn, task_id) in (None, "active_pr"))
+
+
+def clearance_workspace(conn, task_id: str, clearance: PRClearance) -> str:
+    if (not checkout_matches(conn, task_id, clearance.observation.evidence)
+            or _resume.shared_checkout_writer(conn, task_id, int(time.time()))):
+        raise _resume.ResumeAuthorityError("no-associated-PR checkout evidence changed")
+    return clearance.snapshot.workspace_path
+
+
 # --- phase 1: capture --------------------------------------------------------
 
 def capture(
     conn: sqlite3.Connection, task_id: str, *, window_seconds: int,
-    now: Optional[int] = None,
+    now: Optional[int] = None, principal: str = "",
 ) -> Snapshot:
     """One short read of everything the decision depends on.
 
@@ -178,8 +217,7 @@ def capture(
     if provenance:
         candidates = {p[0] for p in provenance}
     else:
-        candidates = _assoc.prose_urls(
-            conn, task_id, window_seconds=window_seconds, now=now)
+        candidates = _assoc.historical_hints(conn, task_id)
     row = conn.execute(
         "SELECT branch_name FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Snapshot(
@@ -191,32 +229,51 @@ def capture(
         branch_name=(row["branch_name"] if row is not None else None),
         candidates=tuple(sorted(candidates)), association_kind=kind,
         provenance=provenance, captured_at=now,
+        checkout=_checkout_identity(base["workspace_path"]), principal=principal,
     )
 
 
 # --- phase 2: observe (no database) -----------------------------------------
 
-def _gh_api(endpoint: str, *, timeout: int = REQUEST_TIMEOUT_SECONDS) -> Any:
-    """One bounded ``gh api`` call under the caller's existing OAuth session.
-
-    Same transport the acceptance collector uses. No credential is selected
-    here, and stderr is dropped rather than surfaced: it can carry the host and
-    token hints, and the caller only needs to know the request failed.
-    """
+def _gh_api(endpoint: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> Any:
+    """Read at most the byte cap plus one sentinel byte, under one deadline."""
+    deadline = time.monotonic() + timeout
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             ["gh", "api", endpoint, "--hostname", "github.com"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            timeout=timeout, check=True,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as exc:
         raise TransportError(type(exc).__name__) from None
-    if len(result.stdout) > MAX_RESPONSE_BYTES:
-        raise TransportError("response exceeded the size bound")
+    output = queue.Queue(maxsize=1)
+
+    def read_bounded():
+        try:
+            output.put(process.stdout.read(MAX_RESPONSE_BYTES + 1))
+        except OSError:
+            output.put(None)
+
+    reader = threading.Thread(target=read_bounded, daemon=True)
+    reader.start()
     try:
-        return json.loads(result.stdout)
-    except ValueError:
-        raise TransportError("response was not JSON") from None
+        raw = output.get(timeout=max(0, deadline - time.monotonic()))
+        if raw is None or len(raw) > MAX_RESPONSE_BYTES:
+            raise TransportError("response exceeded the byte bound or could not be read")
+        process.wait(timeout=max(0, deadline - time.monotonic()))
+        if process.returncode or time.monotonic() >= deadline:
+            raise TransportError("request failed or exceeded deadline")
+        try:
+            return json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise TransportError("response was not JSON") from None
+    except (queue.Empty, subprocess.TimeoutExpired):
+        raise TransportError("request deadline exhausted") from None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        reader.join(timeout=0.1)
+        if not reader.is_alive():
+            process.stdout.close()
 
 
 def _checkout_identity(path: Optional[str]) -> Optional[dict[str, Any]]:
@@ -241,13 +298,66 @@ def _checkout_identity(path: Optional[str]) -> Optional[dict[str, Any]]:
         ["git", "rev-parse", "HEAD"], cwd=str(target), stdin=subprocess.DEVNULL,
         capture_output=True, text=True, timeout=REQUEST_TIMEOUT_SECONDS,
     )
+    remotes = subprocess.run(
+        ["git", "config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"],
+        cwd=str(target), stdin=subprocess.DEVNULL, capture_output=True,
+        text=True, timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    repositories = set()
+    for line in remotes.stdout.splitlines():
+        _, _, url = line.partition(" ")
+        match = re.fullmatch(
+            r"(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)"
+            r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?", url)
+        if match:
+            repositories.add(match.group(1).lower())
     return {
+        "repositories": sorted(repositories),
         "realpath": os.path.realpath(str(target)),
         "git_dir": str(git_dir), "common_dir": str(common_dir),
         "linked_worktree": str(git_dir) != str(common_dir),
         "branch": _kbw._git_current_branch(target),
         "head": head.stdout.strip() if head.returncode == 0 else None,
     }
+
+
+def checkout_matches(conn, task_id: str, evidence: dict[str, Any]) -> bool:
+    """Reinspect local authority at claim and immediately before spawn."""
+    row = conn.execute(
+        "SELECT workspace_path, branch_name FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None or row["branch_name"] != evidence.get("branch"):
+        return False
+    provenance = [[a.pr_url, a.source, a.source_id]
+                  for a in _assoc.structured_associations(conn, task_id)]
+    if provenance != evidence.get("provenance"):
+        return False
+    if not 0 <= time.time() - evidence.get("observed_at", 0) <= TOTAL_DEADLINE_SECONDS:
+        return False
+    try:
+        return _checkout_identity(row["workspace_path"]) == evidence.get("checkout")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def resume_workspace(conn, task_id: str, receipt_id: int) -> str:
+    """A consumed receipt can only launch in the checkout it verified."""
+    row = conn.execute(
+        "SELECT reconciliation, authority_kind, workspace_path FROM task_resume_receipts "
+        "WHERE id=? AND task_id=? AND consumed_run_id=("
+        "SELECT current_run_id FROM tasks WHERE id=?)", (receipt_id, task_id, task_id)
+    ).fetchone()
+    if row is None:
+        raise _resume.ResumeAuthorityError("resume receipt is not attached to this run")
+    writer = _resume.shared_checkout_writer(conn, task_id, int(time.time()))
+    if writer:
+        raise _resume.ResumeAuthorityError(writer)
+    if row["authority_kind"] == _resume.RECONCILED:
+        if not checkout_matches(conn, task_id, json.loads(row["reconciliation"])):
+            raise _resume.ResumeAuthorityError("resume checkout evidence changed or expired")
+    if not row["workspace_path"] or not os.path.isdir(row["workspace_path"]):
+        raise _resume.ResumeAuthorityError("resume checkout is unavailable")
+    return row["workspace_path"]
 
 
 def _unresolved(kind: str, detail: str, recovery: str, snapshot: Snapshot,
@@ -262,9 +372,27 @@ def _unresolved(kind: str, detail: str, recovery: str, snapshot: Snapshot,
                        int(time.time()))
 
 
+def collect(snapshot: Snapshot, *, deadline: float) -> tuple[Snapshot, Observation]:
+    """Resolve the existing authenticated account without reading credentials."""
+    budget = _Budget(deadline)
+    try:
+        user = budget.call(_gh_api, "user")
+        account_id = user["id"]
+        if type(account_id) is not int or account_id <= 0:
+            raise TransportError("authenticated account identity missing")
+    except (TransportError, KeyError, TypeError):
+        snapshot = replace(snapshot, principal="github:unavailable")
+        return snapshot, _unresolved("auth_unavailable", "existing gh account could not be authenticated",
+            "Restore authentication through the existing authenticated owner path. "
+            "A scheduled renewed observation retries automatically after cooldown.",
+            snapshot, snapshot.principal)
+    snapshot = replace(snapshot, principal=f"github:{account_id}")
+    return snapshot, observe(snapshot, deadline=deadline, principal=snapshot.principal, budget=budget)
+
+
 def observe(
     snapshot: Snapshot, *, deadline: float, principal: str,
-    api: Optional[Callable[[str], Any]] = None,
+    api: Optional[Callable[[str], Any]] = None, budget: Optional[_Budget] = None,
 ) -> Observation:
     """Collect bounded evidence about ``snapshot``'s candidate pull request.
 
@@ -272,48 +400,67 @@ def observe(
     without a network; the default is the authenticated ``gh`` CLI.
     """
     api = _gh_api if api is None else api
+    if snapshot.checkout is None:
+        return _unresolved(
+            _assoc.HISTORY_UNRESOLVED,
+            "interrupted publication history has no inspectable recorded checkout",
+            "The authenticated task owner must restore the existing checkout path/branch "
+            "and, if known, the exact completion_contract through the existing task "
+            "editing path. The dispatcher retries; no replacement PR is authorized.",
+            snapshot, principal)
     if not snapshot.candidates:
         return _unresolved(
             UNAVAILABLE, "the card names no pull request to reconcile",
             "Nothing to continue; the hold is not an active_pr hold.",
             snapshot, principal)
-    if len(snapshot.candidates) > 1:
-        return _unresolved(
-            AMBIGUOUS,
-            "the card is associated with more than one pull request: "
-            + ", ".join(snapshot.candidates),
-            "Resolve which pull request this task continues (set completion_contract "
-            "to the exact PR URL), then the dispatcher resumes it automatically.",
-            snapshot, principal, evidence={"candidates": list(snapshot.candidates)})
-
-    pr_url = snapshot.candidates[0]
-    parsed = _assoc.repo_and_number(pr_url)
-    if parsed is None:
-        return _unresolved(UNAVAILABLE, f"{pr_url} is not a pull request URL",
-                           "Correct the recorded pull request URL.", snapshot,
-                           principal, pr_url)
-    repo, number = parsed
-
     checkout = _checkout_identity(snapshot.workspace_path)
-    if checkout is None:
-        return _unresolved(
-            UNAVAILABLE,
-            "this task has no inspectable checkout of its own, so no branch "
-            "can prove the pull request is its",
-            "Restore the task's worktree, or record the pull request on the task "
-            "(completion_contract) so its lineage is structured.",
-            snapshot, principal, pr_url)
-
-    budget = _Budget(deadline)
+    if checkout != snapshot.checkout or not checkout["branch"] or (
+            snapshot.branch_name and checkout["branch"] != snapshot.branch_name):
+        return _unresolved(UNAVAILABLE, "recorded checkout branch or identity changed",
+                           "Restore the recorded task checkout before retrying.", snapshot, principal)
+    budget = budget if budget is not None else _Budget(deadline)
+    if len(snapshot.candidates) > MAX_REQUESTS - budget.used:
+        return _unresolved(INSPECTION_LIMIT, "candidate set exceeds bounded inspection limit",
+            "The authenticated task owner can supply the exact completion_contract; "
+            "otherwise bounded reconciliation will retry.", snapshot, principal)
+    expected_branch = snapshot.branch_name or checkout["branch"]
+    associated = []
+    inspected = []
     try:
-        detail = budget.call(api, f"repos/{repo}/pulls/{number}")
-        state, merged, head_ref, head_sha, head_repo, base_ref, base_repo = _fields(detail)
+        for candidate in snapshot.candidates:
+            parsed = _assoc.repo_and_number(candidate)
+            if parsed is None:
+                raise TransportError("invalid PR identity")
+            candidate_repo, candidate_number = parsed
+            detail = budget.call(api, f"repos/{candidate_repo}/pulls/{candidate_number}")
+            fields = _fields(detail)
+            _, _, ref, _, head_repository, _, base_repository = fields
+            if not head_repository or not base_repository or base_repository.lower() != candidate_repo.lower():
+                raise TransportError("missing or inconsistent repository identity")
+            owns = (ref == expected_branch and
+                    {head_repository.lower(), base_repository.lower()}.issubset(checkout["repositories"]))
+            inspected.append({"pr_url": candidate, "head_ref": ref,
+                              "head_repo": head_repository, "base_repo": base_repository})
+            if owns:
+                associated.append((candidate, candidate_repo, candidate_number, fields))
+            elif snapshot.provenance:
+                return _unresolved(UNAVAILABLE, "structured PR branch or repositories differ from checkout",
+                    "Reconcile the existing contract and recorded checkout through the authenticated owner.",
+                    snapshot, principal, candidate)
     except (TransportError, KeyError, TypeError, ValueError, AttributeError) as exc:
-        return _unresolved(
-            UNAVAILABLE, f"pull request evidence unavailable ({type(exc).__name__})",
-            "Check `gh auth status` and API reachability; the dispatcher retries "
-            "on a bounded schedule without further input.",
-            snapshot, principal, pr_url)
+        return _unresolved(UNAVAILABLE, f"pull request evidence unavailable ({type(exc).__name__})",
+            "Check existing gh authentication and API reachability; bounded reconciliation retries.",
+            snapshot, principal)
+    if not associated:
+        return _unresolved(NO_ASSOCIATED_PR, "all bounded hints belong to other repositories or branches",
+            "Ordinary execution requires atomic revalidation of this observation.", snapshot, principal,
+            evidence={"checkout": checkout, "branch": snapshot.branch_name,
+                      "observed_at": int(time.time()), "inspected": inspected, "requests": budget.used})
+    if len(associated) > 1:
+        return _unresolved(AMBIGUOUS, "multiple PRs match this checkout's repository and branch",
+            "The authenticated task owner must reconcile the competing PR lineages.", snapshot, principal)
+    pr_url, repo, number, fields = associated[0]
+    state, merged, head_ref, head_sha, head_repo, base_ref, base_repo = fields
 
     evidence = {
         "pr_url": pr_url, "repo": repo, "number": number, "state": state,
@@ -323,22 +470,6 @@ def observe(
         "observed_at": int(time.time()), "requests": budget.used,
     }
 
-    # Branch names are case-sensitive in Git, so this comparison must be too.
-    if not snapshot.branch_name or head_ref != snapshot.branch_name:
-        return _unresolved(
-            UNAVAILABLE,
-            f"the pull request's head branch is {head_ref!r}, not this task's "
-            f"branch {snapshot.branch_name!r}",
-            "This pull request belongs to another branch; it is a mention, not "
-            "this task's lineage.",
-            snapshot, principal, pr_url, evidence)
-    if checkout["branch"] != snapshot.branch_name:
-        return _unresolved(
-            UNAVAILABLE,
-            f"the checkout is on branch {checkout['branch']!r}, not the task's "
-            f"branch {snapshot.branch_name!r}",
-            "Return the task's worktree to its own branch before resuming.",
-            snapshot, principal, pr_url, evidence)
     if not checkout["head"] or checkout["head"] != head_sha:
         return _unresolved(
             UNAVAILABLE,
@@ -367,24 +498,31 @@ def observe(
             "the ordinary owner path; a resumed run must not substitute a new PR.",
             snapshot, principal, pr_url, evidence)
 
+    if budget.used >= MAX_REQUESTS:
+        return _unresolved(INSPECTION_LIMIT, "confirming read exceeds request budget",
+            "The authenticated owner can supply the exact completion_contract to narrow inspection.",
+            snapshot, principal, pr_url, evidence)
+
     # Re-read after the checkout inspection: everything above was collected over
     # time, and a head that moved while we looked is a different pull request
     # than the one we are about to authorise.
     try:
         fresh = budget.call(api, f"repos/{repo}/pulls/{number}")
-        f_state, f_merged, f_head_ref, f_head_sha, *_ = _fields(fresh)
+        fresh_fields = _fields(fresh)
+        f_state, f_merged, f_head_ref, f_head_sha, *_ = fresh_fields
     except (TransportError, KeyError, TypeError, ValueError, AttributeError) as exc:
         return _unresolved(
             UNAVAILABLE, f"the confirming re-read failed ({type(exc).__name__})",
             "Retry; the dispatcher does this on a bounded schedule.",
             snapshot, principal, pr_url, evidence)
-    if (f_head_sha, f_head_ref, bool(f_merged), str(f_state).lower()) != (
+    if fresh_fields[4:] != (head_repo, base_ref, base_repo) or (f_head_sha, f_head_ref, bool(f_merged), str(f_state).lower()) != (
             head_sha, head_ref, False, "open"):
         return _unresolved(
             UNAVAILABLE, "the pull request changed while it was being observed",
             "Retry; the dispatcher does this on a bounded schedule.",
             snapshot, principal, pr_url, evidence)
 
+    evidence["requests"] = budget.used
     return Observation(
         OPEN, pr_url, "one open pull request, on this task's branch and head",
         "Resume the existing pull request; do not open another.",
@@ -416,7 +554,11 @@ class _Budget:
         if remaining <= 0:
             raise TransportError("deadline exhausted")
         self.used += 1
-        return api(endpoint)
+        result = (api(endpoint, timeout=min(remaining, REQUEST_TIMEOUT_SECONDS))
+                  if api is _gh_api else api(endpoint))
+        if time.time() >= self.deadline:
+            raise TransportError("deadline exhausted")
+        return result
 
 
 # --- phase 3: admit ----------------------------------------------------------
@@ -439,7 +581,8 @@ def admit(
 
     try:
         with write_txn(conn):
-            if not _tuple_unchanged(conn, snapshot):
+            if (not _tuple_unchanged(conn, snapshot)
+                    or not checkout_matches(conn, snapshot.task_id, observation.evidence)):
                 return None
             return _resume.issue_reconciled(
                 conn, snapshot.task_id, pr_url=observation.pr_url,
@@ -458,11 +601,11 @@ def _tuple_unchanged(conn: sqlite3.Connection, snapshot: Snapshot) -> bool:
     return (current.board_identity, current.run_id, current.occurrence_event_id,
             current.comment_digest, current.lifecycle, current.assignee,
             current.workspace_kind, current.workspace_path, current.branch_name,
-            current.candidates) == (
+            current.candidates, current.provenance, current.checkout) == (
         snapshot.board_identity, snapshot.run_id, snapshot.occurrence_event_id,
         snapshot.comment_digest, snapshot.lifecycle, snapshot.assignee,
         snapshot.workspace_kind, snapshot.workspace_path, snapshot.branch_name,
-        snapshot.candidates)
+        snapshot.candidates, snapshot.provenance, snapshot.checkout)
 
 
 def _assoc_window() -> int:
@@ -494,7 +637,8 @@ def record_unresolved(
             "AND evidence_key = ?", (snapshot.task_id, key)).fetchone()
         attempts = (int(row["attempts"]) if row is not None else 0) + 1
         index = min(attempts - 1, len(RETRY_BACKOFF_SECONDS) - 1)
-        next_at = now + RETRY_BACKOFF_SECONDS[index]
+        next_at = now + (RENEWED_OBSERVATION_SECONDS if exhausted(attempts)
+                         else RETRY_BACKOFF_SECONDS[index])
         if row is None:
             conn.execute(
                 "INSERT INTO task_pr_reconcile_state "
@@ -518,17 +662,19 @@ def exhausted(attempts: int) -> bool:
 def due(conn: sqlite3.Connection, snapshot: Snapshot, *, now: Optional[int] = None) -> bool:
     """Whether this exact situation may be observed again.
 
-    Unknown evidence is due immediately: a key with no row is a situation the
-    reconciler has never seen. An exhausted schedule stays undue until the
-    evidence itself changes, which produces a different key and therefore a
-    fresh row.
+    Changed evidence is due immediately. Unchanged evidence follows short
+    backoff, then scheduled renewed authentication/observation after exhaustion.
     """
     now = int(time.time()) if now is None else now
-    row = conn.execute(
-        "SELECT attempts, next_at FROM task_pr_reconcile_state WHERE task_id = ? "
-        "AND evidence_key = ?", (snapshot.task_id, snapshot.evidence_key())).fetchone()
-    if row is None:
-        return True
-    if exhausted(int(row["attempts"])):
-        return False
-    return now >= int(row["next_at"])
+    if snapshot.principal:
+        row = conn.execute(
+            "SELECT attempts, next_at FROM task_pr_reconcile_state WHERE task_id=? AND evidence_key=?",
+            (snapshot.task_id, snapshot.evidence_key())).fetchone()
+    else:
+        # Authentication is itself budgeted: first wait on unchanged local input,
+        # then resolve the account and bind the new attempt to that principal.
+        row = conn.execute(
+            "SELECT attempts, next_at FROM task_pr_reconcile_state WHERE task_id=? "
+            "AND evidence_key LIKE ? ORDER BY last_at DESC, next_at DESC LIMIT 1",
+            (snapshot.task_id, snapshot.evidence_key(include_principal=False) + ":%")).fetchone()
+    return row is None or now >= int(row["next_at"])
