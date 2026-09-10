@@ -313,6 +313,14 @@
     return `${url}${sep}board=${encodeURIComponent(board)}`;
   }
 
+  // Identity of a board request: everything that changes what comes back. A
+  // response is only meaningful as an answer to its own cohort, so this is
+  // both what makes two requests duplicates of each other and what makes an
+  // arriving response applicable to what is on screen now.
+  function boardCohort(board, tenant, includeArchived) {
+    return `${board || ""} ${tenant || ""} ${includeArchived ? "1" : "0"}`;
+  }
+
   // The SDK's Select component fires ``onValueChange(value)`` directly
   // (it's a shadcn-style popup, not a native <select>). Older plugin
   // code calls ``onChange({target: {value}})`` which silently never
@@ -651,6 +659,11 @@
     // selected when that callback's render happened, so comparing it to another
     // value from the same render answers nothing — both are stale together.
     const selectedBoardRef = useRef(null);
+    // What a board response is an ANSWER to: the board plus the filters that
+    // shaped the query. Two requests that differ here are not duplicates — the
+    // second legitimately supersedes the first and their answers may cross.
+    // Two that agree are duplicates, and only one may be in flight.
+    const boardCohortRef = useRef(null);
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
@@ -659,6 +672,7 @@
     // board-load effect, which runs before any effect that could update a ref
     // afterwards, and from callbacks that can fire at any time.
     selectedBoardRef.current = board;
+    boardCohortRef.current = boardCohort(board, tenantFilter, includeArchived);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -685,23 +699,51 @@
     // equally unsafe: the older one restores data whose events the stream has
     // already consumed. Success, error and completion are all guarded; a stale
     // error would clear a live board's state just as badly.
+    //
+    // A generation alone decides which answer WINS, not how many are asked for,
+    // and that is not enough. Every live event schedules a refresh 250ms later,
+    // while a real board response takes about twice that: each refresh started
+    // a request that invalidated the one already in flight, so on a board that
+    // was actually being worked no response was ever the newest when it landed.
+    // Nothing was applied, `loading` was never cleared, and the tab sat on
+    // "Loading Kanban board…" while the network showed a steady stream of
+    // successful 200s — until the board went quiet. So: at most ONE request per
+    // cohort in flight, and a refresh asked for while it runs is remembered and
+    // issued once afterwards rather than racing it.
     const boardRequestRef = useRef(0);
+    const inFlightCohortRef = useRef(null);
+    const pendingRefreshRef = useRef(false);
+    const loadBoardRef = useRef(null);
     const loadBoard = useCallback(() => {
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
       const requestedBoard = board;
+      const cohort = boardCohort(board, tenantFilter, includeArchived);
       // A long-lived callback (a mutation's `.then(loadBoard)`, a toolbar
       // handler) holds the `loadBoard` from the render it was created in. Left
       // unchecked it would take a fresh generation number here and become the
       // newest request — for a board the user left. Check the live selection
       // BEFORE issuing, so a stale caller never starts a request at all.
-      if (requestedBoard !== selectedBoardRef.current) return Promise.resolve();
+      if (cohort !== boardCohortRef.current) return Promise.resolve();
+      // The answer we are already waiting for is the answer this caller wants.
+      // Starting a second request would only invalidate the first; remember the
+      // refresh instead and run it once, when that one lands. Any number of
+      // events arriving during a request therefore cost exactly one more.
+      if (inFlightCohortRef.current === cohort) {
+        pendingRefreshRef.current = true;
+        return Promise.resolve();
+      }
+      // A DIFFERENT cohort was in flight: this request supersedes it, and any
+      // refresh remembered for it describes a board or filter we have left.
+      pendingRefreshRef.current = false;
+      inFlightCohortRef.current = cohort;
       const generation = ++boardRequestRef.current;
       const current = function () {
         return generation === boardRequestRef.current
-          && requestedBoard === selectedBoardRef.current;
+          && requestedBoard === selectedBoardRef.current
+          && cohort === boardCohortRef.current;
       };
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
@@ -725,10 +767,26 @@
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () {
+          // This request is done either way — release the slot before anything
+          // can return early, or the cohort would never be requestable again.
+          if (inFlightCohortRef.current === cohort) inFlightCohortRef.current = null;
           if (!current()) return;
           setLoading(false);
+          // Events that arrived while this was in flight collapse into one
+          // trailing refresh, so the board still converges on the newest data
+          // without a poller and without ever overlapping itself.
+          if (pendingRefreshRef.current) {
+            pendingRefreshRef.current = false;
+            const refresh = loadBoardRef.current;
+            if (refresh) refresh();
+          }
         });
     }, [tenantFilter, includeArchived, board]);
+
+    // The trailing refresh must run the CURRENT loader, not the one captured by
+    // the request that finished: by the time it fires, the filters may have
+    // moved, and re-running the old closure would ask for the old cohort.
+    useEffect(function () { loadBoardRef.current = loadBoard; }, [loadBoard]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
