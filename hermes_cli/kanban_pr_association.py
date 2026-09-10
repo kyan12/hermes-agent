@@ -37,6 +37,7 @@ run's comments are not attributable, so none of them can carry ownership.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -68,6 +69,11 @@ class Association(NamedTuple):
     pr_url: str
     source: str
     source_id: str
+    payload_digest: str
+
+
+def _payload_digest(raw: str | bytes) -> str:
+    return hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode("utf-8")).hexdigest()
 
 
 def normalize(raw: Optional[str]) -> Optional[str]:
@@ -97,7 +103,7 @@ def structured_associations(conn: sqlite3.Connection, task_id: str) -> list[Asso
         # exact PR contract is an association.
         url = normalize(row["completion_contract"])
         if url is not None:
-            found.append(Association(url, "completion_contract", task_id))
+            found.append(Association(url, "completion_contract", task_id, _payload_digest(row["completion_contract"])))
 
     for run in conn.execute(
         "SELECT id, metadata FROM task_runs WHERE task_id = ? AND metadata IS NOT NULL "
@@ -105,15 +111,17 @@ def structured_associations(conn: sqlite3.Connection, task_id: str) -> list[Asso
     ).fetchall():
         url = normalize(_json_field(run["metadata"], "published_pr"))
         if url is not None:
-            found.append(Association(url, "published_pr", f"run:{int(run['id'])}"))
+            found.append(Association(url, "published_pr", f"run:{int(run['id'])}", _payload_digest(run["metadata"])))
 
     for event in conn.execute(
-        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'pr_acceptance' "
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? AND kind = 'pr_acceptance' "
         "ORDER BY id ASC", (task_id,),
     ).fetchall():
         url = normalize(_json_field(event["payload"], "pr_url"))
         if url is not None:
-            found.append(Association(url, "pr_acceptance", f"event:{int(event['id'])}"))
+            found.append(Association(url, "pr_acceptance", f"event:{int(event['id'])}",
+                                     _payload_digest(json.dumps([event["run_id"], event["payload"]],
+                                                                ensure_ascii=False, separators=(",", ":")))))
 
     return found
 

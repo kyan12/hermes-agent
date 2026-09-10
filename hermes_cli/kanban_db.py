@@ -2166,6 +2166,15 @@ def claim_task(
             # unfinished run terminal and clears its pid without proving its writer
             # stopped — which is exactly what the receipt's writer check reads. Doing
             # it first would erase the disqualifying evidence and then find none.
+            from hermes_cli.kanban_db_dispatch import check_respawn_guard
+
+            guard_reason = check_respawn_guard(conn, task_id)
+            if (resume_receipt_id is None and pr_clearance is None
+                    and guard_reason in ("active_pr", "history_unresolved")):
+                return None
+            if resume_receipt_id is not None and guard_reason not in (
+                    None, "active_pr", "history_unresolved"):
+                return None
             lineage = None
             if pr_clearance is not None:
                 from hermes_cli.kanban_pr_reconcile import validate_clearance

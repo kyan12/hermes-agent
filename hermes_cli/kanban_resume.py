@@ -304,7 +304,7 @@ def writer_state(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[s
             or shared_checkout_writer(conn, task_id, now))
 
 
-def base_snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+def base_snapshot(conn: sqlite3.Connection, task_id: str, *, claimed_run_id: Optional[int] = None) -> dict[str, Any]:
     """Everything a receipt binds except the pull request itself.
 
     The PR comes from different places depending on who is asking: an operator
@@ -315,12 +315,15 @@ def base_snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     moment any of them moves.
     """
     task = conn.execute(
-        "SELECT status, assignee, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        "SELECT status, assignee, workspace_kind, workspace_path, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if task is None:
         raise ResumeAuthorityError(f"task {task_id} does not exist on this board")
-    if task["status"] not in RESUMABLE_STATUSES:
+    if claimed_run_id is not None:
+        if task["status"] != "running" or task["current_run_id"] != claimed_run_id:
+            raise ResumeAuthorityError("the intended claim is no longer current")
+    elif task["status"] not in RESUMABLE_STATUSES:
         raise ResumeAuthorityError(
             f"task {task_id} is {task['status']}; a resume is authorised from "
             f"{' or '.join(RESUMABLE_STATUSES)}, and no transition is manufactured to get there")
@@ -342,6 +345,43 @@ def base_snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
         "workspace_kind": task["workspace_kind"],
         "workspace_path": task["workspace_path"],
     }
+
+
+def post_claim_matches(conn, task_id: str, bound, *, run_id: int, claim_lock: str) -> bool:
+    """Validate captured authority across exactly its own ready→running claim."""
+    try:
+        current = base_snapshot(conn, task_id, claimed_run_id=run_id)
+        fields = set(_BOUND_FIELDS) - {"pr_url", "lifecycle", "occurrence_event_id"}
+        if any(current[field] != bound[field] for field in fields):
+            return False
+        claim = conn.execute(
+            "SELECT r.claim_lock, r.claim_expires, r.profile, r.status, r.ended_at, "
+            "t.claim_lock AS task_lock, t.claim_expires AS task_expires "
+            "FROM task_runs r JOIN tasks t ON t.id=r.task_id WHERE r.id=? AND r.task_id=?",
+            (run_id, task_id)).fetchone()
+        if (claim is None or claim["status"] != "running" or claim["ended_at"] is not None
+                or not claim_lock or claim["claim_lock"] != claim_lock or claim["task_lock"] != claim_lock
+                or claim["profile"] != bound["assignee"]
+                or claim["claim_expires"] != claim["task_expires"]
+                or claim["claim_expires"] <= int(time.time())):
+            return False
+        placeholders = ','.join('?' for _ in OCCURRENCE_EVENT_KINDS)
+        events = conn.execute(
+            f"SELECT kind, run_id, payload FROM task_events WHERE task_id=? AND id>? "
+            f"AND kind IN ({placeholders}) ORDER BY id",
+            (task_id, bound["occurrence_event_id"], *OCCURRENCE_EVENT_KINDS)).fetchall()
+        if not events or events[-1]["kind"] != "claimed" or events[-1]["run_id"] != run_id:
+            return False
+        if not _transition_permitted(bound["lifecycle"], "ready", [e["kind"] for e in events[:-1]]):
+            return False
+        payload = json.loads(events[-1]["payload"])
+        if (payload.get("lock"), payload.get("run_id"), payload.get("expires")) != (
+                claim_lock, run_id, claim["claim_expires"]):
+            return False
+        from hermes_cli.kanban_db_dispatch import check_respawn_guard
+        return check_respawn_guard(conn, task_id) in (None, "active_pr", "history_unresolved")
+    except (ResumeAuthorityError, KeyError, IndexError, TypeError, ValueError):
+        return False
 
 
 def snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:

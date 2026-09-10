@@ -46,18 +46,16 @@ from __future__ import annotations
 import json
 import os
 import re
-import queue
-import threading
 import sqlite3
 import subprocess
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_pr_association as _assoc
 from hermes_cli import kanban_resume as _resume
 
-RECONCILIATION_VERSION = 1
+RECONCILIATION_VERSION = 2
 
 # Classifications. ``OPEN`` and ``MERGED`` admit; the rest schedule a retry.
 OPEN = "open"
@@ -120,7 +118,7 @@ class Snapshot:
     branch_name: Optional[str]
     candidates: tuple[str, ...]
     association_kind: str
-    provenance: tuple[tuple[str, str, str], ...]
+    provenance: tuple[tuple[str, str, str, str], ...]
     captured_at: int
     checkout: Optional[dict[str, Any]] = None
     principal: str = ""
@@ -189,8 +187,11 @@ def validate_clearance(conn, task_id: str, clearance: PRClearance) -> bool:
             and check_respawn_guard(conn, task_id) in (None, "active_pr"))
 
 
-def clearance_workspace(conn, task_id: str, clearance: PRClearance) -> str:
-    if (not checkout_matches(conn, task_id, clearance.observation.evidence)
+def clearance_workspace(conn, task_id: str, clearance: PRClearance, *, run_id: int, claim_lock: str) -> str:
+    if (not _resume.post_claim_matches(conn, task_id, asdict(clearance.snapshot),
+                                       run_id=run_id, claim_lock=claim_lock)
+            or clearance.observation.principal != clearance.snapshot.principal
+            or not checkout_matches(conn, task_id, clearance.observation.evidence)
             or _resume.shared_checkout_writer(conn, task_id, int(time.time()))):
         raise _resume.ResumeAuthorityError("no-associated-PR checkout evidence changed")
     return clearance.snapshot.workspace_path
@@ -212,7 +213,7 @@ def capture(
     base = _resume.base_snapshot(conn, task_id)
     kind = _assoc.classify(conn, task_id, window_seconds=window_seconds, now=now)
     provenance = tuple(
-        (a.pr_url, a.source, a.source_id)
+        (a.pr_url, a.source, a.source_id, a.payload_digest)
         for a in _assoc.structured_associations(conn, task_id))
     if provenance:
         candidates = {p[0] for p in provenance}
@@ -236,7 +237,11 @@ def capture(
 # --- phase 2: observe (no database) -----------------------------------------
 
 def _gh_api(endpoint: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> Any:
-    """Read at most the byte cap plus one sentinel byte, under one deadline."""
+    """Read at most the byte cap plus one sentinel byte, under one deadline.
+
+    Builds without nonblocking subprocess pipes fail closed with TransportError;
+    no blocking reader is left behind as a platform fallback.
+    """
     deadline = time.monotonic() + timeout
     try:
         process = subprocess.Popen(
@@ -244,20 +249,26 @@ def _gh_api(endpoint: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> Any:
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError as exc:
         raise TransportError(type(exc).__name__) from None
-    output = queue.Queue(maxsize=1)
-
-    def read_bounded():
-        try:
-            output.put(process.stdout.read(MAX_RESPONSE_BYTES + 1))
-        except OSError:
-            output.put(None)
-
-    reader = threading.Thread(target=read_bounded, daemon=True)
-    reader.start()
     try:
-        raw = output.get(timeout=max(0, deadline - time.monotonic()))
-        if raw is None or len(raw) > MAX_RESPONSE_BYTES:
-            raise TransportError("response exceeded the byte bound or could not be read")
+        try:
+            os.set_blocking(process.stdout.fileno(), False)
+        except (OSError, AttributeError):
+            raise TransportError("nonblocking subprocess pipes are unsupported by this Python/platform") from None
+        raw = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TransportError("request deadline exhausted")
+            try:
+                chunk = os.read(process.stdout.fileno(), min(65536, MAX_RESPONSE_BYTES + 1 - len(raw)))
+            except BlockingIOError:
+                time.sleep(min(0.01, remaining))
+                continue
+            if not chunk:
+                break
+            raw.extend(chunk)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise TransportError("response exceeded the byte bound")
         process.wait(timeout=max(0, deadline - time.monotonic()))
         if process.returncode or time.monotonic() >= deadline:
             raise TransportError("request failed or exceeded deadline")
@@ -265,15 +276,18 @@ def _gh_api(endpoint: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> Any:
             return json.loads(raw)
         except (ValueError, UnicodeError):
             raise TransportError("response was not JSON") from None
-    except (queue.Empty, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
         raise TransportError("request deadline exhausted") from None
     finally:
+        # Closing our end is sufficient even when a descendant owns the writer.
+        # Only the immediate Popen child is ours to terminate; no process-group kill.
+        process.stdout.close()
         if process.poll() is None:
             process.kill()
-        process.wait()
-        reader.join(timeout=0.1)
-        if not reader.is_alive():
-            process.stdout.close()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            raise TransportError("owned gh child did not exit within cleanup grace") from None
 
 
 def _checkout_identity(path: Optional[str]) -> Optional[dict[str, Any]]:
@@ -328,7 +342,7 @@ def checkout_matches(conn, task_id: str, evidence: dict[str, Any]) -> bool:
     ).fetchone()
     if row is None or row["branch_name"] != evidence.get("branch"):
         return False
-    provenance = [[a.pr_url, a.source, a.source_id]
+    provenance = [[a.pr_url, a.source, a.source_id, a.payload_digest]
                   for a in _assoc.structured_associations(conn, task_id)]
     if provenance != evidence.get("provenance"):
         return False
@@ -340,20 +354,24 @@ def checkout_matches(conn, task_id: str, evidence: dict[str, Any]) -> bool:
         return False
 
 
-def resume_workspace(conn, task_id: str, receipt_id: int) -> str:
+def resume_workspace(conn, task_id: str, receipt_id: int, *, run_id: int, claim_lock: str) -> str:
     """A consumed receipt can only launch in the checkout it verified."""
     row = conn.execute(
-        "SELECT reconciliation, authority_kind, workspace_path FROM task_resume_receipts "
+        "SELECT * FROM task_resume_receipts "
         "WHERE id=? AND task_id=? AND consumed_run_id=("
         "SELECT current_run_id FROM tasks WHERE id=?)", (receipt_id, task_id, task_id)
     ).fetchone()
-    if row is None:
-        raise _resume.ResumeAuthorityError("resume receipt is not attached to this run")
+    if (row is None or row["consumed_run_id"] != run_id or row["revoked_at"] is not None
+            or row["expires_at"] <= int(time.time())
+            or not _resume.post_claim_matches(conn, task_id, row, run_id=run_id, claim_lock=claim_lock)):
+        raise _resume.ResumeAuthorityError("resume receipt no longer authorizes the intended claim")
     writer = _resume.shared_checkout_writer(conn, task_id, int(time.time()))
     if writer:
         raise _resume.ResumeAuthorityError(writer)
     if row["authority_kind"] == _resume.RECONCILED:
-        if not checkout_matches(conn, task_id, json.loads(row["reconciliation"])):
+        evidence = json.loads(row["reconciliation"])
+        if (evidence.get("principal") != row["issued_by"] or evidence.get("task_id") != task_id
+                or not checkout_matches(conn, task_id, evidence)):
             raise _resume.ResumeAuthorityError("resume checkout evidence changed or expired")
     if not row["workspace_path"] or not os.path.isdir(row["workspace_path"]):
         raise _resume.ResumeAuthorityError("resume checkout is unavailable")

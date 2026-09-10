@@ -997,6 +997,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_claim: Optional[tuple[int, str]] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1015,10 +1016,12 @@ def _record_task_failure(
     error = error[:500]
     with _kb.write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, claim_lock "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        if expected_claim is not None and (row["current_run_id"], row["claim_lock"]) != expected_claim:
             return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
@@ -1687,10 +1690,12 @@ def _dispatch_lane_task(
         resolved_branch_name = None
         if decision.resume_receipt_id is not None:
             workspace = _kb_reconcile.resume_workspace(
-                conn, claimed.id, decision.resume_receipt_id)
+                conn, claimed.id, decision.resume_receipt_id,
+                run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
             resolved_branch_name = claimed.branch_name
         elif decision.pr_clearance is not None:
-            workspace = _kb_reconcile.clearance_workspace(conn, claimed.id, decision.pr_clearance)
+            workspace = _kb_reconcile.clearance_workspace(conn, claimed.id, decision.pr_clearance,
+                run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
             resolved_branch_name = claimed.branch_name
         elif claimed.workspace_kind == "worktree":
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
@@ -1700,6 +1705,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            expected_claim=(claimed.current_run_id, claimed.claim_lock),
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -1714,9 +1720,11 @@ def _dispatch_lane_task(
     try:
         if decision.resume_receipt_id is not None:
             workspace = _kb_reconcile.resume_workspace(
-                conn, claimed.id, decision.resume_receipt_id)
+                conn, claimed.id, decision.resume_receipt_id,
+                run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
         if decision.pr_clearance is not None:
-            workspace = _kb_reconcile.clearance_workspace(conn, claimed.id, decision.pr_clearance)
+            workspace = _kb_reconcile.clearance_workspace(conn, claimed.id, decision.pr_clearance,
+                run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
@@ -1732,6 +1740,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            expected_claim=(claimed.current_run_id, claimed.claim_lock),
         ):
             result.auto_blocked.append(claimed.id)
         return False
