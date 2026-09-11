@@ -1258,6 +1258,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     _pre_update_plan = _begin_update_receipt_and_plan(args)
 
+    from hermes_cli.extension_health import refuse_in_place_update
+
+    refuse_in_place_update()
+
     # Backup before any git/file mutation; the snapshot id (None if disabled/failed) feeds
     # the post-update cron-jobs safety net.
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
