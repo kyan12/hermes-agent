@@ -352,8 +352,9 @@ The supported domain method is
 It atomically changes only the task status and appends a `blocked` audit event
 with the original blocker payload, recurrence count, escalation event ID,
 operator identity, and repair reason. It never passes through Ready, synthesizes
-a run, or spawns work. Repeating the repair on the still-blocked repaired task
-is a no-op. Intake cards, stale/inconsistent evidence, execution ownership,
+a run, or spawns work. Repeating the exact repair (same actor and repair reason after trimming surrounding
+whitespace) is a no-op only while the original escalation, audit facts, and
+still-blocked task remain consistent, with no intervening lifecycle event. Intake cards, stale/inconsistent evidence, execution ownership,
 open runs, and tasks in other lifecycle phases are rejected.
 
 The repair's ordinary `blocked` event is intentional: older dispatcher readers

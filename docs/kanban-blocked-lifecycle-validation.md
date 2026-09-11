@@ -114,3 +114,53 @@ or lockfiles were changed. `git diff --check` passed.
 - `tools/kanban_tools_schemas.py`
 - `website/docs/user-guide/features/kanban.md`
 - `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features/kanban.md`
+
+## P2 remediation: validate evidence on exact retries
+
+Remediation base: `b5a3276f35b6f36984f2a2f99c6a1b64d4aeaa55`.
+The earlier 251-Python/28-desktop results above describe the initial implementation,
+not a rerun on this remediation. This follow-up changes only the repair domain
+module, its tests, the retry wording in the user guide, and this record.
+
+Vertical TDD, using the same isolated wrapper and disposable fixture databases:
+
+1. Added strict original-escalation payload tests, then ran
+   `scripts/run_tests.sh tests/hermes_cli/test_kanban_block_loop_repair.py -k initial_repair --file-retries 0`.
+   **RED: 5 failed, 13 passed, 19 deselected.** Missing `kind` for an untyped task
+   and object/list/integer/boolean reasons were incorrectly accepted. Added minimal
+   explicit-key/type validation. **GREEN: full repair file, 37 passed.**
+2. Added tampered task/audit/reference and exact-retry tests, then ran
+   `scripts/run_tests.sh tests/hermes_cli/test_kanban_block_loop_repair.py -k 'retry or atomic_idempotent' --file-retries 0`.
+   **RED: 25 failed, 6 passed, 36 deselected.** Added shared original-evidence
+   validation before either success path; bound the audit reference to the actual
+   preceding same-task escalation; compared all preserved payload facts and trimmed
+   operator identity/reason; rejected intervening lifecycle events.
+   **GREEN: full repair file, 67 passed.**
+
+The original escalation must explicitly contain `kind` (valid non-dependency
+block kind or null), `reason` (string or null), and integer `recurrences`/`limit`
+excluding booleans, with `limit >= 1`, `recurrences >= limit`, and agreement with
+the task's blocker/counter. Retry audits must match the original facts and the
+exact normalized repair request. Whitespace around actor/reason is ignored;
+changing either value is refused. Commentary does not invalidate an otherwise
+exact retry. The existing ordinary `blocked` audit event is retained for old readers.
+The new refusal/no-op cases verify that the database remains byte-for-byte unchanged.
+
+Focused regression command on the remediation:
+
+```bash
+scripts/run_tests.sh \
+  tests/hermes_cli/test_kanban_block_loop_repair.py \
+  tests/hermes_cli/test_kanban_block_kinds.py \
+  tests/hermes_cli/test_kanban_blocked_sticky.py \
+  tests/hermes_cli/test_kanban_cli.py \
+  tests/hermes_cli/test_kanban_resume_authority.py \
+  tests/gateway/test_kanban_notifier.py \
+  --file-retries 0 -j 4
+```
+
+**144 passed, 0 failed, 0 skipped**, six files, 10.8 seconds.
+`.venv/bin/ruff check hermes_cli/kanban_block_repair.py tests/hermes_cli/test_kanban_block_loop_repair.py`
+and `git diff --check` also passed. No desktop code changed and no desktop tests
+were rerun for this follow-up. Existing unrelated lint warnings were not cleaned up.
+No live state, services, deployment, secrets, messaging, or ARBS effects were used.

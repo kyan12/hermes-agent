@@ -1,6 +1,7 @@
 """Operator repair for legacy unblock-loop escalations parked in intake."""
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from hermes_cli import kanban_db as kb
@@ -11,7 +12,8 @@ def repair_block_loop_task(
 ) -> bool:
     """Atomically restore a legacy triage escalation to sticky blocked.
 
-    Return False only for an already repaired, still-blocked task. Refuse
+    Return False only for an exact retry (trimmed actor/reason) whose original
+    escalation, audit facts, and still-blocked task remain consistent. Refuse
     stale evidence or any execution ownership. The ordinary blocked audit
     event also keeps pre-escalation sticky readers from auto-promoting it.
     No run, claim, recurrence, blocker, or PR authority field is changed.
@@ -28,38 +30,68 @@ def repair_block_loop_task(
             "SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL LIMIT 1", (task_id,),
         ).fetchone():
             raise ValueError("cannot repair a task with execution ownership or an open run")
-        event = conn.execute(
-            "SELECT id, kind, payload FROM task_events WHERE task_id=? AND kind IN ("
-            "'block_loop_detected', 'blocked', 'unblocked', 'status', 'completed', "
-            "'archived', 'claimed', 'dependency_wait', 'gave_up', 'review_requested', "
-            "'changes_requested', 'review_reopened', 'specified', 'decomposed', 'imported'"
-            ") ORDER BY id DESC LIMIT 1", (task_id,),
-        ).fetchone()
-        payload = kb._json_dict(event["payload"]) if event else {}
+        event = _latest_lifecycle_event(conn, task_id)
+        audit = None
         if task.status == "blocked":
-            if event and event["kind"] == "blocked" and payload.get("repair") == "block_loop_triage":
-                return False
-            raise ValueError("task is not a previously repaired legacy escalation")
-        count = payload.get("recurrences")
-        limit = payload.get("limit")
-        if (
-            not event or event["kind"] != "block_loop_detected"
-            or type(count) is not int or type(limit) is not int
-            or limit < 1 or count < limit or count != task.block_recurrences
-            or payload.get("kind") != task.block_kind
-            or task.block_kind == "dependency"
-            or task.block_kind not in kb.VALID_BLOCK_KINDS | {None}
-            or "reason" not in payload
-        ):
-            raise ValueError("missing, stale, or inconsistent block-loop evidence")
-        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
-        kb._append_event(conn, task_id, "blocked", {
+            if event is None or event["kind"] != "blocked":
+                raise ValueError("task is not a previously repaired legacy escalation")
+            audit = kb._json_dict(event["payload"])
+            reference = audit.get("escalation_event_id")
+            # The referenced escalation must be the preceding lifecycle occurrence,
+            # not a marker copied across an unblock, new run, or second repair.
+            event = _latest_lifecycle_event(conn, task_id, before_id=event["id"])
+            if type(reference) is not int or event is None or event["id"] != reference:
+                raise ValueError("repair audit does not reference the preceding escalation")
+        if event is None or event["kind"] != "block_loop_detected":
+            raise ValueError("missing or stale block-loop escalation")
+        payload = kb._json_dict(event["payload"])
+        _validate_escalation_payload(payload, task)
+        expected_audit = {
             **payload, "repair": "block_loop_triage", "actor": actor.strip(),
             "repair_reason": reason.strip(), "escalation_event_id": event["id"],
             "from_status": "triage", "status": "blocked",
-        })
+        }
+        if audit is not None:
+            # JSON comparison preserves numeric types (Python equates 2.0 and 2).
+            if json.dumps(audit, sort_keys=True) != json.dumps(expected_audit, sort_keys=True):
+                raise ValueError("repair audit or retry identity differs from original evidence")
+            return False
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+        kb._append_event(conn, task_id, "blocked", expected_audit)
     kb.notify_task_updated(conn, task_id, ("status",))
     return True
+
+
+def _latest_lifecycle_event(conn, task_id, *, before_id=None):
+    """Ignore commentary, but never bridge an intervening lifecycle occurrence."""
+    return conn.execute(
+        "SELECT id, kind, payload FROM task_events WHERE task_id=? "
+        "AND (? IS NULL OR id < ?) AND kind IN ("
+        "'created', 'block_loop_detected', 'blocked', 'unblocked', 'status', 'completed', "
+        "'archived', 'claimed', 'dependency_wait', 'gave_up', 'review_requested', "
+        "'changes_requested', 'review_reopened', 'specified', 'decomposed', 'imported', "
+        "'promoted', 'promoted_manual', 'scheduled', 'reclaimed', 'reconciled', "
+        "'spawned', 'spawn_failed', 'stale', 'timed_out', 'crashed', 'rate_limited', "
+        "'descendant_invalidated', 'resumed_on_authority'"
+        ") ORDER BY id DESC LIMIT 1", (task_id, before_id, before_id),
+    ).fetchone()
+
+
+def _validate_escalation_payload(payload: dict, task: kb.Task) -> None:
+    """Validate the original typed blocker and counters before either success path."""
+    count, limit = payload.get("recurrences"), payload.get("limit")
+    kind = payload.get("kind")
+    if (
+        type(count) is not int or type(limit) is not int
+        or limit < 1 or count < limit or count != task.block_recurrences
+        or "kind" not in payload
+        or (kind is not None and type(kind) is not str)
+        or kind not in kb.VALID_BLOCK_KINDS | {None}
+        or kind == "dependency" or kind != task.block_kind
+        or "reason" not in payload
+        or (payload["reason"] is not None and type(payload["reason"]) is not str)
+    ):
+        raise ValueError("missing, malformed, or inconsistent block-loop evidence")
 
 
 def cmd_repair_block_loop(args) -> int:
