@@ -22,6 +22,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_block_repair import cmd_repair_block_loop
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
@@ -912,13 +913,13 @@ def _cmd_block(args: argparse.Namespace) -> int:
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
-            # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
+            # Dependency waits auto-resume; repeated human blocks stay blocked.
             landed = kb.get_task(conn, tid)
             where = landed.status if landed else "blocked"
             if where == "todo":
                 return f"{tid} → todo (dependency wait){suffix}"
-            if where == "triage":
-                return f"{tid} → triage (unblock loop detected — needs a human decision){suffix}"
+            if landed and landed.block_recurrences >= kb.BLOCK_RECURRENCE_LIMIT:
+                return f"{tid} → blocked (unblock loop detected — needs a human decision){suffix}"
             return f"Blocked {tid}{suffix}"
 
         op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
@@ -1238,6 +1239,7 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
+    "repair-block-loop": cmd_repair_block_loop,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,

@@ -9,7 +9,7 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
   never enter the human ``blocked`` bucket a cron would keep unblocking.
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
   each same-cause re-block after an unblock increments ``block_recurrences``,
-  and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+  and at ``BLOCK_RECURRENCE_LIMIT`` the task stays ``blocked`` and escalates for a human.
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
   amnesia that let the loop run unbounded).
 * A successful ``complete_task`` resets the loop memory.
@@ -111,3 +111,24 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+
+@pytest.mark.parametrize("kind", ["needs_input", "capability", "transient", None])
+def test_repeated_blocks_stay_blocked_without_dispatch(kanban_home, kind):
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        for recurrence in range(1, kb.BLOCK_RECURRENCE_LIMIT + 2):
+            assert kb.block_task(conn, tid, reason="human decision", kind=kind)
+            task = kb.get_task(conn, tid)
+            assert task.status == "blocked"
+            assert task.block_recurrences == recurrence
+            events = kb.list_events(conn, tid)
+            assert not kb.block_task(conn, tid, reason="human decision", kind=kind)
+            assert kb.list_events(conn, tid) == events
+            for _ in range(3):
+                assert kb.recompute_ready(conn) == 0
+                assert kb.claim_task(conn, tid, claimer="worker") is None
+            if recurrence >= kb.BLOCK_RECURRENCE_LIMIT:
+                assert events[-1].kind == "block_loop_detected"
+                assert events[-1].payload["recurrences"] == recurrence
+            assert kb.unblock_task(conn, tid)
+            assert kb.claim_task(conn, tid, claimer="worker") is not None

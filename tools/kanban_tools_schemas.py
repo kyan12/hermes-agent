@@ -175,7 +175,8 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "kept blocked and escalated for a human decision. Triage is intake only. "
+        "Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),
     {
@@ -207,7 +208,7 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
         "column and notifies the subscriber. Unlike ``kanban_block`` this is "
         "NOT a blocker — it never counts toward unblock-loop detection, so a "
         "task can cycle through review across follow-ups without ever being "
-        "falsely escalated to triage. Use this instead of blocking with a "
+        "falsely escalated as a repeated blocker. Use this instead of blocking with a "
         "free-form 'review-required:' reason."
     ),
     {

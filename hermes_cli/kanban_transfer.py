@@ -44,7 +44,7 @@ ARCHIVE_FORMAT = "hermes-kanban-board"
 ARCHIVE_FORMAT_VERSION = 1
 
 # Statuses from which the dispatcher can still act on a task. A task whose
-# workspace cannot be rebuilt on this machine is parked in ``triage`` only
+# workspace cannot be rebuilt on this machine is parked in ``blocked`` only
 # if it is in one of these — terminal and already-parked tasks are left
 # alone rather than having their history rewritten.
 _DISPATCHABLE_STATUSES = ("ready", "running", "todo", "scheduled")
@@ -237,7 +237,7 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
       did not travel (``--no-attachments``) are dropped, since a dangling row
       breaks download in every UI.
     * Workspace paths are cleared. ``scratch`` regenerates on next claim;
-      dispatchable ``dir``/``worktree`` tasks are parked in ``triage``,
+      dispatchable ``dir``/``worktree`` tasks are parked in ``blocked``,
       otherwise the dispatcher claims them, fails to build a workspace, and
       burns them into the failure breaker.
     * Runtime state is scrubbed again (untrusted input, one UPDATE).
@@ -271,9 +271,14 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
         ]
         conn.execute("UPDATE tasks SET workspace_path = NULL, branch_name = NULL")
         if parked:
-            conn.execute(f"UPDATE tasks SET status = 'triage' WHERE id IN ({_placeholders(parked)})", parked)
+            conn.execute(f"UPDATE tasks SET status = 'blocked' WHERE id IN ({_placeholders(parked)})", parked)
+            for task_id in parked:
+                kb._append_event(conn, task_id, "blocked", {
+                    "reason": "Imported workspace is unavailable on this machine; operator must configure it",
+                    "source": "board_import",
+                })
             warnings.append(
-                f"{len(parked)} task(s) moved to triage — their workspace was a directory or git "
+                f"{len(parked)} task(s) moved to blocked — their workspace was a directory or git "
                 f"worktree on the exporting machine and needs to be pointed somewhere on this one"
             )
 

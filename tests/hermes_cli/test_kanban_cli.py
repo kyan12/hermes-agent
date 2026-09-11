@@ -182,3 +182,20 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_block_cli_reports_escalation_as_blocked(kanban_home, capsys):
+    parser = argparse.ArgumentParser()
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="human decision")
+        for recurrence in range(kb.BLOCK_RECURRENCE_LIMIT):
+            args = parser.parse_args(["kanban", "block", tid, "decision needed", "--kind", "needs_input"])
+            assert kc.kanban_command(args) == 0
+            output = capsys.readouterr().out
+            assert "blocked" in output.lower()
+            assert "triage" not in output.lower()
+            if recurrence + 1 == kb.BLOCK_RECURRENCE_LIMIT:
+                assert "human decision" in output
+            else:
+                assert kb.unblock_task(conn, tid)

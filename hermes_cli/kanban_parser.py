@@ -297,9 +297,14 @@ _SPECS = [
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
                   "parents finish, no human); 'needs_input'/'capability' go to "
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
-                  "Repeated same-kind re-blocks after unblock route the task to "
-                  "triage to break unblock loops. Omit for a generic block."),
+                  "Repeated same-kind re-blocks after unblock remain blocked and "
+                  "escalate for a human decision. Triage is intake only. Omit for a generic block."),
     ], help="Mark one or more tasks blocked"),
+    _cmd("repair-block-loop", [
+        _TASK_ID,
+        _arg("--actor", required=True, help="Operator identity for the repair audit"),
+        _arg("--reason", required=True, help="Why this legacy escalation needs repair"),
+    ], help="Restore a legacy block-loop triage card to sticky blocked without running it"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),

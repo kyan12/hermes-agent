@@ -231,7 +231,12 @@ def test_unresolvable_workspaces_are_parked_not_dispatched(kanban_root, tmp_path
     # The worktree lived on the exporting machine's disk. Letting the
     # dispatcher claim this would fail workspace resolution twice and trip
     # the failure breaker, so it waits for a human instead.
-    assert tasks["worktree task"]["status"] == "triage"
+    assert tasks["worktree task"]["status"] == "blocked"
+    with kbc.connect_closing(board=result["board"]) as conn:
+        tid = tasks["worktree task"]["id"]
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.claim_task(conn, tid) is None
     assert tasks["worktree task"]["workspace_path"] is None
     assert result["tasks_parked"] == 1
 

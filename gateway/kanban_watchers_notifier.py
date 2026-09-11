@@ -357,10 +357,9 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
-    # Re-blocked for the same cause past the limit and routed to `triage` for a
-    # human. It emits no blocked/status event, so ping loudly here.
+    # Repeated blocks remain blocked and escalate the decision to the origin.
     "block_loop_detected": lambda ev, n: (
-        f"🛑 {n.head} routed to TRIAGE — needs a human decision"
+        f"🛑 {n.head} remains BLOCKED — needs a human decision"
         f"{_clip(ev, 'recurrences', ' (blocked {}x for the same cause)', 200)}{_clip(ev, 'reason', ': {}', 160)}",
         None, None,
     ),

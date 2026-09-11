@@ -428,7 +428,7 @@ describe('terminal kinds beyond completed', () => {
     })
   })
 
-  it('block_loop_detected notifies (routed-to-triage handoff)', async () => {
+  it('block_loop_detected notifies (blocked escalation handoff)', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
 
@@ -436,6 +436,8 @@ describe('terminal kinds beyond completed', () => {
 
     expect(fired).toBe(true)
     expect(lastNotify()).toMatchObject({ kind: 'warning', message: 'same cause 3x' })
+    expect(lastNotify().title).toMatch(/blocked/i)
+    expect(lastNotify().title).not.toMatch(/triage/i)
   })
 
   it('gave_up carries the payload error; crashed and timed_out fall back to the task id', async () => {
