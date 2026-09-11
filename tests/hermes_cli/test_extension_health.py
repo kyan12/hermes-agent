@@ -5,6 +5,21 @@ from types import SimpleNamespace
 import pytest
 
 
+def _candidate_python(candidate):
+    import os
+    import subprocess
+    import venv
+
+    environment = candidate / "venv"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    probe = subprocess.run([str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                           check=True, capture_output=True, text=True)
+    site = Path(probe.stdout.strip())
+    (site / "candidate.pth").write_text(str(candidate) + "\n")
+    return str(python), site / "candidate.pth"
+
+
 @pytest.mark.parametrize("location", ["custom-sibling", "native-root", "native-sibling"])
 @pytest.mark.parametrize("config,refused", [
     ("kanban:\n  blocker_reconciler:\n    enabled: true\n", True),
@@ -53,7 +68,7 @@ def test_update_checks_all_profiles_before_mutation(tmp_path, monkeypatch, confi
 
 @pytest.mark.parametrize("damage", ["none", "removed", "stub", "malformed", "disabled", "startup", "startup-refused", "startup-env", "startup-serve",
     "startup-wrong-candidate", "startup-wrong-python", "startup-wrong-home", "startup-multi-home",
-    "startup-entry-removed", "startup-disabled", "startup-named", "startup-profile-default", "startup-host-override"])
+    "startup-entry-removed", "startup-disabled", "startup-named", "startup-profile-default", "startup-host-override", "startup-disabled-worker-absent"])
 def test_external_preflight_checks_fresh_candidate_and_persists_result(tmp_path, monkeypatch, damage):
     import hashlib
     import json
@@ -69,6 +84,7 @@ def test_external_preflight_checks_fresh_candidate_and_persists_result(tmp_path,
     (home / "config.yaml").write_text("kanban:\n  blocker_reconciler:\n    enabled: true\n")
     candidate = tmp_path / "candidate"
     candidate.mkdir()
+    candidate_python, installed_path = _candidate_python(candidate)
     marker = tmp_path / "started"
     sources = {
         "hermes_cli/__init__.py": "",
@@ -76,9 +92,11 @@ def test_external_preflight_checks_fresh_candidate_and_persists_result(tmp_path,
             "import json, os, sys\nfrom pathlib import Path\n"
             f"Path({str(marker)!r}).write_text(json.dumps({{'home': os.environ.get('HERMES_HOME'), "
             "'fence': os.environ.get('HERMES_DELEGATED_CHILD_CONTEXT'), 'module': __file__, "
-            "'python': sys.executable, 'argv': sys.argv, 'original_argv': sys.orig_argv, "
+            "'python': sys.executable, 'cwd': os.getcwd(), 'argv': sys.argv, 'original_argv': sys.orig_argv, "
             "'pythonpath': os.environ.get('PYTHONPATH'), 'pythonhome': os.environ.get('PYTHONHOME')}))\n"
         ),
+        "hermes_cli/update_cmd.py": "def _cmd_update_impl(*args): pass\n",
+        "hermes_cli/extension_health.py": "def refuse_in_place_update(): pass\n",
         "gateway/__init__.py": "",
         "hermes_cli/kanban_db.py": "def blocker_reconciler_enabled(): return True\n",
         "hermes_cli/reconciler.py": "def reconcile(): pass\n",
@@ -111,11 +129,20 @@ def test_external_preflight_checks_fresh_candidate_and_persists_result(tmp_path,
         approval.write_text(json.dumps(data))
     if damage == "malformed":
         (home / "config.yaml").write_text("kanban: [private-test-value")
-    if damage in {"disabled", "startup-disabled"}:
+    if damage in {"disabled", "startup-disabled", "startup-disabled-worker-absent"}:
         (home / "config.yaml").write_text("kanban:\n  blocker_reconciler:\n    enabled: false\n")
-        approval.unlink()
-        if damage == "startup-disabled":
+        if damage == "disabled":
+            approval.unlink()
+        else:
+            data = json.loads(approval.read_text())
+            data["files"] = {p: h for p, h in data["files"].items() if p in {
+                "hermes_cli/__init__.py", "hermes_cli/main.py", "hermes_cli/update_cmd.py",
+                "hermes_cli/extension_health.py"}}
+            data["symbols"] = []
+            approval.write_text(json.dumps(data))
             (candidate / "hermes_cli/kanban_db.py").unlink()
+            if damage == "startup-disabled-worker-absent":
+                (candidate / "hermes_cli/update_cmd.py").unlink()
     launch = []
     extra_homes = ["--bind-host=--profile=other"] if damage == "startup-host-override" else []
     if damage.startswith("startup"):
@@ -145,9 +172,18 @@ def test_external_preflight_checks_fresh_candidate_and_persists_result(tmp_path,
         (shadow / "hermes_cli/main.py").write_text("raise RuntimeError('wrong source launched')\n")
         monkeypatch.setenv("PYTHONPATH", str(shadow))
         monkeypatch.setenv("PYTHONHOME", str(tmp_path / "invalid-python-home"))
+    if launch:
+        cli = tmp_path / "bound-bin" / "hermes"
+        cli.parent.mkdir()
+        made = subprocess.run([sys.executable, "-I", str(guard), "--candidate", str(candidate),
+                               "--python", candidate_python, "--home", str(home),
+                               "--approval", str(approval), "--cli-shim", str(cli), "--write-cli-shim"],
+                              capture_output=True, text=True)
+        assert made.returncode == 0, made.stderr
+        extra_homes += ["--cli-shim", str(cli)]
     result = subprocess.run([sys.executable, "-I", str(guard), "--candidate", str(candidate),
-                             "--python", sys.executable, "--home", str(home),
-                             "--approval", str(approval), *extra_homes, *launch], capture_output=True, text=True)
+                             "--python", candidate_python, "--home", str(home),
+                             "--approval", str(approval), *extra_homes, *launch], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == (0 if damage in {"none", "disabled", "startup", "startup-env", "startup-serve", "startup-disabled", "startup-named"} else 2)
     receipt = json.loads((home / "logs/blocker-reconciler-health.json").read_text())
     assert receipt["status"] == ("ready" if result.returncode == 0 else "refused")
@@ -160,11 +196,128 @@ def test_external_preflight_checks_fresh_candidate_and_persists_result(tmp_path,
         identity = json.loads(marker.read_text())
         assert identity["home"] == str(home.resolve())
         assert identity["module"] == str(candidate / "hermes_cli/main.py")
-        assert identity["python"] == sys.executable
+        assert identity["python"] == candidate_python
         module_index = identity["original_argv"].index("-m")
         assert identity["original_argv"][module_index + 1] == "hermes_cli.main"
         assert identity["fence"] == "2"
         assert identity["pythonpath"] is None and identity["pythonhome"] is None
-        assert identity["argv"][1:3] == ["--profile", "work" if damage == "startup-named" else "default"]
+        assert identity["cwd"] == str(tmp_path)
+        if damage == "startup-named":
+            assert identity["argv"][1:3] == ["--profile", "work"]
+        else:
+            assert "--profile" not in identity["argv"]
+        if "gateway" in identity["argv"]:
+            import shlex
+            from gateway.status import looks_like_gateway_command_line, _command_line_belongs_to_profile
+
+            assert "--external-supervisor" in identity["argv"]
+            command_line = shlex.join(identity["original_argv"])
+            assert looks_like_gateway_command_line(command_line)
+            assert _command_line_belongs_to_profile(command_line, home)
         if damage == "startup-serve":
             assert "--isolated" in identity["argv"]
+
+
+# Only synthetic source in tmp_path is executable here; no real updater is invoked.
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.macos_only
+@pytest.mark.parametrize("scenario", ["worker", "cli", "lost-update-guard", "lost-engine-chat", "lost-engine-kanban", "wrong-editable"])
+def test_bound_cli_shim_preserves_worker_provenance_and_update_boundary(tmp_path, monkeypatch, scenario):
+    import hashlib
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    from hermes_cli import extension_health
+    from hermes_cli.kanban_db_dispatch import _resolve_hermes_argv
+
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    candidate_python, installed_path = _candidate_python(candidate)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("kanban:\n  blocker_reconciler:\n    enabled: true\n")
+    marker = tmp_path / "identity.json"
+    sources = {
+        "hermes_cli/__init__.py": "",
+        "hermes_cli/main.py": (
+            "import os, sys, json\nfrom pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text(json.dumps({{'module': __file__, 'python': sys.executable, "
+            "'argv': sys.argv, 'home': os.environ['HERMES_HOME'], 'bin': os.environ['HERMES_BIN'], "
+            "'cwd': os.getcwd(), 'path': os.environ['PATH'], 'fence': os.environ.get('HERMES_DELEGATED_CHILD_CONTEXT')}))\n"
+        ),
+        "hermes_cli/update_cmd.py": "def _cmd_update_impl(*args): pass\n",
+        "hermes_cli/extension_health.py": "def refuse_in_place_update(): pass\n",
+        "hermes_cli/kanban_db.py": "def blocker_reconciler_enabled(): return True\n",
+        "hermes_cli/reconciler.py": "def reconcile(): pass\n",
+        "gateway/__init__.py": "",
+        "gateway/kanban_watchers.py": "class GatewayKanbanWatchersMixin:\n    def reconcile(self): pass\n",
+    }
+    for name, content in sources.items():
+        path = candidate / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"files": {p: hashlib.sha256(s.encode()).hexdigest()
+                                               for p, s in sources.items()}, "symbols": [
+        "hermes_cli.kanban_db:blocker_reconciler_enabled", "hermes_cli.reconciler:reconcile",
+        "gateway.kanban_watchers:GatewayKanbanWatchersMixin.reconcile",
+    ]}))
+    guard = tmp_path / "guard.py"
+    shutil.copyfile(extension_health.__file__, guard)
+    cli = tmp_path / "bin" / "hermes"
+    cli.parent.mkdir()
+    base = [sys.executable, "-I", str(guard), "--candidate", str(candidate),
+            "--python", candidate_python, "--home", str(home), "--approval", str(approval),
+            "--cli-shim", str(cli)]
+    made = subprocess.run([*base, "--write-cli-shim"], capture_output=True, text=True)
+    assert made.returncode == 0, made.stderr
+    stale = tmp_path / "stale" / "hermes"
+    stale.parent.mkdir()
+    unsupported = tmp_path / "unsupported-started"
+    stale.write_text(f"#!/bin/sh\ntouch '{unsupported}'\n")
+    stale.chmod(0o755)
+    env = dict(os.environ, HERMES_BIN=str(stale), PATH=str(stale.parent) + os.pathsep + os.defpath,
+               HERMES_HOME=str(home), HERMES_DELEGATED_CHILD_CONTEXT="1")
+    worktree = tmp_path / "task-worktree"
+    worktree.mkdir()
+    if scenario == "worker":
+        launched = subprocess.run([*base, "--launch", "gateway"], env=env, cwd=worktree, capture_output=True, text=True)
+        assert launched.returncode == 0, launched.stderr
+        parent = json.loads(marker.read_text())
+        monkeypatch.setenv("HERMES_BIN", parent["bin"])
+        monkeypatch.setenv("PATH", parent["path"])
+        argv = _resolve_hermes_argv()  # Real native resolver, without board operations.
+        assert argv == [str(cli)]
+        worker_home = home / "profiles" / "work"
+        worker_home.mkdir(parents=True)
+        env.update(HERMES_HOME=str(worker_home))
+        command = [*argv, "-p", "work", "--cli", "chat", "-q", "synthetic"]
+    else:
+        # CLI maintenance stays reachable when reconciler support is absent.
+        (candidate / "hermes_cli/kanban_db.py").unlink()
+        command = [str(cli), "config", "set", "kanban.blocker_reconciler.enabled", "false"]
+        if scenario == "lost-update-guard":
+            (candidate / "hermes_cli/update_cmd.py").unlink()
+            command = [str(cli), "update"]
+        elif scenario in {"lost-engine-chat", "lost-engine-kanban"}:
+            command = [str(cli), "chat" if scenario.endswith("chat") else "kanban", "list"]
+        elif scenario == "wrong-editable":
+            wrong = tmp_path / "wrong-install"
+            shutil.copytree(candidate / "hermes_cli", wrong / "hermes_cli")
+            installed_path.write_text(str(wrong) + "\n")
+    result = subprocess.run(command, env=env, cwd=worktree, capture_output=True, text=True)
+    assert result.returncode == (2 if scenario in {"lost-update-guard", "lost-engine-chat", "lost-engine-kanban", "wrong-editable"} else 0), result.stderr
+    assert not unsupported.exists()
+    if result.returncode == 0:
+        identity = json.loads(marker.read_text())
+        assert identity["module"] == str(candidate / "hermes_cli/main.py")
+        assert identity["python"] == candidate_python
+        assert identity["home"] == env["HERMES_HOME"]
+        assert identity["argv"][1:] == command[1:]
+        assert identity["fence"] == "1"
+        assert identity["cwd"] == str(worktree)
+    else:
+        assert not marker.exists()
+        assert json.loads((home / "logs/blocker-reconciler-health.json").read_text())["status"] == "refused"
