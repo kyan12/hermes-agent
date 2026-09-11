@@ -1099,6 +1099,8 @@ def test_worker_process_uses_board_policy_without_its_own_setting(isolated_home,
         sync_dispatcher_policy(conn)
         worker_home = isolated_home / 'other-profile'
         worker_home.mkdir()
+        worker_tmpdir = isolated_home / 'worker-tmp'
+        worker_tmpdir.mkdir()
         script = '''from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
 with kbc.connect_closing() as conn:
     task = kb.create_task(conn, title="other profile source", assignee="default")
@@ -1108,7 +1110,7 @@ with kbc.connect_closing() as conn:
         result = subprocess.run([sys.executable, '-B', '-c', script], cwd=Path(__file__).resolve().parents[2],
             env={'HOME': str(worker_home), 'HERMES_HOME': str(worker_home),
                  'HERMES_KANBAN_DB': str(kb.kanban_db_path()), 'PATH': os.defpath,
-                 'TMPDIR': os.environ['TMPDIR'], 'PYTHONDONTWRITEBYTECODE': '1'},
+                 'TMPDIR': str(worker_tmpdir), 'PYTHONDONTWRITEBYTECODE': '1'},
             capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         assert len(_reconciliation_tasks(conn)) == 1
