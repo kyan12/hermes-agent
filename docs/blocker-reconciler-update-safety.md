@@ -18,7 +18,9 @@ There is no general local-extension carry-forward hook. Syntax validation and a
 versioned directory do not prove preservation of custom runtime behavior.
 
 This integration refuses mutating `hermes update` with exit 2 whenever any
-canonical fleet profile or the active custom home enables the reconciler. It
+native default home, its inactive named profiles, or the supplied custom root/profile
+fleet enables the reconciler. Native and custom roots are both checked even when
+HERMES_HOME selects a custom root. It
 also refuses malformed config and non-boolean enabled values. The guard runs
 before backup, gateway pause, source replacement, or restart, independent of
 force options. Read-only `--plan` and `--check` retain their existing behavior.
@@ -42,8 +44,9 @@ malformed settings never become false through coercion.
 
 An independent authorized deployment owner must perform these steps after the
 restoration lane is integrated. Do not run them from a delegated gateway child.
-Keep the existing launchers, service environment, worker fences and natural-drain
-requirements intact. The local extension README was inspected read-only; its
+Keep service ownership, worker fences and natural-drain requirements intact.
+The startup command must be revised to the constrained form below; arbitrary
+existing launchers are no longer accepted. The local extension README was inspected read-only; its
 standalone extension directory exists, but no reconciler implementation or
 `hermes-local-extension-ops` skill was recovered there.
 
@@ -67,6 +70,9 @@ live deployment in place. Do not generate approval merely because staging succee
 After functional review, create `reviewed-files.txt` with one candidate-relative
 path per line: include `hermes_cli/kanban_db.py`, `gateway/kanban_watchers.py`, the
 restored engine, their runtime dependency/wiring closure, and the updater guard.
+Startup additionally requires hashes for `hermes_cli/main.py` and
+`hermes_cli/__init__.py`. The entry module is located in a fresh process without
+importing its live-config startup code during preflight.
 Create `reviewed-symbols.txt` with one actual `module:attribute` per line:
 
 - `hermes_cli.kanban_db:blocker_reconciler_enabled`
@@ -101,7 +107,7 @@ on separate custom roots). Archive the approval and diagnostics with the decisio
 candidate_python=/absolute/path/to/candidate/venv/bin/python
 profile_home=/absolute/path/to/default-home
 second_home=/absolute/path/to/another-profile-home
-"$guard_python" "$ops_dir/guard.py" \
+"$guard_python" -I "$ops_dir/guard.py" \
   --candidate "$candidate" --python "$candidate_python" \
   --home "$profile_home" --home "$second_home" \
   --approval "$ops_dir/approval.json"
@@ -115,25 +121,62 @@ reconciler behavior under the parent acceptance plan.
 
 ## Startup integration
 
-Wrap each gateway/dashboard's existing launch command with the external guard.
-The wrapper must remain outside the source tree and point at the same immutable
-candidate and profile(s) as its launch command. For example, its final invocation
-has this exact structure (fill in the existing command and arguments verbatim):
+Install the external guard as the service's launch boundary, with **one** explicit
+home per service. `--launch` accepts only `gateway`, `serve`, or `dashboard`.
+It does not accept executables, interpreters, module names, profile overrides or
+extra arguments. The same absolute `--python` path is used for both validation
+and execution (its venv symlink spelling is preserved). The guard pins imports
+and the working directory to the resolved `--candidate`, launches only
+`hermes_cli.main`, and supplies an explicit profile selection derived from
+`--home`. Sticky active profiles and inherited HERMES_HOME cannot redirect it.
+Non-canonical named homes that would normalize to another home are refused.
+
+Revised gateway command (not executed):
 
 ```sh
-exec "$guard_python" "$ops_dir/guard.py" \
+exec "$guard_python" -I "$ops_dir/guard.py" \
   --candidate "$candidate" --python "$candidate_python" \
   --home "$profile_home" --approval "$ops_dir/approval.json" \
-  --launch /absolute/path/to/existing-launch-command existing-arg-1 existing-arg-2
+  --launch gateway
 ```
 
-`--launch` must be last. It replaces the guard process only after all homes pass,
-preserving the service environment and delegated-child fences. The guard does not
-alter HERMES_HOME or choose a profile for the launched process. Keep the launcher's
-existing profile environment. On refusal, stderr and the persistent diagnostic
-explain the failure, and no launch occurs. Do not use `--launch` for an update,
-config mutation, or service-control command. A successful start check cannot
-make an in-place source update safe.
+For the dashboard service use this bound command, with the reviewed port/host:
+
+```sh
+exec "$guard_python" -I "$ops_dir/guard.py" \
+  --candidate "$candidate" --python "$candidate_python" \
+  --home "$profile_home" --approval "$ops_dir/approval.json" \
+  --port 9119 --bind-host 127.0.0.1 --launch dashboard
+```
+
+Use `--launch serve` for the headless backend. Dashboard/serve include `--isolated`
+to prevent a named-home launch from forwarding to the machine-level server;
+dashboard also uses `--no-open`. This is an explicit per-home service launch,
+not a replacement for the unified interactive launcher. Extra runtime options
+are intentionally unsupported in this bounded integration. A timestamp wrapper
+may remain **outside** this command for log formatting, but must not choose a
+second interpreter/launcher; replace its old child argv with the exact bound
+command. No timestamp wrapper or service definition was changed in this lane.
+
+Always invoke the external guard with `-I`, as shown: otherwise inherited Python
+settings could interfere before the guard itself imports. The probe also uses `-I`; startup uses `-E -s -B -m hermes_cli.main`
+from the checked candidate directory, with a fresh bytecode path. This keeps an
+actual module launch while ignoring inherited Python settings and user-site code. The launched environment removes
+PYTHONPATH/PYTHONHOME, sets HERMES_HOME to the checked home and preserves other
+service variables, including delegated-child fences. No unrelated autonomy or
+configuration is disabled. If the reconciler is explicitly false or absent,
+startup still validates entry-module origin and binding, but does not require
+reconciler approval/support. Readiness is persisted only after all validations;
+invalid legacy launchers and missing enabled runtime support write a durable
+refusal and do not execute the application. `ready` is preflight status, not
+proof that the application subsequently started or the watcher ran.
+
+`--launch` must be last. Multiple homes are supported for deployment preflight
+without `--launch`, but rejected for a single startup. Config mutation and update
+commands cannot be launched through this interface. A successful start check
+cannot make an in-place source update safe. An external installed guard still
+refuses at next startup if a native source update removes enabled support; the
+maintained updater's early refusal prevents that source swap in the first place.
 
 ## Rollback and limits
 
@@ -150,8 +193,8 @@ silently disables anything. Do not restore the live DB to roll back code.
 
 This boundary is not active until installed in every relevant launch/deployment
 path. Direct git pulls, alternative updaters, omitted custom profile roots,
-misbound launch commands and removal/bypass of the wrapper are outside its
-coverage. Immutability and trusted approval custody prevent changes between
+and removal/bypass of the wrapper are outside its coverage. Legacy arbitrary
+launchers now refuse; no separate launch candidate/interpreter/home is accepted. Immutability and trusted approval custody prevent changes between
 preflight and launch; this is not a hostile-code sandbox or a filesystem lock.
 Imports and hashes establish reviewed support presence, not successful background
 scheduling. The combined restored engine, real watcher wiring, all-host assets,
@@ -176,3 +219,29 @@ GREEN 11 passed. The two parameterized contracts exercise real config parsing,
 profile enumeration, candidate imports and subprocesses; updater side effects
 stop at a sentinel before the first backup. They do not claim a live-engine E2E.
 Final regression command adds `tests/hermes_cli/test_update_receipt.py`: 34 passed.
+
+
+### Review remediation (after `63a31c3eb2`)
+
+Both P1s from `review-result.txt` were reproduced with synthetic candidates and
+isolated real profile enumeration. No activation or approval manifest was made.
+Use the known complete interpreter and four workers for every command:
+
+```sh
+export HERMES_PYTHON=/Users/kyan/.hermes/upstream/hermes-agent/.worktrees/t_b5ca1e7f/.venv/bin/python
+scripts/run_tests.sh tests/hermes_cli/test_extension_health.py -j4 --file-retries 0 -q -k test_update_checks_all_profiles_before_mutation
+scripts/run_tests.sh tests/hermes_cli/test_extension_health.py -j4 --file-retries 0 -q -k test_external_preflight_checks_fresh_candidate_and_persists_result
+scripts/run_tests.sh tests/hermes_cli/test_extension_health.py tests/hermes_cli/test_update_receipt.py -j4 --file-retries 0 -q
+```
+
+Native/custom enumeration: RED 6 failed/6 passed; GREEN 12 passed. Startup binding:
+RED 7 failed/7 passed; GREEN 14 passed. Disabled-startup contract: RED 1 failed;
+then GREEN in the full run. Additional profile/host redirect checks: RED 2 failed/
+1 passed; then GREEN in the full run. Synthetic startup records interpreter,
+module path, explicit home, profile argv and the real delegated-child environment
+marker; stale launchers never execute. Inherited Python shadow/home settings are
+injected into an isolated guard invocation. All config/markers are disposable.
+
+The direct module-launch contract also ran RED (1 failed) before replacing the
+bootstrap with a bound `-m hermes_cli.main` invocation. Final remedial regression:
+**53 passed**, with `-j4`; Ruff and `git diff --check` passed.

@@ -61,10 +61,19 @@ def diagnostic(home: Path, status: str, reason: str) -> None:
 
 
 def refuse_in_place_update() -> None:
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
+    from hermes_cli.profiles import _PROFILE_ID_RE
     from hermes_cli.update_receipt import _profile_homes
 
     homes = {Path(get_hermes_home()), *(Path(home) for _, home in _profile_homes())}
+    # A custom HERMES_HOME changes _profile_homes()'s root, but the native
+    # fleet can still share this checkout, including currently inactive profiles.
+    native = _get_platform_default_hermes_home()
+    homes.add(native)
+    profiles = native / "profiles"
+    if profiles.is_dir():
+        homes.update(entry for entry in profiles.iterdir()
+                     if entry.is_dir() and entry.name != "default" and _PROFILE_ID_RE.match(entry.name))
     refused = False
     for home in sorted(homes):
         try:
@@ -86,15 +95,21 @@ def refuse_in_place_update() -> None:
 # Run from the candidate interpreter, with an empty home and no inherited credentials.
 # The external approval binds the wiring and implementation reviewed by the operator.
 _PROBE = r'''
-import importlib, pathlib, sys
+import importlib, importlib.util, pathlib, sys
 root = pathlib.Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(root))
 for symbol in sys.argv[2:]:
     module_name, attribute = symbol.split(":")
-    module = importlib.import_module(module_name)
-    origin = pathlib.Path(module.__file__).resolve()
+    if not attribute:
+        # Locate startup without importing it: main imports live configuration.
+        origin = pathlib.Path(importlib.util.find_spec(module_name).origin).resolve()
+    else:
+        module = importlib.import_module(module_name)
+        origin = pathlib.Path(module.__file__).resolve()
     if origin != root.joinpath(*module_name.split(".")).with_suffix(".py"):
         raise RuntimeError("foreign module")
+    if not attribute:
+        continue
     value = module
     for part in attribute.split("."):
         value = getattr(value, part)
@@ -103,35 +118,39 @@ for symbol in sys.argv[2:]:
 '''
 
 
-def check_candidate(candidate: Path, python: str, approval: Path) -> None:
+def check_candidate(candidate: Path, python: str, approval: Path, *, startup: bool = False, enabled: bool = True) -> None:
     import hashlib
     import subprocess
 
     try:
-        data = json.loads(approval.read_text(encoding="utf-8"))
-        files, symbols = data["files"], data["symbols"]
-        if not isinstance(files, dict) or not isinstance(symbols, list):
-            raise ValueError()
-        if "hermes_cli.kanban_db:blocker_reconciler_enabled" not in symbols:
-            raise ValueError()
-        if not any(s.startswith("gateway.kanban_watchers:GatewayKanbanWatchersMixin.") for s in symbols):
-            raise ValueError()
-        if not any(s.startswith("hermes_cli.") and not s.startswith("hermes_cli.kanban_db:")
-                   for s in symbols):
-            raise ValueError()
-        for symbol in symbols:
-            module, attribute = symbol.split(":")
-            if not all(part.isidentifier() for part in (module + "." + attribute).split(".")):
-                raise ValueError()
-            if module.replace(".", "/") + ".py" not in files:
-                raise ValueError()
         root = candidate.resolve(strict=True)
-        for relative, expected in files.items():
-            path = (root / relative).resolve(strict=True)
-            if Path(relative).is_absolute() or not path.is_relative_to(root):
+        symbols = []
+        if enabled:
+            data = json.loads(approval.read_text(encoding="utf-8"))
+            files, symbols = data["files"], data["symbols"]
+            if startup and not {"hermes_cli/main.py", "hermes_cli/__init__.py"} <= files.keys():
                 raise ValueError()
-            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            if not isinstance(files, dict) or not isinstance(symbols, list):
                 raise ValueError()
+            if "hermes_cli.kanban_db:blocker_reconciler_enabled" not in symbols:
+                raise ValueError()
+            if not any(s.startswith("gateway.kanban_watchers:GatewayKanbanWatchersMixin.") for s in symbols):
+                raise ValueError()
+            if not any(s.startswith("hermes_cli.") and not s.startswith("hermes_cli.kanban_db:")
+                       for s in symbols):
+                raise ValueError()
+            for symbol in symbols:
+                module, attribute = symbol.split(":")
+                if not all(part.isidentifier() for part in (module + "." + attribute).split(".")):
+                    raise ValueError()
+                if module.replace(".", "/") + ".py" not in files:
+                    raise ValueError()
+            for relative, expected in files.items():
+                path = (root / relative).resolve(strict=True)
+                if Path(relative).is_absolute() or not path.is_relative_to(root):
+                    raise ValueError()
+                if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                    raise ValueError()
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         raise HealthRefusal("missing-or-mismatched-reviewed-approval") from None
 
@@ -142,7 +161,8 @@ def check_candidate(candidate: Path, python: str, approval: Path) -> None:
                 "kanban:\n  blocker_reconciler:\n    enabled: true\n", encoding="utf-8")
             result = subprocess.run(
                 [python, "-I", "-B", "-X", f"pycache_prefix={disposable / 'bytecode'}",
-                 "-c", _PROBE, str(root), *symbols],
+                 "-c", _PROBE, str(root), *symbols,
+                 *(["hermes_cli.main:"] if startup else [])],
                 cwd=disposable,
                 env={"HOME": temporary, "USERPROFILE": temporary,
                      "HERMES_HOME": temporary, "PATH": os.defpath,
@@ -155,6 +175,39 @@ def check_candidate(candidate: Path, python: str, approval: Path) -> None:
         raise HealthRefusal("candidate-runtime-probe-failed") from None
 
 
+def bound_startup(args) -> tuple[list[str], dict[str, str]]:
+    """Reject legacy launchers and profile overrides before recording readiness."""
+    if len(args.home) != 1 or len(args.launch) != 1:
+        raise HealthRefusal("startup-requires-one-home-and-fixed-target")
+    commands = {
+        "gateway": ["gateway", "run"],
+        "serve": ["serve", "--isolated", "--host", args.bind_host, "--port", str(args.port)],
+        "dashboard": ["dashboard", "--isolated", "--no-open", "--host", args.bind_host,
+                      "--port", str(args.port)],
+    }
+    command = commands.get(args.launch[0])
+    if command is None or not 0 <= args.port <= 65535 or args.bind_host.startswith("-"):
+        raise HealthRefusal("unsupported-startup-target")
+    if not Path(args.python).is_absolute() or not Path(args.python).is_file():
+        raise HealthRefusal("startup-requires-absolute-interpreter")
+    home = args.home[0].resolve()
+    if home.parent.name == "profiles" and (
+        home.name == "default" or home.name != home.name.strip().lower()
+    ):
+        raise HealthRefusal("startup-profile-would-be-redirected")
+    # Preserve the venv path spelling: resolving a python symlink loses the venv.
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
+    environment["HERMES_HOME"] = str(home)
+    with tempfile.TemporaryDirectory(prefix="hermes-start-bytecode-") as cache:
+        # -B prevents writes; the unique (now removed) prefix prevents stale reads.
+        profile = home.name if home.parent.name == "profiles" else "default"
+        argv = [args.python, "-E", "-s", "-B", "-X", f"pycache_prefix={cache}",
+                "-m", "hermes_cli.main", "--profile", profile, *command]
+    return argv, environment
+
+
 def main() -> int:
     import argparse
 
@@ -164,20 +217,28 @@ def main() -> int:
     parser.add_argument("--home", type=Path, action="append", required=True,
                         help="Every affected profile home; repeat for fleet deployments")
     parser.add_argument("--approval", type=Path, required=True)
+    parser.add_argument("--port", type=int, default=9119)
+    parser.add_argument("--bind-host", default="127.0.0.1")
     parser.add_argument("--launch", nargs=argparse.REMAINDER,
-                        help="After successful preflight, exec the exact operator-reviewed startup command")
+                        help="Fixed startup target: gateway, serve, or dashboard (must be last)")
     args = parser.parse_args()
     failed = False
+    startup = None
+    reasons = {}
     for home in args.home:
         try:
             if not home.is_dir():
                 raise HealthRefusal("profile-home-missing")
-            if reconciler_requested(home):
-                check_candidate(args.candidate, args.python, args.approval)
-                reason = "reviewed-runtime-support-present"
+            if args.launch is not None:
+                startup = bound_startup(args)
+            requested = reconciler_requested(home)
+            if requested or startup:
+                check_candidate(args.candidate, args.python, args.approval,
+                                startup=bool(startup), enabled=requested)
+                reason = "reviewed-runtime-support-present" if requested else "extension-not-enabled"
             else:
                 reason = "extension-not-enabled"
-            diagnostic(home, "ready", reason)
+            reasons[home] = reason
         except HealthRefusal as exc:
             failed = True
             print(f"Blocker reconciler: {exc}; deployment/startup refused.", file=sys.stderr)
@@ -190,10 +251,22 @@ def main() -> int:
             print("Blocker reconciler: diagnostic-write-failed; deployment/startup refused.", file=sys.stderr)
     if failed:
         return 2
-    if args.launch:
-        # Keep delegated-child fences and the service environment intact. The operator
-        # must bind this command to the same immutable candidate checked above.
-        os.execvp(args.launch[0], args.launch)
+    try:
+        for home, reason in reasons.items():
+            diagnostic(home, "ready", reason)
+        if startup:
+            # -m resolves the fixed module from this checked tree. -E/-s ignore
+            # inherited Python settings and user site without excluding this cwd.
+            os.chdir(args.candidate.resolve())
+            os.execve(args.python, *startup)
+    except OSError:
+        for home in args.home:
+            print("Blocker reconciler: startup-or-diagnostic-failed; refused.", file=sys.stderr)
+            try:
+                diagnostic(home, "refused", "startup-or-diagnostic-failed")
+            except OSError:
+                print("Blocker reconciler: diagnostic-write-failed.", file=sys.stderr)
+        return 2
     return 0
 
 
