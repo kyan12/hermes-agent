@@ -232,3 +232,44 @@ def test_new_explicit_gate_after_managed_recovery_still_notifies_when_disabled(r
     deliver(runner, collect(runner))
     assert len(runner.adapters[Platform.TELEGRAM].sent) == 1
     assert 'Approve a new deployment' in runner.adapters[Platform.TELEGRAM].sent[0]
+
+
+@pytest.mark.parametrize("mode", ["notify+wake", "wake"])
+@pytest.mark.parametrize("refuse_first", [False, True])
+def test_raw_gate_claimed_before_dispatcher_affirmation(rig, mode, refuse_first):
+    runner, settings = rig
+    from hermes_cli.kanban_blocker_capture import drain_pending
+    from hermes_cli.kanban_blocker_policy import sync_dispatcher_policy
+    with kbc.connect_closing() as conn:
+        sync_dispatcher_policy(conn)
+        source = kb.create_task(conn, title='Raw gate before dispatcher', assignee='default')
+        kbn.add_notify_sub(conn, task_id=source, platform='telegram', chat_id='canary', delivery_mode=mode)
+        conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?", (source,))
+        conn.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, 1)",
+                     (source, json.dumps({'kind': 'needs_input', 'reason': 'Approve deployment'})))
+    transport = runner.adapters[Platform.TELEGRAM]
+    deliver(runner, collect(runner))
+    assert not transport.sent and not transport.handled
+    with kbc.connect_closing() as conn:
+        drain_pending(conn)
+        assert reconcile.attention_class(conn, source, reconciler_enabled=True) == 'human_input'
+        occurrence = reconcile.current_human_gate(conn, source).id
+    if refuse_first:
+        handle = transport.handle_message
+
+        async def refuse(event):
+            pass  # No gateway admission receipt: the notifier must retry.
+
+        transport.handle_message = refuse
+        deliver(runner, collect(runner))
+        with kbc.connect_closing() as conn:
+            assert kbn.accepted_notify_wake_ids(conn, task_id=source, platform='telegram', chat_id='canary') == set()
+        transport.handle_message = handle
+    deliver(runner, collect(runner))
+    assert len(transport.sent) == (mode == 'notify+wake')
+    assert len(transport.handled) == 1, 'affirmed gate never woke origin after suppressed raw event advanced cursor'
+
+    deliver(runner, collect(runner))
+    assert len(transport.handled) == 1
+    with kbc.connect_closing() as conn:
+        assert kbn.accepted_notify_wake_ids(conn, task_id=source, platform='telegram', chat_id='canary') == {occurrence}

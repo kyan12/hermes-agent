@@ -25,6 +25,16 @@ if TYPE_CHECKING:
 # (default); "notify+wake" = send AND wake the destination agent; "wake" = wake only.
 _NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
 
+# Installed after legacy subscription-table rebuilding so its FK stays bound
+# to the canonical subscription, and unsubscribe/GC also removes its receipts.
+WAKE_RECEIPTS_SCHEMA_SQL = """CREATE TABLE IF NOT EXISTS kanban_notify_wake_receipts (
+    task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL DEFAULT '', event_id INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id, event_id),
+    FOREIGN KEY (task_id, platform, chat_id, thread_id)
+        REFERENCES kanban_notify_subs(task_id, platform, chat_id, thread_id) ON DELETE CASCADE
+)"""
+
 _SCALAR_TYPES = (str, int, float, bool)
 
 # Subscription primary key predicate; every per-row statement below binds
@@ -403,6 +413,31 @@ def record_notify_ping(
             "UPDATE kanban_notify_subs SET last_ping_event_id = MAX(last_ping_event_id, ?) "
             + _SUB_KEY_WHERE,
             (int(event_id), *_sub_key(task_id, platform, chat_id, thread_id)),
+        )
+
+
+def accepted_notify_wake_ids(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None,
+) -> set[int]:
+    return {row[0] for row in conn.execute(
+        "SELECT event_id FROM kanban_notify_wake_receipts " + _SUB_KEY_WHERE,
+        _sub_key(task_id, platform, chat_id, thread_id),
+    )}
+
+
+def record_notify_wake(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, event_ids: Iterable[int],
+) -> None:
+    """Checkpoint only events included in an actually accepted wake."""
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    with _kb.write_txn(conn):
+        conn.executemany(
+            "INSERT OR IGNORE INTO kanban_notify_wake_receipts "
+            "(task_id, platform, chat_id, thread_id, event_id) "
+            "SELECT task_id, platform, chat_id, thread_id, ? FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+            [(event_id, *key) for event_id in event_ids],
         )
 
 

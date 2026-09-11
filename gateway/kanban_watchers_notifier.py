@@ -414,6 +414,8 @@ class _KanbanNotification:
         self.adapter: Any = None
         self.is_push_adapter = True
         self.wake_kinds: set = set()
+        self.admitted_wake_ids: set[int] = set()
+        self.wake_event_ids: set[int] = set()
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
@@ -464,13 +466,11 @@ class _KanbanNotification:
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
-        self.wake_kinds = {("blocked" if ev.kind == "reconciliation_outcome" else ev.kind)
-                           for ev in self.d["events"]
-                           if (ev.kind in _WAKE_KINDS or ev.kind == "reconciliation_outcome")
-                           # An affirmation uses its original occurrence ID.
-                           # A successful earlier delivery already settled it;
-                           # refused wake admission rewinds this same cursor.
-                           and ev.id > self.d.get("old_cursor", 0)} if self.wake_agent else set()
+        events = [ev for ev in self.d["events"]
+                  if (ev.kind in _WAKE_KINDS or ev.kind == "reconciliation_outcome")
+                  and ev.id not in self.admitted_wake_ids] if self.wake_agent else []
+        self.wake_event_ids = {ev.id for ev in events}
+        self.wake_kinds = {"blocked" if ev.kind == "reconciliation_outcome" else ev.kind for ev in events}
         if not self.wake_kinds:
             return
         if self.is_push_adapter:
@@ -566,7 +566,7 @@ class _KanbanNotification:
         if not self.d.get("reconciliation_managed"):
             return
         from gateway.kanban_gate_notifications import revalidate
-        self.task, self.d["events"], ping = await _to_thread_process_service(
+        self.task, self.d["events"], ping, self.admitted_wake_ids = await _to_thread_process_service(
             revalidate, self.board_slug, self.sub, self.d["events"],
         )
         self.sub["last_ping_event_id"] = max(self.sub.get("last_ping_event_id", 0), ping)
@@ -637,6 +637,11 @@ class _KanbanNotification:
         if wake_kinds:
             try:
                 await self.wake()
+                if self.d.get("reconciliation_managed"):
+                    await _to_thread_process_service(partial(
+                        self.runner._kanban_sub_op, self.board_slug, "record_notify_wake", self.sub,
+                        event_ids=self.wake_event_ids,
+                    ))
                 self.clear_failures()
             except WakeNotAccepted:
                 # Startup / full queue is not a dead destination. Keep the durable

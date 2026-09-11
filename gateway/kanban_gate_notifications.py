@@ -39,4 +39,9 @@ def revalidate(board, sub, events):
             if canonical is not None and canonical.id not in seen:
                 seen.add(canonical.id)
                 result.append(canonical)
-        return task, result, ping
+        from hermes_cli.kanban_db_notify import accepted_notify_wake_ids
+        admitted = accepted_notify_wake_ids(
+            conn, task_id=sub["task_id"], platform=sub["platform"],
+            chat_id=sub["chat_id"], thread_id=sub.get("thread_id"),
+        )
+        return task, result, ping, admitted
