@@ -604,3 +604,24 @@ describe('canonical recovery gates', () => {
     expect(hostMock.notify).toHaveBeenCalledTimes(1)
   })
 })
+
+it.each(['replay', 'later-frame', 'stale'])('retries a genuine gate after temporary fresh-state lookup failure: %s', async retry => {
+  let failed = true
+  const rest = vi.fn(async (path: string) => {
+    if (path.startsWith('/board')) return { latest_event_id: 100, blocker_reconciler_support: 'hermes.kanban.blocker-reconciler.v2' }
+    if (failed) throw new Error('temporary connection failure')
+    return { task: { id: 'source', status: retry === 'stale' ? 'done' : 'blocked', reconciler_enabled: true,
+      reconciliation_managed: true, attention_class: 'human_input',
+      human_gate: { source_event_id: 101, human_action: 'Approve deployment' } } }
+  })
+  const m = await loadModule()
+  m.bindCompletionNotify(rest as never)
+  const frame = [ev(101, 'blocked', {}, 'source'), ev(102, 'reconciliation_outcome', {
+    outcome: 'genuine_human_gate', source_event_id: 101
+  }, 'source')]
+  await m.onKanbanEventsFrame('a', frame)
+  failed = false
+  await m.onKanbanEventsFrame('a', retry === 'replay' ? frame : [ev(103, 'commented', {}, 'source')])
+  await m.onKanbanEventsFrame('a', frame)
+  expect(hostMock.notify).toHaveBeenCalledTimes(retry === 'stale' ? 0 : 1)
+})

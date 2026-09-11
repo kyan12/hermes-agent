@@ -59,6 +59,9 @@ const seenEventIdByBoard = new Map<string, number>()
 const baselinePending = new Set<string>()
 const recoveryAwareBoards = new Set<string>()
 const notifiedGateIds = new Set<string>()
+// A failed authoritative read must survive later frames advancing the cursor.
+// Retry through the existing event stream; every retry revalidates gate state.
+const pendingGateEvents = new Map<string, Map<number, CompletionEvent>>()
 
 interface GateTask {
   id: string
@@ -233,20 +236,33 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
 
   let fired = false
   let cursor = seen
-
+  const pending = pendingGateEvents.get(slug) ?? new Map<number, CompletionEvent>()
+  pendingGateEvents.set(slug, pending)
+  const candidates = new Map<number, CompletionEvent>(pending)
   for (const ev of events) {
+    if (typeof ev.id === 'number' && Number.isSafeInteger(ev.id) && ev.id > seen) candidates.set(ev.id, ev)
+  }
+
+  for (const [id, ev] of candidates) {
     cursor = Math.max(cursor, seenEventIdByBoard.get(slug) ?? 0)
-    if (typeof ev.id !== 'number' || !Number.isSafeInteger(ev.id) || ev.id <= cursor) {
+    if (id <= cursor && !pending.has(id)) {
       continue
     }
 
-    cursor = ev.id
+    cursor = Math.max(cursor, id)
     seenEventIdByBoard.set(slug, cursor)
     const spec = TERMINAL_NOTIFY.get(ev.kind ?? '')
 
     if (spec) {
+      let notice: CompletionEvent | null
       try {
-        const notice = await currentNotice(slug, ev)
+        notice = await currentNotice(slug, ev)
+        pending.delete(id)
+      } catch {
+        pending.set(id, ev)
+        continue
+      }
+      try {
         if (!notice) continue
         const identity = notice.kind === 'reconciliation_outcome' ? notice.payload?.source_event_id : ev.id
         const gateKey = JSON.stringify([slug, ev.task_id, identity])

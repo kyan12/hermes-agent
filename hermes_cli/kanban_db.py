@@ -850,6 +850,8 @@ class Event:
 
 from hermes_cli import kanban_resume as _kanban_resume  # noqa: E402
 from hermes_cli import kanban_blocker_policy as _blocker_policy
+# Public capability entry point required by the external native health probe.
+from hermes_cli.kanban_blocker_reconcile import blocker_reconciler_enabled
 from hermes_cli import kanban_pr_reconcile as _kanban_reconcile  # noqa: E402
 
 SCHEMA_SQL = """

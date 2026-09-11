@@ -20,6 +20,34 @@ def _candidate_python(candidate):
     return str(python), site / "candidate.pth"
 
 
+def test_native_health_accepts_real_maintained_implementation(tmp_path):
+    import hashlib
+    import json
+    import sys
+    from hermes_cli import extension_health
+
+    root = Path(__file__).resolve().parents[2]
+    environment = tmp_path / "installed"
+    environment.mkdir()
+    python, installed_path = _candidate_python(environment)
+    # Install the real source in the disposable interpreter; reuse only the
+    # runner's dependency directories, not its editable source installation.
+    dependencies = dict.fromkeys(path for path in sys.path if Path(path).name in {"site-packages", "dist-packages"})
+    installed_path.write_text("\n".join([str(root), *dependencies]) + "\n")
+    symbols = [
+        "hermes_cli.kanban_db:blocker_reconciler_enabled",
+        "hermes_cli.kanban_blocker_reconcile:enqueue_blocker_reconciliation",
+        "gateway.kanban_watchers:GatewayKanbanWatchersMixin._kanban_notifier_watcher",
+    ]
+    paths = {symbol.split(":")[0].replace(".", "/") + ".py" for symbol in symbols}
+    paths.update({"hermes_cli/main.py", "hermes_cli/__init__.py"})
+    approval = tmp_path / "approval.json"
+    approval.write_text(json.dumps({"symbols": symbols, "files": {
+        path: hashlib.sha256((root / path).read_bytes()).hexdigest() for path in paths
+    }}))
+    extension_health.check_candidate(root, python, approval, startup=True)
+
+
 @pytest.mark.parametrize("location", ["custom-sibling", "native-root", "native-sibling"])
 @pytest.mark.parametrize("config,refused", [
     ("kanban:\n  blocker_reconciler:\n    enabled: true\n", True),

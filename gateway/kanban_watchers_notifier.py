@@ -466,7 +466,11 @@ class _KanbanNotification:
         task, sub = self.task, self.sub
         self.wake_kinds = {("blocked" if ev.kind == "reconciliation_outcome" else ev.kind)
                            for ev in self.d["events"]
-                           if ev.kind in _WAKE_KINDS or ev.kind == "reconciliation_outcome"} if self.wake_agent else set()
+                           if (ev.kind in _WAKE_KINDS or ev.kind == "reconciliation_outcome")
+                           # An affirmation uses its original occurrence ID.
+                           # A successful earlier delivery already settled it;
+                           # refused wake admission rewinds this same cursor.
+                           and ev.id > self.d.get("old_cursor", 0)} if self.wake_agent else set()
         if not self.wake_kinds:
             return
         if self.is_push_adapter:

@@ -15,9 +15,14 @@ CREATE INDEX IF NOT EXISTS idx_blocker_source_events ON task_events(task_id, kin
 """
 _TRIGGER_NAME = "blocker_reconcile_capture_v2"
 _KINDS_SQL = ",".join("'" + kind + "'" for kind in sorted(RECONCILIATION_EVENT_KINDS))
+_MANAGED_HUMAN_TASKS_SQL = """SELECT t.id FROM tasks t
+ WHERE t.status = 'blocked' AND t.block_kind = 'needs_input'
+ AND EXISTS (SELECT 1 FROM task_events managed WHERE managed.task_id = t.id
+             AND managed.kind IN ('reconciliation_enqueued', 'reconciliation_outcome'))"""
 _TRIGGER_SQL = f"""CREATE TRIGGER {_TRIGGER_NAME} AFTER INSERT ON task_events
 WHEN NEW.kind IN ({_KINDS_SQL})
- AND COALESCE((SELECT json_extract(config, '$.enabled') FROM blocker_reconciler_policy WHERE id = 1), 0) = 1
+ AND (COALESCE((SELECT json_extract(config, '$.enabled') FROM blocker_reconciler_policy WHERE id = 1), 0) = 1
+      OR (NEW.kind IN ('blocked', 'block_loop_detected') AND NEW.task_id IN ({_MANAGED_HUMAN_TASKS_SQL})))
  AND EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id
              AND COALESCE(idempotency_key, '') NOT LIKE 'kanban-reconcile:%')
 BEGIN
@@ -61,11 +66,8 @@ def install_capture(conn):
 
 def drain_pending(conn):
     from hermes_cli.kanban_db_connect import write_txn
-    from hermes_cli.kanban_blocker_policy import board_config
     from hermes_cli.kanban_blocker_reconcile import enqueue_blocker_reconciliation
     with write_txn(conn):
-        if not board_config(conn)['enabled']:
-            return []
         rows = conn.execute(
             "SELECT p.event_id, e.kind FROM blocker_reconciler_pending p "
             "JOIN task_events e ON e.id = p.event_id ORDER BY p.event_id LIMIT ?", (BATCH_SIZE,),
@@ -79,3 +81,11 @@ def drain_pending(conn):
             if task_id and task_id not in assigned:
                 assigned.append(task_id)
         return assigned
+
+
+def discard_disabled_pending(conn):
+    """Disable recovery without dropping a new explicit gate from an older writer."""
+    conn.execute(f"""DELETE FROM blocker_reconciler_pending WHERE event_id NOT IN (
+        SELECT id FROM task_events WHERE kind IN ('blocked', 'block_loop_detected')
+        AND task_id IN ({_MANAGED_HUMAN_TASKS_SQL})
+    )""")

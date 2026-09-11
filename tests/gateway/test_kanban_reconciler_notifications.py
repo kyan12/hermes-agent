@@ -181,22 +181,26 @@ def test_gate_context_comment_does_not_erase_the_one_pending_notice(rig):
     assert len(runner.adapters[Platform.TELEGRAM].sent) == 1
 
 
-def test_raw_and_affirmed_gate_share_ping_identity_across_enablement(rig):
+@pytest.mark.parametrize('delivery_mode', ['notify', 'notify+wake', 'wake'])
+def test_raw_and_affirmed_gate_share_ping_identity_across_enablement(rig, delivery_mode):
     runner, settings = rig
     settings['enabled'] = False
     with kbc.connect_closing() as conn:
         task, claim = source_task(conn)
+        kbn.add_notify_sub(conn, task_id=task, platform='telegram', chat_id='canary', delivery_mode=delivery_mode)
         kb.block_task(conn, task, kind='needs_input', reason='Approve deployment', expected_run_id=claim.current_run_id)
         event = [e for e in kb.list_events(conn, task) if e.kind == 'blocked'][-1]
         deliver(runner, collect(runner))
-        assert len(runner.adapters[Platform.TELEGRAM].sent) == 1
+        assert len(runner.adapters[Platform.TELEGRAM].sent) == (delivery_mode != 'wake')
         settings['enabled'] = True
         reconcile.enqueue_blocker_reconciliation(conn, event.id)
     deliver(runner, collect(runner))
-    assert len(runner.adapters[Platform.TELEGRAM].sent) == 1
+    assert len(runner.adapters[Platform.TELEGRAM].sent) == (delivery_mode != 'wake')
+    assert len(runner.adapters[Platform.TELEGRAM].handled) == (delivery_mode != 'notify')
 
 
-def test_new_explicit_gate_after_managed_recovery_still_notifies_when_disabled(rig):
+@pytest.mark.parametrize('producer', ['native', 'raw'])
+def test_new_explicit_gate_after_managed_recovery_still_notifies_when_disabled(rig, producer):
     from hermes_cli.kanban_blocker_policy import sync_dispatcher_policy
     runner, settings = rig
     with kbc.connect_closing() as conn:
@@ -210,8 +214,20 @@ def test_new_explicit_gate_after_managed_recovery_still_notifies_when_disabled(r
         }})
         settings['enabled'] = False
         sync_dispatcher_policy(conn)
-        claim = kb.claim_task(conn, source)
-        kb.block_task(conn, source, kind='needs_input', reason='Approve a new deployment', expected_run_id=claim.current_run_id)
+        if producer == 'native':
+            claim = kb.claim_task(conn, source)
+            kb.block_task(conn, source, kind='needs_input', reason='Approve a new deployment', expected_run_id=claim.current_run_id)
+        else:
+            # Simulate an older writer that has no Python transaction hook.
+            conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?", (source,))
+            conn.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, 1)",
+                         (source, json.dumps({'kind': 'needs_input', 'reason': 'Approve a new deployment'})))
+            from hermes_cli.kanban_blocker_capture import drain_pending
+            # The native tick publishes its disabled policy before draining.
+            sync_dispatcher_policy(conn)
+            drain_pending(conn)
+            assert reconcile.attention_class(conn, source, reconciler_enabled=False) == 'human_input'
+            assert len([t for t in kb.list_tasks(conn) if (t.idempotency_key or '').startswith('kanban-reconcile:')]) == 1
     deliver(runner, collect(runner))
     deliver(runner, collect(runner))
     assert len(runner.adapters[Platform.TELEGRAM].sent) == 1

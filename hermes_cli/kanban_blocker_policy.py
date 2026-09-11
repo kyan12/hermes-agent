@@ -27,4 +27,5 @@ def sync_dispatcher_policy(conn):
             "WHERE config != excluded.config", (encoded,),
         )
         if not config['enabled']:
-            conn.execute("DELETE FROM blocker_reconciler_pending")
+            from hermes_cli.kanban_blocker_capture import discard_disabled_pending
+            discard_disabled_pending(conn)
