@@ -1696,6 +1696,9 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
+        # Event-driven recovery uses the native dispatcher and an existing profile.
+        # Disabled preserves legacy lanes; no model/provider credentials are copied.
+        "blocker_reconciler": {"enabled": False, "profile": "default", "max_active": 2},
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.

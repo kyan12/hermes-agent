@@ -200,6 +200,17 @@ def _placeholders(ids: list) -> str:
     return ",".join(["?"] * len(ids))
 
 
+def _attention_projection(conn, task_id, enabled):
+    from hermes_cli.kanban_blocker_reconcile import attention_class, current_human_gate, managed_source
+    gate = current_human_gate(conn, task_id)
+    return {
+        "attention_class": attention_class(conn, task_id, reconciler_enabled=enabled),
+        "reconciler_enabled": enabled,
+        "reconciliation_managed": managed_source(conn, task_id),
+        "human_gate": ({"source_event_id": gate.id, "human_action": gate.payload["human_action"]} if gate else None),
+    }
+
+
 def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, list[dict]]:
     """``{task_id: [diagnostic_dict, ...]}`` (tasks with none omitted) via three aggregate
     queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot."""
@@ -305,6 +316,10 @@ def get_board(
             p["done"] += row["cstatus"] == "done"
         diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
         latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
+        from hermes_cli.kanban_blocker_policy import board_config
+        from hermes_cli.kanban_blocker_reconcile import BLOCKER_RECONCILER_SUPPORT
+        enabled = board_config(conn)["enabled"]
+        attention_counts = {"human_input": 0, "automation_recovery": 0}
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
             columns["archived"] = []
@@ -314,6 +329,9 @@ def get_board(
         for t in tasks:
             full = summary_map.get(t.id)
             d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
+            d.update(_attention_projection(conn, t.id, enabled))
+            if d["attention_class"] in attention_counts:
+                attention_counts[d["attention_class"]] += 1
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -326,7 +344,9 @@ def get_board(
             "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
         return {
             "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
-            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
+            "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time()),
+            "blocker_reconciler_support": BLOCKER_RECONCILER_SUPPORT,
+            "reconciler_enabled": enabled, "attention_counts": attention_counts}
 
 
 # --- GET /tasks/:id ---------------------------------------------------------
@@ -337,7 +357,7 @@ def get_task(
     board: Optional[str] = Query(None),
     run_state_type: Optional[str] = Query(None, description="With run_state_name: filter runs by column 'status' or 'outcome'"),
     run_state_name: Optional[str] = Query(None, description="With run_state_type: exact value for that run column")):
-    with _board_conn(board) as (board, conn):
+    with _board_conn(board) as (board, conn), kbc.read_txn(conn):
         if (run_state_type is None) ^ (run_state_name is None):
             raise HTTPException(status_code=400, detail="run_state_type and run_state_name must be passed together or omitted")
         if run_state_type not in (None, "status", "outcome"):
@@ -345,6 +365,8 @@ def get_task(
         task = _require_task(conn, task_id)
         # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
         task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
+        from hermes_cli.kanban_blocker_policy import board_config
+        task_d.update(_attention_projection(conn, task_id, board_config(conn)["enabled"]))
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))

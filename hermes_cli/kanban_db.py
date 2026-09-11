@@ -849,6 +849,7 @@ class Event:
 # --- Schema ---
 
 from hermes_cli import kanban_resume as _kanban_resume  # noqa: E402
+from hermes_cli import kanban_blocker_policy as _blocker_policy
 from hermes_cli import kanban_pr_reconcile as _kanban_reconcile  # noqa: E402
 
 SCHEMA_SQL = """
@@ -1047,7 +1048,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
-""" + _kanban_resume.SCHEMA_SQL + _kanban_reconcile.SCHEMA_SQL
+""" + _kanban_resume.SCHEMA_SQL + _kanban_reconcile.SCHEMA_SQL + _blocker_policy.SCHEMA_SQL
 
 
 # --- ID generation ---
@@ -1842,12 +1843,21 @@ def _insert_comment(
 def _append_event(
     conn: sqlite3.Connection, task_id: str, kind: str, payload: Optional[dict] = None, *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
-    conn.execute(
+    if kind in {"commented", "linked"}:
+        from hermes_cli.kanban_blocker_evidence import source_write_evidence
+        evidence = source_write_evidence(conn, task_id)
+        if evidence is not None:
+            payload = {**(payload or {}), "reconciliation_evidence": evidence}
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), int(time.time())),
     )
+
+    from hermes_cli.kanban_blocker_reconcile import record_event
+    record_event(conn, int(cur.lastrowid), kind)
+    return int(cur.lastrowid)
 
 
 def _end_run(
@@ -1964,6 +1974,9 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     the circuit breaker or by direct DB manipulation) — preserves the pre-#28712 auto-recover semantics for
     that path.
     """
+    from hermes_cli.kanban_blocker_reconcile import managed_source
+    if managed_source(conn, task_id):
+        return True
     row = conn.execute(
         "SELECT kind FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected', 'unblocked') "
@@ -2018,6 +2031,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
+        from hermes_cli.kanban_blocker_outcomes import release_backoffs
+        promoted += release_backoffs(conn)
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -2152,6 +2167,9 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     try:
         with write_txn(conn):
+            from hermes_cli.kanban_blocker_reconcile import claim_allowed
+            if not claim_allowed(conn, task_id):
+                return None
             # Single enforcement point: never ready -> running with an undone
             # parent, whichever writer set 'ready'. Demote to 'todo';
             # recompute_ready re-promotes when the parents finish.
@@ -2607,6 +2625,12 @@ def complete_task(
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
+    from hermes_cli.kanban_blocker_outcomes import validate_completion, apply_completion, validate_run, completion_replayed
+    if completion_replayed(conn, task_id, metadata, expected_run_id):
+        return False
+    verdict = validate_completion(conn, task_id, metadata)
+    if verdict is not None:
+        validate_run(conn, task_id, expected_run_id)
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2621,6 +2645,8 @@ def complete_task(
     if acceptance is False:
         return False
     with write_txn(conn):
+        if verdict is not None:
+            validate_run(conn, task_id, expected_run_id)
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
@@ -2647,6 +2673,7 @@ def complete_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        apply_completion(conn, task_id, metadata)
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(

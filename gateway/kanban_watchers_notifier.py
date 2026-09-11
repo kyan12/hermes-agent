@@ -30,7 +30,7 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "reconciliation_outcome", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -234,7 +234,12 @@ class _Collector:
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        from hermes_cli.kanban_blocker_reconcile import RECONCILIATION_EVENT_KINDS, managed_source
+        from hermes_cli.kanban_blocker_policy import board_config
+        guarded = (board_config(conn)["enabled"] or managed_source(conn, sub["task_id"])
+                   or any(ev.kind in RECONCILIATION_EVENT_KINDS for ev in events))
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events,
+                "task": task, "board": slug, "reconciliation_managed": guarded}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -346,6 +351,10 @@ def _fmt_changes_requested(ev, n) -> tuple:
 # never wake the creator.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "completed": _fmt_completed,
+    "reconciliation_outcome": lambda ev, n: (
+        f"⏸ {n.head} needs input: {_safe_review_reason(_payload(ev, 'human_action'), 1000)}",
+        None, _safe_review_reason(_payload(ev, "human_action"), 1000),
+    ),
     "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
     "gave_up": lambda ev, n: (
         f"✖ {n.head} gave up after repeated spawn failures{_clip(ev, 'error', _NL, 200)}", None, None,
@@ -455,7 +464,9 @@ class _KanbanNotification:
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
-        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
+        self.wake_kinds = {("blocked" if ev.kind == "reconciliation_outcome" else ev.kind)
+                           for ev in self.d["events"]
+                           if ev.kind in _WAKE_KINDS or ev.kind == "reconciliation_outcome"} if self.wake_agent else set()
         if not self.wake_kinds:
             return
         if self.is_push_adapter:
@@ -547,6 +558,15 @@ class _KanbanNotification:
             except Exception as art_exc:
                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
 
+    async def _revalidate_gates(self) -> None:
+        if not self.d.get("reconciliation_managed"):
+            return
+        from gateway.kanban_gate_notifications import revalidate
+        self.task, self.d["events"], ping = await _to_thread_process_service(
+            revalidate, self.board_slug, self.sub, self.d["events"],
+        )
+        self.sub["last_ping_event_id"] = max(self.sub.get("last_ping_event_id", 0), ping)
+
     async def _send_pings(self) -> bool:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
         for ev in self.d["events"]:
@@ -600,9 +620,11 @@ class _KanbanNotification:
         from gateway.wake import adapter_supports_push
         self.is_push_adapter = adapter_supports_push(adapter)
 
+        await self._revalidate_gates()
         if not await self._send_pings():
             return
         # All text pings delivered (or skipped for non-push / wake-only).
+        await self._revalidate_gates()
         self.build_wake_text()
         wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
         from gateway.wake import WakeNotAccepted
@@ -632,3 +654,11 @@ class _KanbanNotification:
         # Unsubscribe only on archive; ``done`` is reversible.
         if self.task and self.task.status == "archived":
             await self.unsub()
+
+
+def should_notify_kanban_event(kind: str, payload: Any, *, reconciler_enabled: bool) -> bool:
+    """Raw machine failures are never a gate when reconciliation owns them."""
+    from hermes_cli.kanban_blocker_reconcile import RECONCILIATION_EVENT_KINDS
+    if kind == "reconciliation_outcome":
+        return isinstance(payload, dict) and payload.get("outcome") == "genuine_human_gate"
+    return not (reconciler_enabled and kind in RECONCILIATION_EVENT_KINDS)

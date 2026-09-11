@@ -1282,3 +1282,45 @@ Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file
 ## Design spec
 
 The complete design — architecture, concurrency correctness, comparison with other systems, implementation plan, risks, open questions — lives in `docs/hermes-kanban-v1-spec.pdf`. Read that before filing any behavior-change PR.
+
+## Event-driven blocker recovery
+
+The optional `kanban.blocker_reconciler` setting routes machine failures to ordinary
+Kanban recovery tasks on the existing dispatcher:
+
+```yaml
+kanban:
+  blocker_reconciler:
+    enabled: false
+    profile: default
+    max_active: 2
+```
+
+Use an existing profile. The native dispatcher publishes this policy for its
+board, so workers on other profiles use the same recovery policy. Policy changes
+reach those workers at the next native dispatcher tick. There is no additional
+worker pool or polling controller.
+
+A machine terminal failure and its recovery assignment commit together. Repeated
+occurrences coalesce into one active recovery; replay and archive do not recreate
+an existing assignment. Recovery receives a bounded, redacted source envelope in
+a scratch workspace. It can report `cleared/resumed`, `continuation_created`,
+`dependency_wait`, `backoff_scheduled`, `genuine_human_gate`, or
+`reconciliation_failed`. Outcomes require the current recovery run and source
+occurrence; source comments and links count as recovery evidence only when their
+native task/run provenance matches. Existing dependency, review, PR and worktree
+authority checks still apply.
+
+Explicit `needs_input` with a stated action stays Blocked and affirms a human gate
+atomically. Other machine failures do not notify as human gates. Recovery failure
+or exhaustion stays Blocked as automation recovery and never moves into Triage.
+Recovery is capped at three generations per source; backoff is capped at 24 hours.
+The notifier deduplicates each gate by its source occurrence and rechecks it before
+delivery, suppressing obsolete alerts after unblock, completion or archive.
+
+Once the restored runtime installs its SQLite capture trigger and publishes board
+policy, older binaries and raw SQL writers leave durable pending markers. The
+existing dispatcher drains at most 16 markers per tick; no additional polling
+controller is installed. Disabled boards
+retain the existing behavior for unmanaged events; already managed recovery
+failures do not become human gates when the setting changes.

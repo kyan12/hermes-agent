@@ -1561,6 +1561,11 @@ def dispatch_once(
     resolved DB path so unrelated boards tick in parallel.
     """
     def _locked_tick() -> DispatchResult:
+        if not dry_run:
+            from hermes_cli.kanban_blocker_policy import sync_dispatcher_policy
+            sync_dispatcher_policy(conn)
+            from hermes_cli.kanban_blocker_capture import drain_pending
+            drain_pending(conn)
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,

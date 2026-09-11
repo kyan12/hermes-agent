@@ -1232,3 +1232,26 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_board_and_task_project_truthful_attention_without_changing_lanes(client, monkeypatch):
+    from hermes_cli import config
+    monkeypatch.setattr(config, 'load_config', lambda: {'kanban': {'blocker_reconciler': {'enabled': True}}})
+    with kbc.connect_closing() as conn:
+        machine = kb.create_task(conn, title='machine failure', assignee='default')
+        human = kb.create_task(conn, title='human decision', assignee='default')
+        kb.block_task(conn, machine, kind='transient', reason='worker crash')
+        kb.block_task(conn, human, kind='needs_input', reason='Approve deployment')
+    board = client.get('/api/plugins/kanban/board').json()
+    assert board['attention_counts'] == {'human_input': 1, 'automation_recovery': 1}
+    for task, attention in ((machine, 'automation_recovery'), (human, 'human_input')):
+        item = client.get(f'/api/plugins/kanban/tasks/{task}').json()['task']
+        assert item['status'] == 'blocked'
+        assert item['attention_class'] == attention
+        assert item['reconciler_enabled'] is True
+    gate = client.get(f'/api/plugins/kanban/tasks/{human}').json()['task']['human_gate']
+    assert gate['source_event_id'] > 0
+    assert gate['human_action'] == 'Approve deployment'
+    with kbc.connect_closing() as conn:
+        kb.unblock_task(conn, human)
+    assert client.get(f'/api/plugins/kanban/tasks/{human}').json()['task']['human_gate'] is None

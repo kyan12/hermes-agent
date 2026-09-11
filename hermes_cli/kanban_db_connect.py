@@ -727,6 +727,8 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
+                from hermes_cli.kanban_blocker_capture import install_capture
+                install_capture(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -1166,6 +1168,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     (``complete_task`` & co.) must never run under an open outer transaction,
     since those side effects would fire while the outer txn can still roll back.
     """
+    from hermes_cli import kanban_blocker_reconcile as recovery
     _kb._assert_not_delegated_child_mutation()
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
@@ -1175,11 +1178,13 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
                 "(savepoint semantics; the inner RELEASE is not durable until "
                 "the outer transaction commits)."
             )
+        event_mark = recovery.event_savepoint(conn)
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
         conn.execute(f"SAVEPOINT {savepoint}")
         try:
             yield conn
         except Exception:
+            recovery.rollback_events(event_mark)
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute(f"ROLLBACK TO {savepoint}")
                 conn.execute(f"RELEASE {savepoint}")
@@ -1189,8 +1194,11 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    event_token = None
     try:
+        event_token = recovery.begin_events(conn)
         yield conn
+        recovery.drain_events(conn)
     except Exception:
         # SQLite may already have auto-rolled-back (EIO, contention, corruption);
         # don't let this secondary failure shadow the real one.
@@ -1208,6 +1216,10 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             raise
         # Post-commit torn-extend check — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+
+    finally:
+        if event_token is not None:
+            recovery.end_events(event_token)
 
 
 @contextlib.contextmanager

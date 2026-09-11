@@ -555,3 +555,52 @@ describe('i18n routing', () => {
     expect(lastNotify().title).toBe('Task timed out — will retry')
   })
 })
+
+describe('canonical recovery gates', () => {
+  function recoveryRest(task: () => Record<string, unknown>) {
+    return vi.fn(async (path: string) => path.startsWith('/board')
+      ? { latest_event_id: 100, blocker_reconciler_support: 'hermes.kanban.blocker-reconciler.v2' }
+      : { task: task() })
+  }
+
+  it('suppresses machine failures and emits one current gate across raw and affirmed events', async () => {
+    let state: Record<string, unknown> = { id: 'source', status: 'blocked', reconciler_enabled: true,
+      reconciliation_managed: true, attention_class: 'automation_recovery', human_gate: null }
+    const rest = recoveryRest(() => state)
+    const os = { notify: vi.fn() }
+    const m = await loadModule()
+    m.bindCompletionNotify(rest as never, undefined, os)
+    expect(await m.onKanbanEventsFrame('a', [ev(101, 'crashed', null, 'source')])).toBe(false)
+    expect(hostMock.notify).not.toHaveBeenCalled()
+    state = { ...state, attention_class: 'human_input', human_gate: { source_event_id: 102, human_action: 'Approve deployment' } }
+    await m.onKanbanEventsFrame('a', [ev(102, 'blocked', { reason: 'untrusted wording' }, 'source'),
+      ev(103, 'reconciliation_outcome', { outcome: 'genuine_human_gate', source_event_id: 102 }, 'source')])
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+    expect(os.notify).toHaveBeenCalledTimes(1)
+    expect(lastNotify().message).toBe('Approve deployment')
+    expect(rest).toHaveBeenCalledWith('/tasks/source?board=a')
+  })
+
+  it.each(['done', 'ready', 'archived'])('revalidates an affirmed gate after source becomes %s', async status => {
+    const m = await loadModule()
+    const os = { notify: vi.fn() }
+    m.bindCompletionNotify(recoveryRest(() => ({ id: 'source', status, reconciler_enabled: true,
+      human_gate: null, attention_class: 'none' })) as never, undefined, os)
+    expect(await m.onKanbanEventsFrame('a', [ev(101, 'reconciliation_outcome', {
+      outcome: 'genuine_human_gate', source_event_id: 99
+    }, 'source')])).toBe(false)
+    expect(hostMock.notify).not.toHaveBeenCalled()
+    expect(os.notify).not.toHaveBeenCalled()
+  })
+
+  it('keeps disabled unmanaged behavior but never promotes managed failure after a flag toggle', async () => {
+    let managed = false
+    const m = await loadModule()
+    m.bindCompletionNotify(recoveryRest(() => ({ id: 'source', status: 'blocked', reconciler_enabled: false,
+      reconciliation_managed: managed, attention_class: managed ? 'automation_recovery' : 'human_input', human_gate: null })) as never)
+    expect(await m.onKanbanEventsFrame('a', [ev(101, 'blocked', null, 'source')])).toBe(true)
+    managed = true
+    expect(await m.onKanbanEventsFrame('a', [ev(102, 'gave_up', null, 'source')])).toBe(false)
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+  })
+})

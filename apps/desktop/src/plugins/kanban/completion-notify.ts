@@ -47,6 +47,7 @@ type ToastKind = 'error' | 'success' | 'warning'
  *  silent kinds (status/archived/unblocked, which only advance the cursor). */
 const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>([
   ['blocked', { titleKey: 'notify.blockedTitle', toast: 'warning' }],
+  ['reconciliation_outcome', { titleKey: 'notify.blockedTitle', toast: 'warning' }],
   ['block_loop_detected', { titleKey: 'notify.blockLoopTitle', toast: 'warning' }],
   ['completed', { titleKey: 'notify.completedTitle', toast: 'success' }],
   ['crashed', { titleKey: 'notify.crashedTitle', toast: 'error' }],
@@ -56,6 +57,17 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
 
 const seenEventIdByBoard = new Map<string, number>()
 const baselinePending = new Set<string>()
+const recoveryAwareBoards = new Set<string>()
+const notifiedGateIds = new Set<string>()
+
+interface GateTask {
+  id: string
+  status: string
+  reconciler_enabled?: boolean
+  reconciliation_managed?: boolean
+  attention_class?: string
+  human_gate?: { source_event_id: number; human_action: string } | null
+}
 
 let rest: Rest | null = null
 let translate: PluginTranslate | null = null
@@ -99,10 +111,14 @@ async function ensureBaseline(slug: string): Promise<void> {
   baselinePending.add(slug)
 
   try {
-    const board = (await rest!<{ latest_event_id?: unknown }>(`/board?board=${encodeURIComponent(slug)}`)) as {
+    const board = (await rest!<{ latest_event_id?: unknown; blocker_reconciler_support?: unknown }>(`/board?board=${encodeURIComponent(slug)}`)) as {
       latest_event_id?: unknown
+      blocker_reconciler_support?: unknown
     }
 
+    if (board.blocker_reconciler_support === 'hermes.kanban.blocker-reconciler.v2') {
+      recoveryAwareBoards.add(slug)
+    }
     seenEventIdByBoard.set(slug, typeof board.latest_event_id === 'number' ? board.latest_event_id : 0)
   } catch {
     // Fail-closed: unknown baseline → notifications stay suppressed.
@@ -119,6 +135,10 @@ function trimmed(value: unknown): string {
  *  payload contract the gateway watcher reads). */
 function bodyFor(kind: string, ev: CompletionEvent): string {
   const payload = ev.payload
+
+  if (kind === 'reconciliation_outcome') {
+    return trimmed(payload?.human_action)
+  }
 
   if (kind === 'completed') {
     return trimmed(payload?.summary)
@@ -174,6 +194,28 @@ function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, e
   }
 }
 
+/** Fresh backend state, not failure wording, owns gate eligibility. */
+async function currentNotice(slug: string, ev: CompletionEvent): Promise<CompletionEvent | null> {
+  if (ev.kind === 'completed') return ev
+  if (!recoveryAwareBoards.has(slug)) return ev.kind === 'reconciliation_outcome' ? null : ev
+  const taskId = trimmed(ev.task_id)
+  if (!taskId) return null
+  const { task } = await rest!<{ task: GateTask }>(`/tasks/${encodeURIComponent(taskId)}?board=${encodeURIComponent(slug)}`)
+  if (!task || task.id !== taskId) return null
+  const gate = task.human_gate
+  const sourceId = ev.kind === 'reconciliation_outcome' ? ev.payload?.source_event_id : ev.id
+  if (task.status === 'blocked' && task.attention_class === 'human_input' && gate
+      && Number.isSafeInteger(gate.source_event_id) && gate.source_event_id === sourceId
+      && trimmed(gate.human_action)) {
+    if (ev.kind === 'reconciliation_outcome' && ev.payload?.outcome !== 'genuine_human_gate') return null
+    return { ...ev, kind: 'reconciliation_outcome', payload: {
+      outcome: 'genuine_human_gate', source_event_id: gate.source_event_id, human_action: gate.human_action
+    } }
+  }
+  return ev.kind !== 'reconciliation_outcome' && !task.reconciler_enabled && !task.reconciliation_managed
+    ? ev : null
+}
+
 /** Consume one /events frame for a board. Returns true when a terminal-event
  *  notification was fired. Never throws: notification failure cannot
  *  interfere with api.ts cache invalidation. */
@@ -193,7 +235,8 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
   let cursor = seen
 
   for (const ev of events) {
-    if (typeof ev.id !== 'number' || ev.id <= cursor) {
+    cursor = Math.max(cursor, seenEventIdByBoard.get(slug) ?? 0)
+    if (typeof ev.id !== 'number' || !Number.isSafeInteger(ev.id) || ev.id <= cursor) {
       continue
     }
 
@@ -203,7 +246,13 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
 
     if (spec) {
       try {
-        notifyOne(ev.kind!, spec, ev)
+        const notice = await currentNotice(slug, ev)
+        if (!notice) continue
+        const identity = notice.kind === 'reconciliation_outcome' ? notice.payload?.source_event_id : ev.id
+        const gateKey = JSON.stringify([slug, ev.task_id, identity])
+        if (notice.kind !== 'completed' && notifiedGateIds.has(gateKey)) continue
+        notifyOne(notice.kind!, TERMINAL_NOTIFY.get(notice.kind!)!, notice)
+        if (notice.kind !== 'completed') notifiedGateIds.add(gateKey)
         fired = true
       } catch {
         /* swallowed */
