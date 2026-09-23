@@ -125,6 +125,47 @@ def _reconcile_park_artifacts(
     return frozenset({comment_id, park_id}), True
 
 
+# Events that may follow a source's own terminal ``completed`` event without
+# disturbing its settled state. Anything else (claimed, promoted, unblocked,
+# status, descendant_invalidated, ...) means the source was reopened.
+_SETTLED_TAIL_KINDS = frozenset({"completed", "archived", "commented", "linked", "unlinked", "attached", "edited"})
+
+
+def _settled_source_completion(
+    conn: sqlite3.Connection, source_task_id: str, source_event_id: int,
+) -> Optional[int]:
+    """Return the source's ``completed`` event id when it settled natively.
+
+    A source that recovered on its own after the pinned occurrence (promoted,
+    claimed, completed) can never again match the blocked-source fence, so the
+    recovery worker needs a truthful ``cleared/resumed`` record. That is only
+    allowed when: the source is done/archived with no active run, no newer
+    blocker occurrence or foreign reconciliation outcome appeared after the
+    pinned occurrence, and nothing but inert bookkeeping followed its last
+    ``completed`` event.
+    """
+    from hermes_cli.kanban_db import get_task
+    source = get_task(conn, source_task_id)
+    if source is None or source.status not in {"done", "archived"} or source.current_run_id:
+        return None
+    rows = conn.execute(
+        "SELECT id, kind FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', "
+        "'heartbeat', 'claim_extended') ORDER BY id ASC",
+        (source_task_id, source_event_id),
+    ).fetchall()
+    completed_id: Optional[int] = None
+    for row in rows:
+        kind = row["kind"]
+        if kind in RECONCILIATION_EVENT_KINDS or kind == "reconciliation_outcome":
+            return None
+        if kind == "completed":
+            completed_id = row["id"]
+        elif completed_id is not None and kind not in _SETTLED_TAIL_KINDS:
+            completed_id = None
+    return completed_id
+
+
 def _required_reconciliation_text(
     reconciliation: Mapping[str, Any],
     field: str,
@@ -248,10 +289,18 @@ def validate_completion(
         ignored_event_ids=park_artifacts,
     )
     if newer_source_event is not None:
-        raise ValueError(
-            "reconciliation source advanced after source event "
-            f"{source_event_id} via {newer_source_event['kind']}:{newer_source_event['id']}"
+        # A source that settled natively after the pinned occurrence may only
+        # be recorded as cleared/resumed; every other verdict is stale.
+        settled_id = (
+            _settled_source_completion(conn, source_id, source_event_id)
+            if outcome == "cleared/resumed" else None
         )
+        if settled_id is None:
+            raise ValueError(
+                "reconciliation source advanced after source event "
+                f"{source_event_id} via {newer_source_event['kind']}:{newer_source_event['id']}"
+            )
+        verdict["source_settled_event_id"] = settled_id
     verdict["source_drifted_by_recorded_park_chain"] = drift_settlement
     return verdict
 
@@ -266,6 +315,13 @@ def apply_completion(conn: sqlite3.Connection, recovery_id: str, metadata: Any) 
     expected_status = verdict.pop("expected_source_status")
     drifted = bool(verdict.pop("source_drifted_by_recorded_park_chain", False))
     source = kb.get_task(conn, source_id)
+    if "source_settled_event_id" in verdict:
+        # Record-only: the source already finished; never transition it.
+        if source is None or source.status not in {"done", "archived"} or source.current_run_id:
+            raise ValueError("reconciliation source advanced or still has an active run")
+        kb._append_event(conn, source_id, "reconciliation_outcome",
+                         {**verdict, "reconciliation_task_id": recovery_id})
+        return
     if drifted:
         # The only non-exempt post-occurrence history is the recorded benign
         # park-artifact chain, so the misfiring park itself moved the source
@@ -280,10 +336,13 @@ def apply_completion(conn: sqlite3.Connection, recovery_id: str, metadata: Any) 
         raise ValueError("reconciliation source advanced or still has an active run")
     outcome = verdict["outcome"]
     payload = {**verdict, "reconciliation_task_id": recovery_id}
+    # Record-only settled outcomes never resumed anything; they do not count
+    # toward the recovery generation limit.
     generations = conn.execute(
         "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'reconciliation_outcome' "
         "AND json_extract(payload, '$.outcome') IN "
-        "('cleared/resumed', 'continuation_created', 'dependency_wait', 'backoff_scheduled')",
+        "('cleared/resumed', 'continuation_created', 'dependency_wait', 'backoff_scheduled') "
+        "AND json_extract(payload, '$.source_settled_event_id') IS NULL",
         (source_id,),
     ).fetchone()[0]
     if outcome in {"cleared/resumed", "continuation_created", "dependency_wait", "backoff_scheduled"}:
