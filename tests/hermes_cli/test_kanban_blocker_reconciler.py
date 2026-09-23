@@ -1244,6 +1244,26 @@ def test_prior_blocked_run_evidence_survives_synthesized_terminal_event(isolated
 # --- Benign park-artifact chain: advance guard + drifted-source settlement ---
 
 
+def test_park_chain_accepts_evidence_from_prior_recovery_attempt(isolated_home, monkeypatch):
+    """Disposable-board canary for the pinned occurrence and retried recovery."""
+    from hermes_cli.kanban_db_dispatch import _record_task_failure
+    _enable(monkeypatch)
+    with connection.connect_closing() as conn:
+        source = _running(conn)
+        assert kb.block_task(conn, source, reason='crashed', kind='transient')
+        recovery = _reconciliation_tasks(conn)[0]
+        first = kb.claim_task(conn, recovery.id)
+        event = int(recovery.idempotency_key.rsplit(':', 1)[1])
+        _park_then_evidence(conn, monkeypatch, source, recovery, first)
+        _record_task_failure(conn, recovery.id, 'retryable worker failure', outcome='spawn_failed',
+                             release_claim=True, end_run=True, failure_limit=10)
+        second = kb.claim_task(conn, recovery.id)
+        assert kb.complete_task(conn, recovery.id, expected_run_id=second.current_run_id,
+                                metadata={'reconciliation': {'outcome': 'cleared/resumed',
+                                          'source_task_id': source, 'source_event_id': event}})
+        assert kb.get_task(conn, source).status == 'todo'
+
+
 def _park_then_evidence(conn, monkeypatch, source, recovery, claim):
     """Record the misfire shape: evidence-free park note + its park, then
     recovery-owned evidence comment/link writes (crossing the fence via
