@@ -8,6 +8,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_blocker_reconcile as reconcile
+from hermes_cli import kanban_blocker_outcomes as outcomes
 from hermes_cli import kanban_db_connect as connection
 
 
@@ -1204,3 +1205,232 @@ def test_prior_run_evidence_requires_durable_run_window(isolated_home, monkeypat
                 kb.complete_task(conn, recovery.id, metadata=metadata, expected_run_id=second.current_run_id)
         else:
             assert kb.complete_task(conn, recovery.id, metadata=metadata, expected_run_id=second.current_run_id)
+
+
+# --- Benign park-artifact chain: advance guard + drifted-source settlement ---
+
+
+def _park_then_evidence(conn, monkeypatch, source, recovery, claim):
+    """Record the misfire shape: evidence-free park note + its park, then
+    recovery-owned evidence comment/link writes (crossing the fence via
+    matches()), mirroring the live t_a6e9cf69 chain."""
+    kb.add_comment(conn, source, author='default', body='Park note citing an unrelated task address')
+    assert kb.schedule_task(conn, source, reason='misfiring park citing the wrong address')
+    monkeypatch.setenv('HERMES_KANBAN_TASK', recovery.id)
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(claim.current_run_id))
+    parent = kb.create_task(conn, title='continuation', assignee='default')
+    kb.link_tasks(conn, parent, source)
+    kb.add_comment(conn, source, author='default', body='Recovery evidence: zero-loss verified')
+    monkeypatch.delenv('HERMES_KANBAN_TASK')
+    monkeypatch.delenv('HERMES_KANBAN_RUN_ID')
+    return parent
+
+
+@pytest.mark.parametrize('outcome,extra', [
+    ('cleared/resumed', {}),
+    ('continuation_created', 'PARENT'),
+    ('dependency_wait', 'PARENT'),
+    ('backoff_scheduled', 'BACKOFF'),
+    ('genuine_human_gate', {'human_action': 'Run the one unfenced unblock command'}),
+    ('reconciliation_failed', {'error': 'sanitized failure'}),
+])
+def test_park_artifact_chain_settles_every_outcome_schema(isolated_home, monkeypatch, outcome, extra):
+    import time
+
+    _enable(monkeypatch)
+    with connection.connect_closing() as conn:
+        source = _running(conn)
+        assert kb.block_task(conn, source, reason='crashed', kind='transient')
+        recovery = _reconciliation_tasks(conn)[0]
+        claim = kb.claim_task(conn, recovery.id)
+        source_event_id = int((recovery.idempotency_key or '').rsplit(':', 1)[1])
+        parent = _park_then_evidence(conn, monkeypatch, source, recovery, claim)
+        assert kb.get_task(conn, source).status == 'scheduled'
+        fields = {'outcome': outcome, 'source_task_id': source, 'source_event_id': source_event_id}
+        if extra == 'PARENT':
+            fields['continuation_task_id' if outcome == 'continuation_created' else 'dependency_task_id'] = parent
+        elif extra == 'BACKOFF':
+            fields['resume_at'] = int(time.time()) + 3600
+        elif isinstance(extra, dict):
+            fields.update(extra)
+        assert kb.complete_task(
+            conn, recovery.id, summary='verdict',
+            metadata={'reconciliation': fields}, expected_run_id=claim.current_run_id,
+        )
+        settled = kb.get_task(conn, source)
+        if outcome == 'genuine_human_gate':
+            assert settled.status == 'scheduled'
+            assert settled.block_kind == 'needs_input'
+        elif outcome == 'reconciliation_failed':
+            # The parked state stands; no progress transition, no human gate.
+            assert settled.status == 'scheduled'
+            assert settled.block_kind == 'transient'
+        elif outcome == 'backoff_scheduled':
+            assert settled.status == 'scheduled'
+            assert settled.block_kind is None
+        else:
+            # Progress outcomes resume normally; the linked continuation is
+            # still open, so _resume_status_from_events yields 'todo'.
+            assert settled.status == 'todo'
+            assert settled.block_kind is None
+        outcomes = [e for e in kb.list_events(conn, source) if e.kind == 'reconciliation_outcome']
+        assert [e.payload['outcome'] for e in outcomes] == [outcome]
+
+
+def test_park_chain_bookkeeping_event_id_remains_stale_occurrence(isolated_home, monkeypatch):
+    _enable(monkeypatch)
+    with connection.connect_closing() as conn:
+        source = _running(conn)
+        assert kb.block_task(conn, source, reason='crashed', kind='transient')
+        recovery = _reconciliation_tasks(conn)[0]
+        claim = kb.claim_task(conn, recovery.id)
+        _park_then_evidence(conn, monkeypatch, source, recovery, claim)
+        benign_event_id = [e.id for e in kb.list_events(conn, source) if e.kind == 'commented'][0]
+        # The stale-check runs before the occurrence-kind check, so the
+        # stale error wins regardless of which branch would reject next.
+        with pytest.raises(ValueError, match='stale'):
+            kb.complete_task(
+                conn, recovery.id, summary='bookkeeping id',
+                metadata={'reconciliation': {
+                    'outcome': 'cleared/resumed', 'source_task_id': source,
+                    'source_event_id': benign_event_id,
+                }},
+                expected_run_id=claim.current_run_id,
+            )
+
+
+def test_genuine_later_blocker_still_invalidates_pinned_occurrence(isolated_home, monkeypatch):
+    _enable(monkeypatch)
+    with connection.connect_closing() as conn:
+        source = _running(conn)
+        assert kb.block_task(conn, source, reason='crashed', kind='transient')
+        recovery = _reconciliation_tasks(conn)[0]
+        claim = kb.claim_task(conn, recovery.id)
+        source_event_id = int((recovery.idempotency_key or '').rsplit(':', 1)[1])
+        _park_then_evidence(conn, monkeypatch, source, recovery, claim)
+        # A genuine later blocker occurrence (needs_input) after the artifacts.
+        # Appended raw because block_task's status guard targets running/ready;
+        # the native capture coalesces it onto the active recovery exactly as
+        # in production, advancing the pinned occurrence.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (source,))
+            kb._append_event(conn, source, 'blocked', {
+                'reason': 'a genuine new human gate', 'block_kind': 'needs_input',
+            })
+        genuine = [e.id for e in kb.list_events(conn, source)
+                   if e.kind == 'blocked' and (e.payload or {}).get('block_kind') == 'needs_input'][-1]
+        # The pinned pre-artifacts verdict is now stale — the recovery must
+        # acknowledge the new occurrence; the park chain cannot hide it.
+        with pytest.raises(ValueError, match='stale; expected newest coalesced event'):
+            kb.complete_task(
+                conn, recovery.id, summary='stale after genuine occurrence',
+                metadata={'reconciliation': {
+                    'outcome': 'genuine_human_gate', 'source_task_id': source,
+                    'source_event_id': source_event_id, 'human_action': 'decide',
+                }},
+                expected_run_id=claim.current_run_id,
+            )
+        assert not any(
+            e.kind == 'reconciliation_outcome' for e in kb.list_events(conn, source)
+        )
+        # Citing the genuine occurrence settles the verdict against it; the
+        # source keeps its human-gate state instead of resuming.
+        assert kb.complete_task(
+            conn, recovery.id, summary='verdict on the genuine occurrence',
+            metadata={'reconciliation': {
+                'outcome': 'genuine_human_gate', 'source_task_id': source,
+                'source_event_id': genuine, 'human_action': 'decide',
+            }},
+            expected_run_id=claim.current_run_id,
+        )
+        settled = kb.get_task(conn, source)
+        assert settled.status == 'blocked'
+        assert settled.block_kind == 'needs_input'
+
+
+def test_drift_settlement_rejects_blocked_source_with_active_run(isolated_home, monkeypatch):
+    _enable(monkeypatch)
+    with connection.connect_closing() as conn:
+        source = _running(conn)
+        assert kb.block_task(conn, source, reason='crashed', kind='transient')
+        recovery = _reconciliation_tasks(conn)[0]
+        claim = kb.claim_task(conn, recovery.id)
+        source_event_id = int((recovery.idempotency_key or '').rsplit(':', 1)[1])
+        _park_then_evidence(conn, monkeypatch, source, recovery, claim)
+        # An operator re-gated the source and a worker picked it up again.
+        # Raw status/run flips write no guard-relevant events (claimed is
+        # guard-excluded), so the chain detection is intact and the drift
+        # branch must still refuse to settle a source with an active run.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running', current_run_id = 424242 WHERE id = ?",
+                (source,),
+            )
+        assert kb.get_task(conn, source).current_run_id == 424242
+        with pytest.raises(ValueError, match='active run'):
+            kb.complete_task(
+                conn, recovery.id, summary='must not settle',
+                metadata={'reconciliation': {
+                    'outcome': 'cleared/resumed', 'source_task_id': source,
+                    'source_event_id': source_event_id,
+                }},
+                expected_run_id=claim.current_run_id,
+            )
+
+
+def test_drift_settlement_rejects_unexplained_status(isolated_home, monkeypatch):
+    """Only the recorded park chain earns drift settlement: any other
+    observed drift must be rejected. E2E this is unreachable past the
+    advance guard — every event-visible drift (comment/link/scheduled/status)
+    either matches the chain or breaks it and raises 'source advanced' — so
+    assert the settlement contract directly on apply_completion's verdict,
+    exactly as complete_task invokes it inside the native transaction."""
+    _enable(monkeypatch)
+    with connection.connect_closing() as conn:
+        source = _running(conn)
+        assert kb.block_task(conn, source, reason='crashed', kind='transient')
+        recovery = _reconciliation_tasks(conn)[0]
+        claim = kb.claim_task(conn, recovery.id)
+        source_event_id = int((recovery.idempotency_key or '').rsplit(':', 1)[1])
+        _park_then_evidence(conn, monkeypatch, source, recovery, claim)
+        verdict = outcomes.validate_completion(conn, recovery.id, {'reconciliation': {
+            'outcome': 'cleared/resumed', 'source_task_id': source,
+            'source_event_id': source_event_id,
+        }})
+        assert verdict is not None and verdict['source_drifted_by_recorded_park_chain']
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (source,))
+        with pytest.raises(ValueError, match='drifted outside the recorded park chain'):
+            outcomes.apply_completion(conn, recovery.id, {'reconciliation': {
+                'outcome': 'cleared/resumed', 'source_task_id': source,
+                'source_event_id': source_event_id,
+            }})
+        assert not any(
+            e.kind == 'reconciliation_outcome' for e in kb.list_events(conn, source)
+        )
+
+
+def test_evidence_only_history_without_park_chain_keeps_blocked_settlement(isolated_home, monkeypatch):
+    """No park pair: evidence-bearing writes exempt, source still 'blocked',
+    settled from 'blocked' exactly as before the drift contract."""
+    _enable(monkeypatch)
+    with connection.connect_closing() as conn:
+        source = _running(conn)
+        assert kb.block_task(conn, source, reason='failure', kind='transient')
+        recovery = _reconciliation_tasks(conn)[0]
+        claim = kb.claim_task(conn, recovery.id)
+        source_event_id = int((recovery.idempotency_key or '').rsplit(':', 1)[1])
+        monkeypatch.setenv('HERMES_KANBAN_TASK', recovery.id)
+        monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(claim.current_run_id))
+        kb.add_comment(conn, source, author='default', body='Verified the source workspace.')
+        monkeypatch.delenv('HERMES_KANBAN_TASK')
+        monkeypatch.delenv('HERMES_KANBAN_RUN_ID')
+        assert kb.complete_task(
+            conn, recovery.id, summary='verdict',
+            metadata={'reconciliation': {
+                'outcome': 'cleared/resumed', 'source_task_id': source,
+                'source_event_id': source_event_id,
+            }},
+            expected_run_id=claim.current_run_id,
+        )
+        assert kb.get_task(conn, source).status == 'ready'
