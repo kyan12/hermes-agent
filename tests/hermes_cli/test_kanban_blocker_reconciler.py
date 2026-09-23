@@ -1207,7 +1207,61 @@ def test_prior_run_evidence_requires_durable_run_window(isolated_home, monkeypat
             assert kb.complete_task(conn, recovery.id, metadata=metadata, expected_run_id=second.current_run_id)
 
 
+def test_prior_blocked_run_evidence_survives_synthesized_terminal_event(isolated_home, monkeypatch):
+    """A reasoned block closes the claimed run but attributes its event to a synthesized run."""
+    _enable(monkeypatch)
+    with connection.connect_closing() as conn:
+        source = kb.create_task(conn, title='source', assignee='default')
+        kb.block_task(conn, source, kind='transient', reason='failure')
+        recovery = _reconciliation_tasks(conn)[0]
+        first = kb.claim_task(conn, recovery.id)
+        monkeypatch.setenv('HERMES_KANBAN_TASK', recovery.id)
+        monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(first.current_run_id))
+        kb.add_comment(conn, source, author='default', body='Verified workspace')
+        stamped = [e for e in kb.list_events(conn, source) if e.kind == 'commented'][-1]
+        monkeypatch.delenv('HERMES_KANBAN_TASK')
+        monkeypatch.delenv('HERMES_KANBAN_RUN_ID')
+        assert kb.block_task(conn, recovery.id, kind='transient', reason='retry later',
+                             expected_run_id=first.current_run_id)
+        # Model the historical reclaim path: the closed attempt has a
+        # different outcome from the terminal event recorded by the park.
+        # Only the disposable board is edited; no live event is rewritten.
+        conn.execute("UPDATE task_runs SET outcome = 'crashed' WHERE id = ?",
+                     (first.current_run_id,))
+        assert not [e for e in kb.list_events(conn, recovery.id)
+                    if e.run_id == first.current_run_id and e.kind == 'crashed']
+        assert kb.unblock_task(conn, recovery.id)
+        second = kb.claim_task(conn, recovery.id)
+        assert second is not None
+        from hermes_cli.kanban_blocker_evidence import matches
+        source_event_id = int(recovery.idempotency_key.rsplit(':', 1)[1])
+        assert matches(conn, stamped.payload, recovery.id, source, source_event_id, stamped.id)
+        with kb.write_txn(conn):
+            late = kb._append_event(conn, source, 'commented', stamped.payload)
+        assert not matches(conn, stamped.payload, recovery.id, source, source_event_id, late)
+
+
 # --- Benign park-artifact chain: advance guard + drifted-source settlement ---
+
+
+def test_park_chain_accepts_evidence_from_prior_recovery_attempt(isolated_home, monkeypatch):
+    """Disposable-board canary for the pinned occurrence and retried recovery."""
+    from hermes_cli.kanban_db_dispatch import _record_task_failure
+    _enable(monkeypatch)
+    with connection.connect_closing() as conn:
+        source = _running(conn)
+        assert kb.block_task(conn, source, reason='crashed', kind='transient')
+        recovery = _reconciliation_tasks(conn)[0]
+        first = kb.claim_task(conn, recovery.id)
+        event = int(recovery.idempotency_key.rsplit(':', 1)[1])
+        _park_then_evidence(conn, monkeypatch, source, recovery, first)
+        _record_task_failure(conn, recovery.id, 'retryable worker failure', outcome='spawn_failed',
+                             release_claim=True, end_run=True, failure_limit=10)
+        second = kb.claim_task(conn, recovery.id)
+        assert kb.complete_task(conn, recovery.id, expected_run_id=second.current_run_id,
+                                metadata={'reconciliation': {'outcome': 'cleared/resumed',
+                                          'source_task_id': source, 'source_event_id': event}})
+        assert kb.get_task(conn, source).status == 'todo'
 
 
 def _park_then_evidence(conn, monkeypatch, source, recovery, claim):
@@ -1434,3 +1488,140 @@ def test_evidence_only_history_without_park_chain_keeps_blocked_settlement(isola
             expected_run_id=claim.current_run_id,
         )
         assert kb.get_task(conn, source).status == 'ready'
+def _natively_recover_and_complete(conn, source):
+    """Mirror t_21e46f20: promoted -> claimed -> spawned -> completed after the occurrence."""
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready', block_kind = NULL WHERE id = ?", (source,))
+        kb._append_event(conn, source, 'promoted', None)
+    run = kb.claim_task(conn, source)
+    assert run is not None
+    assert kb.complete_task(conn, source, summary='finished natively', expected_run_id=run.current_run_id)
+
+
+def _settled_setup(conn, monkeypatch):
+    _enable(monkeypatch)
+    source = _running(conn)
+    assert kb.block_task(conn, source, kind='transient', reason='worker crashed')
+    recovery = _reconciliation_tasks(conn)[0]
+    event = int(recovery.idempotency_key.rsplit(':', 1)[1])
+    return source, recovery, event
+
+
+def test_source_settled_after_native_recovery_records_cleared_without_transition(isolated_home, monkeypatch):
+    with connection.connect_closing() as conn:
+        source, recovery, event = _settled_setup(conn, monkeypatch)
+        kb.add_comment(conn, source, author='worker', body='progress note without evidence')
+        _natively_recover_and_complete(conn, source)
+        claim = kb.claim_task(conn, recovery.id)
+        before = kb.get_task(conn, source)
+        metadata = {'reconciliation': {'outcome': 'cleared/resumed', 'source_task_id': source,
+                                       'source_event_id': event}}
+        assert kb.complete_task(conn, recovery.id, metadata=metadata, expected_run_id=claim.current_run_id)
+        after = kb.get_task(conn, source)
+        assert (after.status, after.completed_at, after.block_kind) == (before.status, before.completed_at, before.block_kind)
+        outcome = [e for e in kb.list_events(conn, source) if e.kind == 'reconciliation_outcome'][-1]
+        completed = [e.id for e in kb.list_events(conn, source) if e.kind == 'completed'][-1]
+        assert outcome.payload['outcome'] == 'cleared/resumed'
+        assert outcome.payload['source_settled_event_id'] == completed
+        assert outcome.payload['reconciliation_task_id'] == recovery.id
+        assert kb.get_task(conn, recovery.id).status == 'done'
+        # Exact replay stays a zero-write no-op.
+        changes = conn.total_changes
+        assert kb.complete_task(conn, recovery.id, metadata=metadata, expected_run_id=claim.current_run_id) is False
+        assert conn.total_changes == changes
+
+
+def test_source_settled_then_archived_still_records_cleared(isolated_home, monkeypatch):
+    with connection.connect_closing() as conn:
+        source, recovery, event = _settled_setup(conn, monkeypatch)
+        _natively_recover_and_complete(conn, source)
+        assert kb.archive_task(conn, source)
+        claim = kb.claim_task(conn, recovery.id)
+        assert kb.complete_task(conn, recovery.id, expected_run_id=claim.current_run_id, metadata={'reconciliation': {
+            'outcome': 'cleared/resumed', 'source_task_id': source, 'source_event_id': event}})
+        assert kb.get_task(conn, source).status == 'archived'
+
+
+@pytest.mark.parametrize('outcome,extra', [
+    ('genuine_human_gate', {'human_action': 'Pick one'}),
+    ('reconciliation_failed', {'error': 'could not recover'}),
+    ('backoff_scheduled', None),
+])
+def test_settled_source_rejects_non_cleared_verdicts(isolated_home, monkeypatch, outcome, extra):
+    import time as _time
+    with connection.connect_closing() as conn:
+        source, recovery, event = _settled_setup(conn, monkeypatch)
+        _natively_recover_and_complete(conn, source)
+        claim = kb.claim_task(conn, recovery.id)
+        extra = extra or {'resume_at': int(_time.time()) + 600}
+        with pytest.raises(ValueError, match='advanced after source event'):
+            kb.complete_task(conn, recovery.id, expected_run_id=claim.current_run_id, metadata={'reconciliation': {
+                'outcome': outcome, 'source_task_id': source, 'source_event_id': event, **extra}})
+        assert not any(e.kind == 'reconciliation_outcome' for e in kb.list_events(conn, source))
+        assert kb.get_task(conn, source).status == 'done'
+
+
+def test_settled_source_rejects_when_reopened_after_completion(isolated_home, monkeypatch):
+    with connection.connect_closing() as conn:
+        source, recovery, event = _settled_setup(conn, monkeypatch)
+        _natively_recover_and_complete(conn, source)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (source,))
+            kb._append_event(conn, source, 'status', {'status': 'blocked'})
+        claim = kb.claim_task(conn, recovery.id)
+        with pytest.raises(ValueError, match='advanced after source event'):
+            kb.complete_task(conn, recovery.id, expected_run_id=claim.current_run_id, metadata={'reconciliation': {
+                'outcome': 'cleared/resumed', 'source_task_id': source, 'source_event_id': event}})
+
+
+def test_settled_source_rejects_after_genuine_later_blocker_occurrence(isolated_home, monkeypatch):
+    with connection.connect_closing() as conn:
+        source, recovery, event = _settled_setup(conn, monkeypatch)
+        with kb.write_txn(conn):
+            kb._append_event(conn, source, 'gave_up', {'error': 'a later, unassigned occurrence'})
+        _natively_recover_and_complete(conn, source)
+        from hermes_cli.kanban_blocker_outcomes import _settled_source_completion
+        assert _settled_source_completion(conn, source, event) is None
+        claim = kb.claim_task(conn, recovery.id)
+        with pytest.raises(ValueError, match='stale'):
+            kb.complete_task(conn, recovery.id, expected_run_id=claim.current_run_id, metadata={'reconciliation': {
+                'outcome': 'cleared/resumed', 'source_task_id': source, 'source_event_id': event}})
+
+
+def test_settled_after_newest_coalesced_gave_up_mirrors_t_a94c519b(isolated_home, monkeypatch):
+    """crashed -> coalesced gave_up -> promoted -> claimed -> completed: newest id is accepted."""
+    with connection.connect_closing() as conn:
+        source, recovery, event = _settled_setup(conn, monkeypatch)
+        with kb.write_txn(conn):
+            gave_up = kb._append_event(conn, source, 'gave_up', {'error': 'pid not alive'})
+        assert any(e.kind == 'reconciliation_coalesced' and e.payload.get('source_event_id') == gave_up
+                   for e in kb.list_events(conn, source))
+        _natively_recover_and_complete(conn, source)
+        claim = kb.claim_task(conn, recovery.id)
+        assert kb.complete_task(conn, recovery.id, expected_run_id=claim.current_run_id, metadata={'reconciliation': {
+            'outcome': 'cleared/resumed', 'source_task_id': source, 'source_event_id': gave_up}})
+        assert kb.get_task(conn, source).status == 'done'
+
+
+def test_settled_path_does_not_admit_non_newest_event_id(isolated_home, monkeypatch):
+    with connection.connect_closing() as conn:
+        source, recovery, event = _settled_setup(conn, monkeypatch)
+        _natively_recover_and_complete(conn, source)
+        promoted = [e.id for e in kb.list_events(conn, source) if e.kind == 'promoted'][-1]
+        claim = kb.claim_task(conn, recovery.id)
+        with pytest.raises(ValueError, match='stale'):
+            kb.complete_task(conn, recovery.id, expected_run_id=claim.current_run_id, metadata={'reconciliation': {
+                'outcome': 'cleared/resumed', 'source_task_id': source, 'source_event_id': promoted}})
+
+
+def test_blocked_source_with_benign_promoted_still_fenced(isolated_home, monkeypatch):
+    """No regression: a live (not settled) source that advanced is still stale."""
+    with connection.connect_closing() as conn:
+        source, recovery, event = _settled_setup(conn, monkeypatch)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (source,))
+            kb._append_event(conn, source, 'promoted', None)
+        claim = kb.claim_task(conn, recovery.id)
+        with pytest.raises(ValueError, match='advanced after source event'):
+            kb.complete_task(conn, recovery.id, expected_run_id=claim.current_run_id, metadata={'reconciliation': {
+                'outcome': 'cleared/resumed', 'source_task_id': source, 'source_event_id': event}})
