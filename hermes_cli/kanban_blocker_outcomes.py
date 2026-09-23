@@ -108,6 +108,10 @@ def _reconcile_park_artifacts(
             continue
         if row["kind"] == "commented" and comment_id is None and park_id is None:
             if not isinstance(payload.get("reconciliation_evidence"), dict):
+                # A plain bookkeeping comment (no evidence dict at all) cannot
+                # attest to anything about the source; the misfiring park note
+                # looks exactly like this. Evidence-shaped comments fall
+                # through to the fail-closed branch below.
                 comment_id = row["id"]
                 continue
             # Evidence-shaped but not provably recovery-owned: fail closed.

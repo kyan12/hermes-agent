@@ -1207,6 +1207,40 @@ def test_prior_run_evidence_requires_durable_run_window(isolated_home, monkeypat
             assert kb.complete_task(conn, recovery.id, metadata=metadata, expected_run_id=second.current_run_id)
 
 
+def test_prior_blocked_run_evidence_survives_synthesized_terminal_event(isolated_home, monkeypatch):
+    """A reasoned block closes the claimed run but attributes its event to a synthesized run."""
+    _enable(monkeypatch)
+    with connection.connect_closing() as conn:
+        source = kb.create_task(conn, title='source', assignee='default')
+        kb.block_task(conn, source, kind='transient', reason='failure')
+        recovery = _reconciliation_tasks(conn)[0]
+        first = kb.claim_task(conn, recovery.id)
+        monkeypatch.setenv('HERMES_KANBAN_TASK', recovery.id)
+        monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(first.current_run_id))
+        kb.add_comment(conn, source, author='default', body='Verified workspace')
+        stamped = [e for e in kb.list_events(conn, source) if e.kind == 'commented'][-1]
+        monkeypatch.delenv('HERMES_KANBAN_TASK')
+        monkeypatch.delenv('HERMES_KANBAN_RUN_ID')
+        assert kb.block_task(conn, recovery.id, kind='transient', reason='retry later',
+                             expected_run_id=first.current_run_id)
+        # Model the historical reclaim path: the closed attempt has a
+        # different outcome from the terminal event recorded by the park.
+        # Only the disposable board is edited; no live event is rewritten.
+        conn.execute("UPDATE task_runs SET outcome = 'crashed' WHERE id = ?",
+                     (first.current_run_id,))
+        assert not [e for e in kb.list_events(conn, recovery.id)
+                    if e.run_id == first.current_run_id and e.kind == 'crashed']
+        assert kb.unblock_task(conn, recovery.id)
+        second = kb.claim_task(conn, recovery.id)
+        assert second is not None
+        from hermes_cli.kanban_blocker_evidence import matches
+        source_event_id = int(recovery.idempotency_key.rsplit(':', 1)[1])
+        assert matches(conn, stamped.payload, recovery.id, source, source_event_id, stamped.id)
+        with kb.write_txn(conn):
+            late = kb._append_event(conn, source, 'commented', stamped.payload)
+        assert not matches(conn, stamped.payload, recovery.id, source, source_event_id, late)
+
+
 # --- Benign park-artifact chain: advance guard + drifted-source settlement ---
 
 

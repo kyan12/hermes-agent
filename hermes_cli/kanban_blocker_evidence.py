@@ -57,4 +57,15 @@ def matches(conn, payload, recovery_id, source_id, source_event_id, evidence_eve
         "SELECT MIN(id) FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ?",
         (recovery_id, evidence["run_id"], run["outcome"]),
     ).fetchone()[0]
-    return terminal is not None and evidence_event_id < terminal
+    if terminal is not None:
+        return evidence_event_id < terminal
+    # Some terminal paths (kanban_block with a reason, reclaim) synthesize a
+    # fresh run for the terminal event, so no event carries this run id. The
+    # ended run row is still durable authority; bound the same window by the
+    # recovery's NEXT claim. Event ids are monotonic, so a stamp written after
+    # that claim can never fall inside the window — forgery stays closed.
+    next_claim = conn.execute(
+        "SELECT MIN(id) FROM task_events WHERE task_id = ? AND kind = 'claimed' AND id > ?",
+        (recovery_id, claimed),
+    ).fetchone()[0]
+    return next_claim is not None and evidence_event_id < next_claim
