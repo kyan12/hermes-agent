@@ -73,6 +73,54 @@ def _newer_reconciliation_source_event(
     return None
 
 
+def _reconcile_park_artifacts(
+    conn: sqlite3.Connection, source_task_id: str, source_event_id: int,
+    recovery_task_id: Optional[str] = None,
+) -> tuple[frozenset[int], bool]:
+    """Recognize one benign park-artifact chain after the pinned occurrence.
+
+    A misfiring park (``kanban_block`` citing an unrelated reason, contradicting
+    the controlling operator directive) leaves exactly two non-exempt source
+    events: an evidence-free ``commented`` park note followed by the
+    ``scheduled`` park itself. That pair is bookkeeping, not source progress, so
+    it is exempt from the advance guard; when it is the only non-exempt flagged
+    history it also drifted the source out of its expected status, which
+    ``apply_completion`` may then settle from. Recovery-owned evidence comments
+    and links are exempt through ``matches`` exactly as in
+    ``_newer_reconciliation_source_event``. Any additional non-exempt flagged
+    event (a genuine later blocker occurrence, a foreign comment or link)
+    breaks the chain and nothing is exempted.
+    """
+    from hermes_cli.kanban_blocker_evidence import matches
+    rows = conn.execute(
+        "SELECT id, kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind NOT IN ('reconciliation_enqueued', 'reconciliation_coalesced', "
+        "'heartbeat', 'claim_extended') ORDER BY id ASC",
+        (source_task_id, source_event_id),
+    ).fetchall()
+    comment_id: Optional[int] = None
+    park_id: Optional[int] = None
+    for row in rows:
+        payload = json.loads(row["payload"] or "{}")
+        if (recovery_task_id and row["kind"] in {"commented", "linked"}
+                and matches(conn, payload, recovery_task_id, source_task_id,
+                            source_event_id, row["id"])):
+            continue
+        if row["kind"] == "commented" and comment_id is None and park_id is None:
+            if not isinstance(payload.get("reconciliation_evidence"), dict):
+                comment_id = row["id"]
+                continue
+            # Evidence-shaped but not provably recovery-owned: fail closed.
+            return frozenset(), False
+        if row["kind"] == "scheduled" and comment_id is not None and park_id is None:
+            park_id = row["id"]
+            continue
+        return frozenset(), False
+    if comment_id is None or park_id is None:
+        return frozenset(), False
+    return frozenset({comment_id, park_id}), True
+
+
 def _required_reconciliation_text(
     reconciliation: Mapping[str, Any],
     field: str,
@@ -185,17 +233,22 @@ def validate_completion(
         field = {"genuine_human_gate": "human_action", "reconciliation_failed": "error"}[outcome]
         verdict[field] = _redact_reconciliation_text(_required_reconciliation_text(reconciliation, field), limit=1000)
 
+    park_artifacts, drift_settlement = _reconcile_park_artifacts(
+        conn, source_id, source_event_id, recovery_task_id=recovery_task_id,
+    )
     newer_source_event = _newer_reconciliation_source_event(
         conn,
         source_id,
         source_event_id,
         recovery_task_id=recovery_task_id,
+        ignored_event_ids=park_artifacts,
     )
     if newer_source_event is not None:
         raise ValueError(
             "reconciliation source advanced after source event "
             f"{source_event_id} via {newer_source_event['kind']}:{newer_source_event['id']}"
         )
+    verdict["source_drifted_by_recorded_park_chain"] = drift_settlement
     return verdict
 
 
@@ -207,8 +260,19 @@ def apply_completion(conn: sqlite3.Connection, recovery_id: str, metadata: Any) 
         return
     source_id = verdict.pop("source_task_id")
     expected_status = verdict.pop("expected_source_status")
+    drifted = bool(verdict.pop("source_drifted_by_recorded_park_chain", False))
     source = kb.get_task(conn, source_id)
-    if source is None or source.status != expected_status or source.status != "blocked" or source.current_run_id:
+    if drifted:
+        # The only non-exempt post-occurrence history is the recorded benign
+        # park-artifact chain, so the misfiring park itself moved the source
+        # out of its expected status. The parked state is never legitimate
+        # while an active run holds the source: settle nothing.
+        if source is None or source.current_run_id:
+            raise ValueError("reconciliation source advanced or still has an active run")
+        if source.status != "scheduled":
+            raise ValueError("reconciliation source drifted outside the recorded park chain")
+    elif (source is None or source.status != expected_status
+          or source.status != "blocked" or source.current_run_id):
         raise ValueError("reconciliation source advanced or still has an active run")
     outcome = verdict["outcome"]
     payload = {**verdict, "reconciliation_task_id": recovery_id}
